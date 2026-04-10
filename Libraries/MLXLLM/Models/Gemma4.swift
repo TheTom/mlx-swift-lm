@@ -959,30 +959,12 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
-        // Match Python mlx-lm: process every prefill token except the LAST one
-        // through chunked prefill with eval(cache) + clearCache between chunks.
-        // The single trailing token is returned to the iterator's "primes the
-        // pump" call, which produces the first decode logits.
-        //
-        // Previously this loop only ran for prompts > prefillStepSize, so for
-        // any prompt that fit in a single chunk (e.g. 1024 tokens with chunk
-        // size 2048) the entire prompt was processed in one shot inside the
-        // iterator with NO clearCache, leaving 1–5 GB of intermediate
-        // activation buffers in the MLX recycle pool until the user
-        // explicitly cleared it. (M5 Max, Gemma 4 E2B 4bit, 1024 ctx:
-        // ~3.3 GB cache pool growth before this fix.)
         while y.tokens.size > 1 {
             let chunkSize = min(prefillStepSize, y.tokens.size - 1)
             let input = y[.newAxis, ..<chunkSize]
-            // Call model() directly — skip lmHead + softcap during prefill chunks.
-            // The LM head projects hidden states to vocab_size (262K), creating a
-            // ~1GB tensor that eval(cache) doesn't need. Skipping it avoids
-            // allocating that dead-end buffer in the lazy graph.
             _ = model(input.tokens, cache: cache.isEmpty ? nil : cache)
             eval(cache)
             y = y[chunkSize...]
-            // Free intermediate activation buffers between chunks to reduce memory pressure,
-            // matching Python mlx-lm's mx.clear_cache() after each prefill chunk.
             MLX.Memory.clearCache()
         }
 

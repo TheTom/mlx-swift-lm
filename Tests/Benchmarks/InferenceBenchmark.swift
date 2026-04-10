@@ -333,7 +333,7 @@ struct InferenceBenchmarks {
     // MARK: - Entry Point
 
     /// Single benchmark entry point. All configuration comes from env vars.
-    @Test func benchmark() async throws {
+    @Test @MainActor func benchmark() async throws {
         // Force line-buffered stdout so progress lines appear immediately when piped
         setlinebuf(stdout)
 
