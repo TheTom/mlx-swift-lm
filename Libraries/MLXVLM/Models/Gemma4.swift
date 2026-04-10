@@ -435,7 +435,7 @@ private class Gemma4TextRouter: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let normWeight = scale * MLXArray(rootSize)
+        let normWeight = scale * rootSize
         let normed = MLXFast.rmsNorm(x, weight: normWeight, eps: eps)
         return proj(normed)
     }

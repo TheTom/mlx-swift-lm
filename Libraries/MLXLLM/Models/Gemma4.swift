@@ -561,7 +561,8 @@ class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let normWeight = scale * MLXArray(rootSize)
+        // Use bare Float scalar to avoid fp32 promotion (same pattern as PLE fix).
+        let normWeight = scale * rootSize
         let normed = MLXFast.rmsNorm(x, weight: normWeight, eps: eps)
         return proj(normed)
     }
