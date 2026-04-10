@@ -887,6 +887,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     var ngramAccepted = 0
     var cachesTrimmable = false
     var ngramDisabled = false  // auto-disabled when acceptance rate drops
+    var ngramCooldownTokens = 0  // tokens until re-enable after disable
     var ngramAttempts = 0      // rolling window for acceptance tracking
     var ngramHits = 0          // hits in rolling window
 
@@ -1294,13 +1295,15 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             ngramHits += actualMatches
         }
 
-        // Check rolling acceptance rate every 10 attempts
+        // Check rolling acceptance rate every 10 attempts.
+        // If low, enter cooldown (not permanent disable) so speculation
+        // can re-activate when patterns appear (code blocks, lists, etc).
         if ngramAttempts >= 10 {
             let rate = Double(ngramHits) / Double(ngramAttempts * maxNgramDraftTokens)
-            if rate < 0.1 {  // less than 10% of proposed tokens accepted
+            if rate < 0.1 {
                 ngramDisabled = true
+                ngramCooldownTokens = 50  // try again after 50 standard tokens
             }
-            // Reset rolling window
             ngramAttempts = 0
             ngramHits = 0
         }
@@ -1391,8 +1394,15 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             return token
         }
 
-        // Try n-gram speculation if enabled
-        if ngramSize > 0 && cachesTrimmable {
+        // Try n-gram speculation if enabled.
+        // Cooldown: re-enable after ngramCooldownTokens of standard decode.
+        if ngramSize > 0 && ngramDisabled && ngramCooldownTokens > 0 {
+            ngramCooldownTokens -= 1
+            if ngramCooldownTokens == 0 {
+                ngramDisabled = false
+            }
+        }
+        if ngramSize > 0 && !ngramDisabled && cachesTrimmable {
             let accepted = ngramSpeculateRound()
             if !accepted.isEmpty {
                 pendingTokens = Array(accepted.dropFirst())

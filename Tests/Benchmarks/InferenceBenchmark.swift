@@ -653,6 +653,9 @@ struct InferenceBenchmarks {
         if case .none = kv { isKVQuantized = false } else { isKVQuantized = true }
         let needsKLD = BenchEnv.kldEnabled && (variant.quantization != "bf16" || isKVQuantized)
 
+        // N-gram speculative decoding: MLX_BENCH_NGRAM=3 to enable
+        let benchNgram = Int(ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM"] ?? "0") ?? 0
+
         let params = GenerateParameters(
             maxTokens: effectiveMaxTokens,
             maxKVSize: contextSize > 0 ? contextSize : nil,
@@ -668,6 +671,7 @@ struct InferenceBenchmarks {
             prefillStepSize: 2048,
             additionalProcessors: additionalProcessors,
             reasoningEffort: family.reasoningEffort,
+            ngramSize: benchNgram,
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId,
             thinkingPhasePrefilled: thinkStartId != nil && !family.thinkingConfig.assistantPrefill.isEmpty,
