@@ -362,12 +362,14 @@ struct InferenceBenchmarks {
             // and deflates prefill tok/s. Run a short 64-token generation, sync GPU,
             // then discard. This matches llama.cpp's llama-bench warmup behavior.
             do {
-                print("[WARMUP] Running warmup pass (64 tokens)...")
-                let warmupPrompt = try loadPrompt(tokenCount: 128)
+                // Warmup with 2048+ tokens to warm ALL Metal pipeline specializations
+                // including the SDPA kernels that only dispatch at longer sequences.
+                print("[WARMUP] Running warmup pass (2048 tokens)...")
+                let warmupPrompt = try loadPrompt(tokenCount: 2048)
                 try await runGenerationBenchmark(
                     family: family, variant: variant, repoId: repoId, kv: kv,
                     label: "warmup",
-                    contextSize: 128,
+                    contextSize: 2048,
                     messages: [["role": "user", "content": warmupPrompt]],
                     systemPrompt: nil, maxTokens: 16,
                     warmup: true

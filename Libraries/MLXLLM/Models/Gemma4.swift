@@ -405,23 +405,23 @@ class Gemma4Attention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil,
         useSharedKV: Bool = false,
+        sharedKVArrays: (MLXArray, MLXArray)? = nil,
         donorOffset: Int? = nil,
-        inputNormWeight: MLXArray? = nil  // When provided, fuses norm into projections
+        inputNormWeight: MLXArray? = nil
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         var queries = qProj(x).reshaped(B, L, nHeads, -1)
 
-        if useSharedKV, let cache, let (cachedKeys, cachedValues) = cache.peek() {
-            let offset = donorOffset ?? cache.offset
+        if useSharedKV, let sharedKV = sharedKVArrays {
+            let (cachedKeys, cachedValues) = sharedKV
+            let offset = donorOffset ?? cache?.offset ?? 0
             if let fusedInvFreqs {
-                // Fused: norm+rope on [B, L, nHeads, D], then transpose
                 queries = MLXFast.rmsNormRoPE(
                     queries, weight: qNorm.weight, invFreqs: fusedInvFreqs.invFreqs,
                     eps: rmsNormEps, offset: offset, nHeads: nHeads, seqLen: L)
                 queries = queries.transposed(0, 2, 1, 3)
             } else {
-                // Separate: norm on [B, L, nHeads, D], transpose, then rope
                 queries = qNorm(queries)
                 queries = queries.transposed(0, 2, 1, 3)
                 queries = rope(queries, offset: offset)
@@ -657,15 +657,11 @@ class Gemma4TransformerBlock: Module {
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
         useSharedKV: Bool = false,
+        sharedKVArrays: (MLXArray, MLXArray)? = nil,
         donorOffset: Int? = nil
     ) -> MLXArray {
-        // Attention with pre/post norms and residual
-        // NOTE: Fused RMSNorm+QGEMV was tested but regresses -3-5% decode.
-        // The GEMV bottleneck is weight reads (5.6 MB per projection), not the
-        // 11 KB norm intermediate. Fusing adds shared memory + barrier overhead
-        // that outweighs the tiny memory savings.
         let inputNorm = inputLayerNorm(x)
-        let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, donorOffset: donorOffset)
+        let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, sharedKVArrays: sharedKVArrays, donorOffset: donorOffset)
         // Manual `residual + norm(x)` instead of compiledNormResidual.
         // The compiled fused op was apparently materializing intermediate
         // copies inside its traced graph at every layer during prefill,
@@ -875,6 +871,10 @@ public class Gemma4ModelInner: Module {
         // Shared layers need these to apply query RoPE at the same positions as their donor —
         // by the time a shared layer runs, cache.offset has already been incremented by the donor.
         var donorPreUpdateOffsets = [Int](repeating: 0, count: layers.count)
+        // Match Python: store (kvs, offset) per layer so shared layers reuse
+        // the donor's K/V arrays directly instead of re-slicing from cache.
+        // This eliminates ~450 redundant graph ops (Slice, SDPA, etc).
+        var intermediateKVs: [(MLXArray, MLXArray)?] = Array(repeating: nil, count: layers.count)
 
         for (i, layer) in layers.enumerated() {
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
@@ -902,19 +902,23 @@ public class Gemma4ModelInner: Module {
 
             let pli: MLXArray? = perLayerInputs.map { $0[0..., 0..., i, 0...] }
 
-            // KV sharing: shared layers use the donor's cache to read K/V
             let donorIdx = previousKVs[i]
             let isShared = donorIdx != i
 
             if isShared {
-                // Pass the donor's pre-update offset so query RoPE uses the correct positions.
-                h = layer(h, mask: maskMode, cache: cache[donorIdx], perLayerInput: pli,
-                          useSharedKV: true, donorOffset: donorPreUpdateOffsets[donorIdx])
+                h = layer(h, mask: maskMode, cache: nil, perLayerInput: pli,
+                          useSharedKV: true, sharedKVArrays: intermediateKVs[donorIdx],
+                          donorOffset: donorPreUpdateOffsets[donorIdx])
             } else {
-                // Snapshot cache.offset BEFORE the donor runs; attentionWithCacheUpdate will
-                // increment it, so any later read would give the wrong (post-update) value.
                 donorPreUpdateOffsets[i] = cache[i]?.offset ?? 0
                 h = layer(h, mask: maskMode, cache: cache[i], perLayerInput: pli)
+                // Store donor's K/V from cache.update() return value for shared layers.
+                // peek() creates redundant Slice ops — use the cache's stored arrays directly.
+                if let c = cache[i] as? StandardKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
+                    intermediateKVs[i] = (k, v)
+                } else if let c = cache[i] as? RotatingKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
+                    intermediateKVs[i] = (k, v)
+                }
             }
         }
 
@@ -962,10 +966,28 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         while y.tokens.size > 1 {
             let chunkSize = min(prefillStepSize, y.tokens.size - 1)
             let input = y[.newAxis, ..<chunkSize]
+
+            let t0 = DispatchTime.now().uptimeNanoseconds
             _ = model(input.tokens, cache: cache.isEmpty ? nil : cache)
-            eval(cache)
+            let t1 = DispatchTime.now().uptimeNanoseconds
+
+            // Collect cache state arrays manually to time eval precisely
+            var cacheArrays: [MLXArray] = []
+            for c in cache { cacheArrays.append(contentsOf: c.innerState()) }
+            let t2 = DispatchTime.now().uptimeNanoseconds
+
+            eval(cacheArrays)
+            let t3 = DispatchTime.now().uptimeNanoseconds
+
             y = y[chunkSize...]
             MLX.Memory.clearCache()
+            let t4 = DispatchTime.now().uptimeNanoseconds
+
+            let fwdMs = Double(t1 - t0) / 1_000_000
+            let collectMs = Double(t2 - t1) / 1_000_000
+            let evalMs = Double(t3 - t2) / 1_000_000
+            let clearMs = Double(t4 - t3) / 1_000_000
+            print("[PREFILL] \(chunkSize)tok: fwd=\(String(format:"%.1f",fwdMs))ms collect=\(String(format:"%.1f",collectMs))ms eval=\(String(format:"%.1f",evalMs))ms clear=\(String(format:"%.1f",clearMs))ms total=\(String(format:"%.1f",fwdMs+collectMs+evalMs+clearMs))ms")
         }
 
         return .tokens(y)
