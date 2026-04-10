@@ -957,7 +957,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = max(windowSize ?? 512, 2048)
+        // Use chunk size ≤ sliding window so sliding attention layers don't
+        // need a materialized mask. At 32K with window=1024 and chunk=2048,
+        // each chunk materializes a [2048, 33792] boolean mask (~69 MB).
+        // With chunk=1024, both sliding and full layers use symbolic .causal.
+        let prefillStepSize = min(windowSize ?? 2048, 2048)
         var y = input.text
 
         // Match Python mlx-lm: process every prefill token except the LAST one

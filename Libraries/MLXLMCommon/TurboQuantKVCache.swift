@@ -337,9 +337,9 @@ public enum TurboQuantRotation {
         precondition(dim > 0 && (dim & (dim - 1)) == 0, "dim must be power of 2")
         let signed = x * signs
         let transformed = whtButterfly(signed)
-        // Use bare Float scalar to avoid fp32 promotion cascade.
-        // See Gemma4 PLE bf16 fix for rationale.
-        return transformed * Float(1.0 / sqrt(Float(dim)))
+        // Avoid fp32 promotion: scale as MLXArray in the input's dtype.
+        let scale = MLXArray(Float(1.0 / sqrt(Float(dim)))).asType(transformed.dtype)
+        return transformed * scale
     }
 
     /// Apply SRHT inverse rotation: x = diag(signs) * H * y / sqrt(dim)
@@ -348,7 +348,8 @@ public enum TurboQuantRotation {
         let dim = y.dim(-1)
         precondition(dim > 0 && (dim & (dim - 1)) == 0, "dim must be power of 2")
         let transformed = whtButterfly(y)
-        return transformed * Float(1.0 / sqrt(Float(dim))) * signs
+        let scale = MLXArray(Float(1.0 / sqrt(Float(dim)))).asType(transformed.dtype)
+        return transformed * scale * signs
     }
 }
 
@@ -520,7 +521,7 @@ public class MSECodec {
     public func encode(_ vectors: MLXArray) -> MSECodecState {
         // Extract norms and normalize (paper assumes unit sphere; we store norms separately)
         let norms = sqrt((vectors * vectors).sum(axis: -1))
-        let safeNorms = maximum(norms, Float(1e-8))
+        let safeNorms = maximum(norms, MLXArray(Float(1e-8)).asType(norms.dtype))
         let unit = vectors / expandedDimensions(safeNorms, axis: -1)
 
         // Rotate: y ← Π · x (Algorithm 1 line 5)
@@ -537,7 +538,7 @@ public class MSECodec {
             // Dense rotation path: norm correction compensates for quantization error
             let reconstructed = codebook[indices]  // [B,H,T,D] — quantized approximation in rotated space
             let reconNormSq = (reconstructed * reconstructed).sum(axis: -1)
-            let reconNorms = sqrt(maximum(reconNormSq, Float(1e-16)))
+            let reconNorms = sqrt(maximum(reconNormSq, MLXArray(Float(1e-16)).asType(reconNormSq.dtype)))
             storedNorms = norms / reconNorms  // original_norm / reconstruction_norm
         }
 
