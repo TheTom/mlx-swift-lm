@@ -963,6 +963,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
+        // Drain pending GPU work before prefill
+        Stream.gpu.synchronize()
+
         while y.tokens.size > 1 {
             let chunkSize = min(prefillStepSize, y.tokens.size - 1)
             let input = y[.newAxis, ..<chunkSize]
@@ -971,9 +974,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             _ = model(input.tokens, cache: cache.isEmpty ? nil : cache)
             let t1 = DispatchTime.now().uptimeNanoseconds
 
-            // Collect cache state arrays manually to time eval precisely
+            // Only eval non-shared caches (first 15)
+            let nonSharedCount = 35 - 20  // config.hiddenLayers - config.numKvSharedLayers
             var cacheArrays: [MLXArray] = []
-            for c in cache { cacheArrays.append(contentsOf: c.innerState()) }
+            for c in cache.prefix(nonSharedCount) { cacheArrays.append(contentsOf: c.innerState()) }
             let t2 = DispatchTime.now().uptimeNanoseconds
 
             eval(cacheArrays)
