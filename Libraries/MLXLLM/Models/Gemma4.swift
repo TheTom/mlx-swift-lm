@@ -133,6 +133,82 @@ private final class NativePrefillBridge {
         let _ = cache.update(keys: kArray, values: vArray)
         return true
     }
+
+    // MARK: - V2 (weight-sharing bridge)
+
+    private var v2Handle: UnsafeMutableRawPointer?
+    private var v2Initialized = false
+
+    typealias PB2Init = @convention(c) (Int32, Int32, Int32, Int32, Int32, Int32) -> Int32
+    typealias PB2SetWeight = @convention(c) (UnsafePointer<CChar>, UnsafeMutableRawPointer) -> Int32
+    typealias PB2Finalize = @convention(c) () -> Int32
+    typealias PB2Run = @convention(c) (UnsafePointer<Int32>, Int32, UnsafeMutablePointer<Double>, UnsafeMutablePointer<Float>) -> Int32
+    typealias PB2Cleanup = @convention(c) () -> Void
+
+    func ensureInitializedV2(model: Gemma4ModelInner, config: Gemma4TextConfiguration) -> Bool {
+        if v2Initialized { return true }
+
+        guard let h = dlopen("/tmp/libprefill_bridge_v2.dylib", RTLD_NOW) else {
+            print("[NativePrefill] V2 dylib not found")
+            return false
+        }
+        v2Handle = h
+
+        guard let initSym = dlsym(h, "pb2_init"),
+              let setSym = dlsym(h, "pb2_set_weight"),
+              let finSym = dlsym(h, "pb2_finalize") else {
+            print("[NativePrefill] V2 symbols not found")
+            return false
+        }
+
+        let pb2Init = unsafeBitCast(initSym, to: PB2Init.self)
+        let pb2Set = unsafeBitCast(setSym, to: PB2SetWeight.self)
+        let pb2Fin = unsafeBitCast(finSym, to: PB2Finalize.self)
+
+        // Init architecture
+        // slidingWindowPattern: count how many layers before first "full_attention"
+        let pattern = config.layerTypes.prefix(while: { $0 != "full_attention" }).count + 1
+        // Only build non-shared layers (first 15)
+        let nonShared = config.hiddenLayers - config.numKvSharedLayers
+        let rc = pb2Init(
+            Int32(nonShared), Int32(config.hiddenSize),
+            Int32(config.attentionHeads), Int32(config.kvHeads),
+            Int32(config.slidingWindow), Int32(pattern))
+        if rc != 0 { print("[NativePrefill] V2 init failed"); return false }
+
+        // Pass model weights
+        let params = model.parameters().flattened()
+        var weightCount = 0
+        for (key, arr) in params {
+            // Bridge expects keys WITHOUT "model." prefix
+            let rawPtr = arr.ctx.ctx
+            let status = key.withCString { cKey in
+                pb2Set(cKey, rawPtr!)
+            }
+            if status == 0 { weightCount += 1 }
+        }
+        print("[NativePrefill] V2: passed \(weightCount) weights to bridge")
+
+        let finRC = pb2Fin()
+        if finRC != 0 { print("[NativePrefill] V2 finalize failed"); return false }
+
+        v2Initialized = true
+        print("[NativePrefill] V2 initialized (weight-sharing)")
+        return true
+    }
+
+    func runV2(tokenIds: [Int32]) -> (elapsedMs: Double, checksum: Float)? {
+        guard v2Initialized, let h = v2Handle,
+              let runSym = dlsym(h, "pb2_run") else { return nil }
+        let pb2Run = unsafeBitCast(runSym, to: PB2Run.self)
+
+        var ms: Double = 0
+        var ck: Float = 0
+        let rc = tokenIds.withUnsafeBufferPointer { buf in
+            pb2Run(buf.baseAddress!, Int32(buf.count), &ms, &ck)
+        }
+        return rc == 0 ? (ms, ck) : nil
+    }
 }
 
 // MARK: - Configuration
@@ -1106,13 +1182,27 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
-        // Native prefill offload (NATIVE_PREFILL=1)
-        // Currently: timing comparison only. Full offload blocked by double model load.
-        // The native bridge achieves 50ms vs Swift's 104ms at 1K tokens (2.1x faster).
-        // Production integration requires weight sharing between bridge and Swift.
-        // See /tmp/prefill_bridge.cpp and [[MLX Swift Prefill Investigation]].
-        //
-        // To test standalone: .build/release/PrefillBench native
+        // Native prefill offload v2 (NATIVE_PREFILL=1)
+        // Uses weight-sharing bridge — passes Swift's weight arrays directly to C++ bridge.
+        // No double model load.
+        if NativePrefillBridge.isEnabled {
+            let bridge = NativePrefillBridge.shared
+            if bridge.ensureInitializedV2(model: model, config: config) {
+                let allTokens = input.text.tokens
+                let prefillCount = allTokens.size - 1
+                if prefillCount > 0 {
+                    let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
+                    eval(tokenSlice)
+                    let tokenIds = tokenSlice.asArray(Int32.self)
+
+                    if let result = bridge.runV2(tokenIds: tokenIds) {
+                        // TODO: inject K/V into Swift caches for decode
+                        print("[NativePrefill] \(prefillCount) tok in \(String(format: "%.1f", result.elapsedMs))ms (cksum=\(result.checksum))")
+                    }
+                }
+            }
+            // Fall through to Swift prefill (until KV injection works)
+        }
 
         // Only eval non-shared caches — shared layers don't update any cache,
         // so their computation is dead code that lazy eval will prune.
