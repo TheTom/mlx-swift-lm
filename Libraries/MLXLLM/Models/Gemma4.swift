@@ -194,6 +194,18 @@ private final class NativePrefillBridge {
 
         v2Initialized = true
         print("[NativePrefill] V2 initialized (weight-sharing)")
+
+        // Pre-warm: run a tiny forward to materialize lazy weights on GPU
+        if let runSym = dlsym(h, "pb2_run") {
+            let warmRun = unsafeBitCast(runSym, to: PB2Run.self)
+            var warmMs: Double = 0; var warmCk: Float = 0
+            let warmTokens: [Int32] = [1, 2, 3, 4]
+            warmTokens.withUnsafeBufferPointer { buf in
+                let _ = warmRun(buf.baseAddress!, 4, &warmMs, &warmCk)
+            }
+            print(String(format: "[NativePrefill] V2 pre-warmed in %.0fms", warmMs))
+        }
+
         return true
     }
 
@@ -1247,22 +1259,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 let allTokens = input.text.tokens
                 let prefillCount = allTokens.size - 1
                 if prefillCount > 0 {
-                    let t0 = CFAbsoluteTimeGetCurrent()
                     let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
                     eval(tokenSlice)
-                    let t1 = CFAbsoluteTimeGetCurrent()
                     let tokenIds = tokenSlice.asArray(Int32.self)
-                    let t2 = CFAbsoluteTimeGetCurrent()
-                    print(String(format: "[NP] token eval: %.0fms, asArray: %.0fms",
-                        (t1-t0)*1000, (t2-t1)*1000))
                     let nonShared = config.hiddenLayers - config.numKvSharedLayers
 
-                    let t3 = CFAbsoluteTimeGetCurrent()
                     let (ms, ok) = bridge.runAndInjectKV(
                         tokenIds: tokenIds, cache: cache, numLayers: nonShared)
-                    let t4 = CFAbsoluteTimeGetCurrent()
-                    print(String(format: "[NP] bridge+inject: %.0fms (bridge: %.1fms)",
-                        (t4-t3)*1000, ms))
 
                     if ok {
                         return .tokens(y)
