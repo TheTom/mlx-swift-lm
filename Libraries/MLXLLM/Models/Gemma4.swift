@@ -963,9 +963,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
-        // Drain pending GPU work before prefill
-        Stream.gpu.synchronize()
-
         while y.tokens.size > 1 {
             let chunkSize = min(prefillStepSize, y.tokens.size - 1)
             let input = y[.newAxis, ..<chunkSize]
