@@ -80,11 +80,19 @@ struct PrefillBenchmark {
                     log("Finalize: \(finRC)")
                     if finRC != 0 { return }
 
-                    // Run native prefill on 16 tokens
-                    let tokens16 = Array(allTokens.prefix(16))
+                    // Isolated bridge timing: 16 and 1024 tokens
                     var ms: Double = 0; var ck: Float = 0
-                    let runRC = pb2Run(tokens16, 16, &ms, &ck)
-                    log(String(format: "Native prefill 16 tok: rc=%d ms=%.1f cksum=%.4f", runRC, ms, ck))
+                    for n in [16, 1024] {
+                        let toks = Array(allTokens.prefix(n))
+                        // warmup
+                        for _ in 0..<3 { let _ = pb2Run(toks, Int32(n), &ms, &ck) }
+                        // timed
+                        var times: [Double] = []
+                        for _ in 0..<5 { let _ = pb2Run(toks, Int32(n), &ms, &ck); times.append(ms) }
+                        let avg = times.reduce(0, +) / 5.0
+                        log(String(format: "Bridge %4d tok: %.1fms (%.0f tok/s) cksum=%.4f",
+                            n, avg, Double(n)/(avg/1000.0), ck))
+                    }
 
                     // --- Task 2: K/V injection ---
                     typealias PB2KVNbytes = @convention(c) (Int32) -> Int
@@ -143,7 +151,7 @@ struct PrefillBenchmark {
 
                     // --- Task 3: Decode correctness ---
                     log("--- DECODE (native prefill → Swift decode) ---")
-                    let lastTok = MLXArray([tokens16.last!]).reshaped(1, 1)
+                    let lastTok = MLXArray([Array(allTokens.prefix(16)).last!]).reshaped(1, 1)
                     var nativeDecode: [Int32] = []
                     var inp = lastTok
                     for _ in 0..<8 {
@@ -158,7 +166,7 @@ struct PrefillBenchmark {
 
                     log("--- DECODE (Swift prefill → Swift decode) ---")
                     let swiftCache = model.newCache(parameters: nil)
-                    let swiftArr = MLXArray(tokens16).reshaped(1, 16)
+                    let swiftArr = MLXArray(Array(allTokens.prefix(16))).reshaped(1, 16)
                     let _ = model(swiftArr, cache: swiftCache); eval(swiftCache)
 
                     var swiftDecode: [Int32] = []
