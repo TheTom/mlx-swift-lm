@@ -84,7 +84,95 @@ struct PrefillBenchmark {
                     let tokens16 = Array(allTokens.prefix(16))
                     var ms: Double = 0; var ck: Float = 0
                     let runRC = pb2Run(tokens16, 16, &ms, &ck)
-                    log(String(format: "Run 16 tok: rc=%d ms=%.1f cksum=%.4f", runRC, ms, ck))
+                    log(String(format: "Native prefill 16 tok: rc=%d ms=%.1f cksum=%.4f", runRC, ms, ck))
+
+                    // --- Task 2: K/V injection ---
+                    typealias PB2KVNbytes = @convention(c) (Int32) -> Int
+                    typealias PB2KVShape = @convention(c) (Int32, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>) -> Int32
+                    typealias PB2ExportKV = @convention(c) (Int32, UnsafeMutableRawPointer, UnsafeMutableRawPointer) -> Int32
+
+                    let kvNbytes = unsafeBitCast(dlsym(lib, "pb2_kv_nbytes")!, to: PB2KVNbytes.self)
+                    let kvShape = unsafeBitCast(dlsym(lib, "pb2_kv_shape")!, to: PB2KVShape.self)
+                    let exportKV = unsafeBitCast(dlsym(lib, "pb2_export_kv")!, to: PB2ExportKV.self)
+
+                    let cache = model.newCache(parameters: nil)
+                    log("Cache created: \(cache.count) entries")
+                    for i in 0..<15 {
+                        log("  export layer \(i)...")
+                        let nb = kvNbytes(Int32(i))
+                        log("  nb=\(nb)")
+                        guard nb > 0 else { log("Layer \(i): no data"); continue }
+                        var kvH: Int32 = 0, seqL: Int32 = 0, hd: Int32 = 0
+                        let _ = kvShape(Int32(i), &kvH, &seqL, &hd)
+                        log("  shape: [\(kvH),\(seqL),\(hd)]")
+
+                        let kBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
+                        let vBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
+                        log("  allocated bufs")
+                        let rc = exportKV(Int32(i), kBuf, vBuf)
+                        log("  exported rc=\(rc)")
+                        guard rc == 0 else { kBuf.deallocate(); vBuf.deallocate(); log("Export \(i) failed"); continue }
+
+                        let shape = [1, Int(kvH), Int(seqL), Int(hd)]
+                        let numElements = shape.reduce(1, *)
+                        let bpe = nb / numElements
+                        let kData = Data(bytes: kBuf, count: nb)
+                        let vData = Data(bytes: vBuf, count: nb)
+                        kBuf.deallocate(); vBuf.deallocate()
+
+                        let kArr: MLXArray
+                        let vArr: MLXArray
+                        if bpe == 2 {
+                            // bfloat16 — view as bf16
+                            kArr = MLXArray(kData, shape, type: UInt16.self).view(dtype: .bfloat16)
+                            vArr = MLXArray(vData, shape, type: UInt16.self).view(dtype: .bfloat16)
+                        } else {
+                            // float32 — convert to bf16
+                            kArr = MLXArray(kData, shape, type: Float.self).asType(.bfloat16)
+                            vArr = MLXArray(vData, shape, type: Float.self).asType(.bfloat16)
+                        }
+
+                        log("  Layer \(i): K=\(kArr.shape) nb=\(nb)")
+                        let _ = cache[i].update(keys: kArr, values: vArr)
+                    }
+                    log("All layers injected, evaluating cache...")
+                    eval(cache)
+                    let c0sum = MLX.sum(cache[0].state[0]).item(Float.self)
+                    log(String(format: "Cache[0] K cksum: %.4f (bridge: %.4f) %@",
+                        c0sum, ck, abs(c0sum - ck) < 0.01 ? "✓" : "✗"))
+
+                    // --- Task 3: Decode correctness ---
+                    log("--- DECODE (native prefill → Swift decode) ---")
+                    let lastTok = MLXArray([tokens16.last!]).reshaped(1, 1)
+                    var nativeDecode: [Int32] = []
+                    var inp = lastTok
+                    for _ in 0..<8 {
+                        let logits = model(inp, cache: cache)
+                        let next = MLX.argMax(logits[0..., -1, 0...], axis: -1)
+                        eval(next)
+                        let tok = next.item(Int32.self)
+                        nativeDecode.append(tok)
+                        inp = MLXArray([tok]).reshaped(1, 1)
+                    }
+                    log("Native decode: \(nativeDecode)")
+
+                    log("--- DECODE (Swift prefill → Swift decode) ---")
+                    let swiftCache = model.newCache(parameters: nil)
+                    let swiftArr = MLXArray(tokens16).reshaped(1, 16)
+                    let _ = model(swiftArr, cache: swiftCache); eval(swiftCache)
+
+                    var swiftDecode: [Int32] = []
+                    inp = lastTok
+                    for _ in 0..<8 {
+                        let logits = model(inp, cache: swiftCache)
+                        let next = MLX.argMax(logits[0..., -1, 0...], axis: -1)
+                        eval(next)
+                        let tok = next.item(Int32.self)
+                        swiftDecode.append(tok)
+                        inp = MLXArray([tok]).reshaped(1, 1)
+                    }
+                    log("Swift decode:  \(swiftDecode)")
+                    log("MATCH: \(nativeDecode == swiftDecode ? "YES ✓" : "NO ✗")")
                 }
                 log("After perform")
                 dlclose(lib)
