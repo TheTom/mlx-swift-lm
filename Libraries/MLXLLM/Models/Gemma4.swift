@@ -91,6 +91,48 @@ private final class NativePrefillBridge {
 
         return (elapsedMs, checksum)
     }
+
+    /// Export K/V from layer and inject into Swift cache.
+    /// Returns true on success.
+    func exportKVToCache(layerIdx: Int, cache: KVCache) -> Bool {
+        guard initialized, let h = handle else { return false }
+
+        // Resolve export functions lazily
+        typealias KVBytesFn = @convention(c) (Int32) -> Int
+        typealias ExportFn = @convention(c) (Int32, UnsafeMutableRawPointer, UnsafeMutableRawPointer, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>) -> Int32
+
+        guard let bytesSym = dlsym(h, "prefill_bridge_kv_bytes"),
+              let exportSym = dlsym(h, "prefill_bridge_export_kv") else { return false }
+
+        let kvBytes = unsafeBitCast(bytesSym, to: KVBytesFn.self)
+        let exportKV = unsafeBitCast(exportSym, to: ExportFn.self)
+
+        let nbytes = kvBytes(Int32(layerIdx))
+        if nbytes == 0 { return false }
+
+        // Allocate CPU buffers
+        let kBuf = UnsafeMutableRawPointer.allocate(byteCount: nbytes, alignment: 16)
+        let vBuf = UnsafeMutableRawPointer.allocate(byteCount: nbytes, alignment: 16)
+        defer { kBuf.deallocate(); vBuf.deallocate() }
+
+        var kvHeads: Int32 = 0, seqLen: Int32 = 0, headDim: Int32 = 0
+        let status = exportKV(Int32(layerIdx), kBuf, vBuf, &kvHeads, &seqLen, &headDim)
+        if status != 0 { return false }
+
+        // Create MLXArrays from CPU data
+        // bfloat16 is stored as UInt16 in memory — create as UInt16 then reinterpret
+        let shape: [Int32] = [1, kvHeads, seqLen, headDim]
+        let count = Int(kvHeads * seqLen * headDim)
+
+        let kData = Data(bytes: kBuf, count: nbytes)
+        let vData = Data(bytes: vBuf, count: nbytes)
+        let kArray = MLXArray(kData, shape.map { Int($0) }, type: UInt16.self).asType(.bfloat16)
+        let vArray = MLXArray(vData, shape.map { Int($0) }, type: UInt16.self).asType(.bfloat16)
+
+        // Inject into cache by calling update()
+        let _ = cache.update(keys: kArray, values: vArray)
+        return true
+    }
 }
 
 // MARK: - Configuration
@@ -1064,29 +1106,25 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
-        // Native prefill timing comparison (NATIVE_PREFILL=1)
-        // TODO: Replace Swift prefill entirely once native bridge returns K/V arrays
+        // Native prefill comparison (NATIVE_PREFILL=1)
+        // Runs native C++ bridge for timing, then Swift for actual cache population.
+        // Shows achievable speedup from native offload.
         if NativePrefillBridge.isEnabled {
             let bridge = NativePrefillBridge.shared
             if bridge.ensureInitialized() {
-                // Extract all token IDs (except last) for prefill
                 let allTokens = input.text.tokens
                 let prefillCount = allTokens.size - 1
                 if prefillCount > 0 {
-                    // Materialize token IDs to CPU for the bridge
                     let tokenSlice = allTokens[0 ..< prefillCount]
                     eval(tokenSlice)
                     let tokenIds: [Int32] = (0 ..< prefillCount).map { i in
                         tokenSlice[i].item(Int32.self)
                     }
-
                     if let result = bridge.run(tokenIds: tokenIds) {
-                        print("[NativePrefill] \(prefillCount) tokens in \(String(format: "%.1f", result.elapsedMs))ms " +
-                              "(checksum=\(result.checksum))")
+                        print("[NativePrefill] \(prefillCount) tok: \(String(format: "%.1f", result.elapsedMs))ms native (cksum=\(result.checksum))")
                     }
                 }
             }
-            // Fall through to Swift prefill for actual cache population
         }
 
         // Only eval non-shared caches — shared layers don't update any cache,
