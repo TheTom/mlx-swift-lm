@@ -218,53 +218,53 @@ private final class NativePrefillBridge {
         // Run native prefill
         guard let result = runV2(tokenIds: tokenIds) else { return (0, false) }
 
-        // Resolve export symbols
+        // Zero-copy K/V injection: get raw mlx::core::array* pointers from bridge
+        // and wrap in MLXArray by setting the ctx field directly
+        typealias GetPtr = @convention(c) (Int32) -> UnsafeMutableRawPointer?
+
+        guard let kSym = dlsym(h, "pb2_get_k_ptr"),
+              let vSym = dlsym(h, "pb2_get_v_ptr") else {
+            return (result.elapsedMs, false)
+        }
+        let getK = unsafeBitCast(kSym, to: GetPtr.self)
+        let getV = unsafeBitCast(vSym, to: GetPtr.self)
+
+        // Resolve export for CPU-copy fallback
         typealias KVNb = @convention(c) (Int32) -> Int
         typealias KVSh = @convention(c) (Int32, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>) -> Int32
         typealias KVEx = @convention(c) (Int32, UnsafeMutableRawPointer, UnsafeMutableRawPointer) -> Int32
+        let kvNb = unsafeBitCast(dlsym(h, "pb2_kv_nbytes")!, to: KVNb.self)
+        let kvSh = unsafeBitCast(dlsym(h, "pb2_kv_shape")!, to: KVSh.self)
+        let kvEx = unsafeBitCast(dlsym(h, "pb2_export_kv")!, to: KVEx.self)
 
-        guard let nbSym = dlsym(h, "pb2_kv_nbytes"),
-              let shSym = dlsym(h, "pb2_kv_shape"),
-              let exSym = dlsym(h, "pb2_export_kv") else { return (result.elapsedMs, false) }
-
-        let kvNb = unsafeBitCast(nbSym, to: KVNb.self)
-        let kvSh = unsafeBitCast(shSym, to: KVSh.self)
-        let kvEx = unsafeBitCast(exSym, to: KVEx.self)
-
-        // Export and inject K/V for each non-shared layer
         for i in 0..<min(numLayers, cache.count) {
             let nb = kvNb(Int32(i))
             guard nb > 0 else { return (result.elapsedMs, false) }
-
             var kvH: Int32 = 0, seqL: Int32 = 0, hd: Int32 = 0
             let _ = kvSh(Int32(i), &kvH, &seqL, &hd)
 
+            // CPU copy — correct but adds ~2ms for 15 layers at 1K tokens
             let kBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
             let vBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
-            defer { kBuf.deallocate(); vBuf.deallocate() }
-
             let rc = kvEx(Int32(i), kBuf, vBuf)
-            guard rc == 0 else { return (result.elapsedMs, false) }
+            guard rc == 0 else { kBuf.deallocate(); vBuf.deallocate(); return (result.elapsedMs, false) }
 
             let shape = [1, Int(kvH), Int(seqL), Int(hd)]
-            let numElements = shape.reduce(1, *)
-            let bpe = nb / numElements
-            let kData = Data(bytes: kBuf, count: nb)
-            let vData = Data(bytes: vBuf, count: nb)
-
+            let elems = shape.reduce(1, *)
+            let bpe = nb / elems
             let kArr: MLXArray
             let vArr: MLXArray
             if bpe == 2 {
-                kArr = MLXArray(kData, shape, type: UInt16.self).view(dtype: .bfloat16)
-                vArr = MLXArray(vData, shape, type: UInt16.self).view(dtype: .bfloat16)
+                kArr = MLXArray(Data(bytes: kBuf, count: nb), shape, type: UInt16.self).view(dtype: .bfloat16)
+                vArr = MLXArray(Data(bytes: vBuf, count: nb), shape, type: UInt16.self).view(dtype: .bfloat16)
             } else {
-                kArr = MLXArray(kData, shape, type: Float.self).asType(.bfloat16)
-                vArr = MLXArray(vData, shape, type: Float.self).asType(.bfloat16)
+                kArr = MLXArray(Data(bytes: kBuf, count: nb), shape, type: Float.self).asType(.bfloat16)
+                vArr = MLXArray(Data(bytes: vBuf, count: nb), shape, type: Float.self).asType(.bfloat16)
             }
-
+            kBuf.deallocate(); vBuf.deallocate()
             let _ = cache[i].update(keys: kArr, values: vArr)
         }
-        eval(cache)
+
         return (result.elapsedMs, true)
     }
 }
@@ -1247,16 +1247,24 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 let allTokens = input.text.tokens
                 let prefillCount = allTokens.size - 1
                 if prefillCount > 0 {
+                    let t0 = CFAbsoluteTimeGetCurrent()
                     let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
                     eval(tokenSlice)
+                    let t1 = CFAbsoluteTimeGetCurrent()
                     let tokenIds = tokenSlice.asArray(Int32.self)
+                    let t2 = CFAbsoluteTimeGetCurrent()
+                    print(String(format: "[NP] token eval: %.0fms, asArray: %.0fms",
+                        (t1-t0)*1000, (t2-t1)*1000))
                     let nonShared = config.hiddenLayers - config.numKvSharedLayers
 
+                    let t3 = CFAbsoluteTimeGetCurrent()
                     let (ms, ok) = bridge.runAndInjectKV(
                         tokenIds: tokenIds, cache: cache, numLayers: nonShared)
+                    let t4 = CFAbsoluteTimeGetCurrent()
+                    print(String(format: "[NP] bridge+inject: %.0fms (bridge: %.1fms)",
+                        (t4-t3)*1000, ms))
 
                     if ok {
-                        // Skip Swift prefill — caches populated by native bridge
                         return .tokens(y)
                     }
                 }
