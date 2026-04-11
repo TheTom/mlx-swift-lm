@@ -7,58 +7,43 @@ import MLXLMCommon
 struct PrefillBenchmark {
     static func main() async {
         print("START")
-
         do {
-            let modelID = "mlx-community/gemma-4-e2b-it-4bit"
-            let config = ModelConfiguration(id: modelID)
+            let config = ModelConfiguration(id: "mlx-community/gemma-4-e2b-it-4bit")
             let container = try await LLMModelFactory.shared.loadContainer(
-                configuration: config
-            ) { p in
+                configuration: config) { p in
                 if p.fractionCompleted > 0.99 { print("Loading: 100%") }
             }
             print("MODEL_LOADED")
 
-            for ctx in [16, 1024, 2048, 4096] {
-                let path = "/tmp/bench_tokens_\(ctx > 16 ? ctx : 1024).json"
+            for ctx in [1024, 2048, 4096] {
+                let path = "/tmp/bench_tokens_\(ctx).json"
                 let data = try Data(contentsOf: URL(fileURLWithPath: path))
                 let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-                let allTokens = json["tokens"] as! [Int]
-                let tokens = Array(allTokens.prefix(ctx))
+                let tokens = Array((json["tokens"] as! [Int]).prefix(ctx)).map { Int32($0) }
 
                 try await container.perform { context in
                     let model = context.model
-                    let tokenArray = MLXArray(tokens.map { Int32($0) }).reshaped(1, tokens.count)
-
-                    // Warmup: 3 runs
+                    let arr = MLXArray(tokens).reshaped(1, tokens.count)
                     for _ in 0..<3 {
-                        let cache = model.newCache(parameters: nil)
-                        let _ = model(tokenArray, cache: cache)
-                        eval(cache)
-                        Stream.gpu.synchronize()
-                        MLX.Memory.clearCache()
+                        let c = model.newCache(parameters: nil)
+                        let _ = model(arr, cache: c); eval(c)
+                        Stream.gpu.synchronize(); MLX.Memory.clearCache()
                     }
-
-                    // Timed: 5 runs
                     var times: [Double] = []
                     for _ in 0..<5 {
-                        let cache = model.newCache(parameters: nil)
-                        let start = CFAbsoluteTimeGetCurrent()
-                        let _ = model(tokenArray, cache: cache)
-                        eval(cache)
+                        let c = model.newCache(parameters: nil)
+                        let t0 = CFAbsoluteTimeGetCurrent()
+                        let _ = model(arr, cache: c); eval(c)
                         Stream.gpu.synchronize()
-                        let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
-                        times.append(elapsed)
+                        times.append((CFAbsoluteTimeGetCurrent() - t0) * 1000)
                         MLX.Memory.clearCache()
                     }
-
-                    let avg = times.reduce(0, +) / Double(times.count)
+                    let avg = times.reduce(0, +) / 5.0
                     let tps = Double(tokens.count) / (avg / 1000.0)
-                    print(String(format: "ctx=%4d tokens=%4d avg=%.1fms %.0f tok/s",
-                        ctx, tokens.count, avg, tps))
+                    print(String(format: "ctx=%4d: %.1fms (%.0f tok/s)", ctx, avg, tps))
                 }
             }
             print("Done.")
-
         } catch {
             print("ERROR: \(error)")
         }
