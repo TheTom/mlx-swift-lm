@@ -183,6 +183,20 @@ let package = Package(
                 .enableExperimentalFeature("StrictConcurrency")
             ]
         ),
+        .executableTarget(
+            name: "PrefillBench",
+            dependencies: [
+                "MLXLLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Hub", package: "swift-transformers"),
+            ],
+            path: "Sources/PrefillBench",
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
     ]
 )
 
