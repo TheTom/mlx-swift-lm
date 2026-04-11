@@ -241,7 +241,7 @@ private final class NativePrefillBridge {
         let getK = unsafeBitCast(kSym, to: GetPtr.self)
         let getV = unsafeBitCast(vSym, to: GetPtr.self)
 
-        // Resolve export for CPU-copy fallback
+        // CPU-copy K/V injection (~8ms for 15 layers at 1K tokens)
         typealias KVNb = @convention(c) (Int32) -> Int
         typealias KVSh = @convention(c) (Int32, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>) -> Int32
         typealias KVEx = @convention(c) (Int32, UnsafeMutableRawPointer, UnsafeMutableRawPointer) -> Int32
@@ -255,7 +255,6 @@ private final class NativePrefillBridge {
             var kvH: Int32 = 0, seqL: Int32 = 0, hd: Int32 = 0
             let _ = kvSh(Int32(i), &kvH, &seqL, &hd)
 
-            // CPU copy — correct but adds ~2ms for 15 layers at 1K tokens
             let kBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
             let vBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
             let rc = kvEx(Int32(i), kBuf, vBuf)
