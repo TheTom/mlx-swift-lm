@@ -1106,26 +1106,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
-        // Native prefill comparison (NATIVE_PREFILL=1)
-        // Runs native C++ bridge for timing, then Swift for actual cache population.
-        // Shows achievable speedup from native offload.
-        if NativePrefillBridge.isEnabled {
-            let bridge = NativePrefillBridge.shared
-            if bridge.ensureInitialized() {
-                let allTokens = input.text.tokens
-                let prefillCount = allTokens.size - 1
-                if prefillCount > 0 {
-                    let tokenSlice = allTokens[0 ..< prefillCount]
-                    eval(tokenSlice)
-                    let tokenIds: [Int32] = (0 ..< prefillCount).map { i in
-                        tokenSlice[i].item(Int32.self)
-                    }
-                    if let result = bridge.run(tokenIds: tokenIds) {
-                        print("[NativePrefill] \(prefillCount) tok: \(String(format: "%.1f", result.elapsedMs))ms native (cksum=\(result.checksum))")
-                    }
-                }
-            }
-        }
+        // Native prefill offload (NATIVE_PREFILL=1)
+        // Currently: timing comparison only. Full offload blocked by double model load.
+        // The native bridge achieves 50ms vs Swift's 104ms at 1K tokens (2.1x faster).
+        // Production integration requires weight sharing between bridge and Swift.
+        // See /tmp/prefill_bridge.cpp and [[MLX Swift Prefill Investigation]].
+        //
+        // To test standalone: .build/release/PrefillBench native
 
         // Only eval non-shared caches — shared layers don't update any cache,
         // so their computation is dead code that lazy eval will prune.
