@@ -411,6 +411,16 @@ class Gemma4Attention: Module {
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
+        // Log shapes/strides for first call only
+        struct FirstCall { static var logged = false }
+        if !FirstCall.logged && L > 100 {
+            FirstCall.logged = true
+            if let ql = qProj as? QuantizedLinear {
+                print("[ATTN-L0] qProj: w=\(ql.weight.shape) s=\(ql.scales.shape) b=\(ql.biases?.shape ?? []) bits=\(ql.bits) gs=\(ql.groupSize)")
+            }
+            print("[ATTN-L0] x: \(x.shape) dtype=\(x.dtype)")
+        }
+
         var queries = qProj(x).reshaped(B, L, nHeads, -1)
 
         if useSharedKV, let sharedKV = sharedKVArrays {
