@@ -12,6 +12,87 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Native Prefill Bridge (C++ dylib)
+
+/// Lazy-loaded bridge to native C++ prefill for timing comparison.
+/// Activated by setting NATIVE_PREFILL=1 environment variable.
+/// TODO: Once validated, replace Swift prefill entirely with native K/V injection.
+private final class NativePrefillBridge {
+    static let shared = NativePrefillBridge()
+
+    private var handle: UnsafeMutableRawPointer?
+    private var initFn: (@convention(c) (UnsafePointer<CChar>) -> Int32)?
+    private var runFn: (@convention(c) (UnsafePointer<Int32>, Int32, UnsafeMutablePointer<Double>?, UnsafeMutablePointer<Float>?) -> Int32)?
+    private var cleanupFn: (@convention(c) () -> Void)?
+    private var initialized = false
+
+    /// Whether native prefill is enabled via env var
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1"
+    }
+
+    /// Load dylib and init model weights. Returns true on success.
+    func ensureInitialized() -> Bool {
+        if initialized { return true }
+
+        // Load the dylib
+        let dylibPath = "/tmp/libprefill_bridge.dylib"
+        guard let h = dlopen(dylibPath, RTLD_NOW) else {
+            let err = String(cString: dlerror())
+            print("[NativePrefill] Failed to load \(dylibPath): \(err)")
+            return false
+        }
+        handle = h
+
+        // Resolve symbols
+        guard let initSym = dlsym(h, "prefill_bridge_init"),
+              let runSym = dlsym(h, "prefill_bridge_run2"),
+              let cleanSym = dlsym(h, "prefill_bridge_cleanup") else {
+            let err = String(cString: dlerror())
+            print("[NativePrefill] Symbol lookup failed: \(err)")
+            return false
+        }
+
+        initFn = unsafeBitCast(initSym, to: (@convention(c) (UnsafePointer<CChar>) -> Int32).self)
+        runFn = unsafeBitCast(runSym, to: (@convention(c) (UnsafePointer<Int32>, Int32, UnsafeMutablePointer<Double>?, UnsafeMutablePointer<Float>?) -> Int32).self)
+        cleanupFn = unsafeBitCast(cleanSym, to: (@convention(c) () -> Void).self)
+
+        // Init with model path — look for HF cache path via env or use default
+        let modelPath = ProcessInfo.processInfo.environment["NATIVE_PREFILL_MODEL_PATH"]
+            ?? NSString(string: "~/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-4bit").expandingTildeInPath
+        print("[NativePrefill] Initializing with model path: \(modelPath)")
+
+        let status = initFn!(modelPath)
+        if status != 0 {
+            print("[NativePrefill] Init failed with status \(status)")
+            return false
+        }
+
+        initialized = true
+        print("[NativePrefill] Bridge initialized successfully")
+        return true
+    }
+
+    /// Run native prefill and return (elapsed_ms, checksum). Returns nil on failure.
+    func run(tokenIds: [Int32]) -> (elapsedMs: Double, checksum: Float)? {
+        guard initialized, let runFn = runFn else { return nil }
+
+        var elapsedMs: Double = 0
+        var checksum: Float = 0
+
+        let status = tokenIds.withUnsafeBufferPointer { buf in
+            runFn(buf.baseAddress!, Int32(buf.count), &elapsedMs, &checksum)
+        }
+
+        if status != 0 {
+            print("[NativePrefill] Run failed with status \(status)")
+            return nil
+        }
+
+        return (elapsedMs, checksum)
+    }
+}
+
 // MARK: - Configuration
 
 public struct Gemma4TextConfiguration: Codable, Sendable {
@@ -983,15 +1064,41 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
+        // Native prefill timing comparison (NATIVE_PREFILL=1)
+        // TODO: Replace Swift prefill entirely once native bridge returns K/V arrays
+        if NativePrefillBridge.isEnabled {
+            let bridge = NativePrefillBridge.shared
+            if bridge.ensureInitialized() {
+                // Extract all token IDs (except last) for prefill
+                let allTokens = input.text.tokens
+                let prefillCount = allTokens.size - 1
+                if prefillCount > 0 {
+                    // Materialize token IDs to CPU for the bridge
+                    let tokenSlice = allTokens[0 ..< prefillCount]
+                    eval(tokenSlice)
+                    let tokenIds: [Int32] = (0 ..< prefillCount).map { i in
+                        tokenSlice[i].item(Int32.self)
+                    }
+
+                    if let result = bridge.run(tokenIds: tokenIds) {
+                        print("[NativePrefill] \(prefillCount) tokens in \(String(format: "%.1f", result.elapsedMs))ms " +
+                              "(checksum=\(result.checksum))")
+                    }
+                }
+            }
+            // Fall through to Swift prefill for actual cache population
+        }
+
         // Only eval non-shared caches — shared layers don't update any cache,
         // so their computation is dead code that lazy eval will prune.
         // Matches Python's behavior where make_cache() creates only non-shared caches.
         let nonSharedCount = config.hiddenLayers - config.numKvSharedLayers
 
+        let swiftStart = CFAbsoluteTimeGetCurrent()
+
         while y.tokens.size > 1 {
             let chunkSize = min(prefillStepSize, y.tokens.size - 1)
             let input = y[.newAxis, ..<chunkSize]
-            print("[PREPARE] chunk \(chunkSize) tokens, prefillMode=true, nonSharedCount=\(nonSharedCount)")
             _ = model(input.tokens, cache: cache.isEmpty ? nil : cache, prefillMode: true)
 
             // Eval only non-shared caches for graph pruning
@@ -1003,6 +1110,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
             y = y[chunkSize...]
             MLX.Memory.clearCache()
+        }
+
+        if NativePrefillBridge.isEnabled {
+            let swiftMs = (CFAbsoluteTimeGetCurrent() - swiftStart) * 1000.0
+            print("[NativePrefill] Swift prefill took \(String(format: "%.1f", swiftMs))ms for comparison")
         }
 
         return .tokens(y)
