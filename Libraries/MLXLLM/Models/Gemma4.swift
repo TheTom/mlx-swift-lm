@@ -209,6 +209,64 @@ private final class NativePrefillBridge {
         }
         return rc == 0 ? (ms, ck) : nil
     }
+
+    /// Run native prefill and inject K/V into Swift caches.
+    /// Returns (elapsed_ms, success). Caches are populated on success.
+    func runAndInjectKV(tokenIds: [Int32], cache: [KVCache], numLayers: Int) -> (Double, Bool) {
+        guard v2Initialized, let h = v2Handle else { return (0, false) }
+
+        // Run native prefill
+        guard let result = runV2(tokenIds: tokenIds) else { return (0, false) }
+
+        // Resolve export symbols
+        typealias KVNb = @convention(c) (Int32) -> Int
+        typealias KVSh = @convention(c) (Int32, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>) -> Int32
+        typealias KVEx = @convention(c) (Int32, UnsafeMutableRawPointer, UnsafeMutableRawPointer) -> Int32
+
+        guard let nbSym = dlsym(h, "pb2_kv_nbytes"),
+              let shSym = dlsym(h, "pb2_kv_shape"),
+              let exSym = dlsym(h, "pb2_export_kv") else { return (result.elapsedMs, false) }
+
+        let kvNb = unsafeBitCast(nbSym, to: KVNb.self)
+        let kvSh = unsafeBitCast(shSym, to: KVSh.self)
+        let kvEx = unsafeBitCast(exSym, to: KVEx.self)
+
+        // Export and inject K/V for each non-shared layer
+        for i in 0..<min(numLayers, cache.count) {
+            let nb = kvNb(Int32(i))
+            guard nb > 0 else { return (result.elapsedMs, false) }
+
+            var kvH: Int32 = 0, seqL: Int32 = 0, hd: Int32 = 0
+            let _ = kvSh(Int32(i), &kvH, &seqL, &hd)
+
+            let kBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
+            let vBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
+            defer { kBuf.deallocate(); vBuf.deallocate() }
+
+            let rc = kvEx(Int32(i), kBuf, vBuf)
+            guard rc == 0 else { return (result.elapsedMs, false) }
+
+            let shape = [1, Int(kvH), Int(seqL), Int(hd)]
+            let numElements = shape.reduce(1, *)
+            let bpe = nb / numElements
+            let kData = Data(bytes: kBuf, count: nb)
+            let vData = Data(bytes: vBuf, count: nb)
+
+            let kArr: MLXArray
+            let vArr: MLXArray
+            if bpe == 2 {
+                kArr = MLXArray(kData, shape, type: UInt16.self).view(dtype: .bfloat16)
+                vArr = MLXArray(vData, shape, type: UInt16.self).view(dtype: .bfloat16)
+            } else {
+                kArr = MLXArray(kData, shape, type: Float.self).asType(.bfloat16)
+                vArr = MLXArray(vData, shape, type: Float.self).asType(.bfloat16)
+            }
+
+            let _ = cache[i].update(keys: kArr, values: vArr)
+        }
+        eval(cache)
+        return (result.elapsedMs, true)
+    }
 }
 
 // MARK: - Configuration
@@ -1183,8 +1241,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         var y = input.text
 
         // Native prefill offload v2 (NATIVE_PREFILL=1)
-        // Uses weight-sharing bridge — passes Swift's weight arrays directly to C++ bridge.
-        // No double model load.
         if NativePrefillBridge.isEnabled {
             let bridge = NativePrefillBridge.shared
             if bridge.ensureInitializedV2(model: model, config: config) {
@@ -1194,22 +1250,24 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
                     eval(tokenSlice)
                     let tokenIds = tokenSlice.asArray(Int32.self)
+                    let nonShared = config.hiddenLayers - config.numKvSharedLayers
 
-                    if let result = bridge.runV2(tokenIds: tokenIds) {
-                        // TODO: inject K/V into Swift caches for decode
-                        print("[NativePrefill] \(prefillCount) tok in \(String(format: "%.1f", result.elapsedMs))ms (cksum=\(result.checksum))")
+                    let (ms, ok) = bridge.runAndInjectKV(
+                        tokenIds: tokenIds, cache: cache, numLayers: nonShared)
+
+                    if ok {
+                        // Skip Swift prefill — caches populated by native bridge
+                        return .tokens(y)
                     }
                 }
             }
-            // Fall through to Swift prefill (until KV injection works)
+            // Fall through to Swift prefill on failure
         }
 
         // Only eval non-shared caches — shared layers don't update any cache,
         // so their computation is dead code that lazy eval will prune.
         // Matches Python's behavior where make_cache() creates only non-shared caches.
         let nonSharedCount = config.hiddenLayers - config.numKvSharedLayers
-
-        let swiftStart = CFAbsoluteTimeGetCurrent()
 
         while y.tokens.size > 1 {
             let chunkSize = min(prefillStepSize, y.tokens.size - 1)
@@ -1227,10 +1285,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             MLX.Memory.clearCache()
         }
 
-        if NativePrefillBridge.isEnabled {
-            let swiftMs = (CFAbsoluteTimeGetCurrent() - swiftStart) * 1000.0
-            print("[NativePrefill] Swift prefill took \(String(format: "%.1f", swiftMs))ms for comparison")
-        }
+
 
         return .tokens(y)
     }
