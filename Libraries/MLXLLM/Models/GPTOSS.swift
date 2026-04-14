@@ -8,6 +8,7 @@
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gpt_oss.py
 
 import Foundation
+import NativePrefillBridge
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -436,8 +437,31 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
+
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+            let bridge = GenericPrefillBridge.shared
+            let json = """
+            {"model_type":"gpt_oss","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":false,"num_local_experts":\(configuration.localExperts),"num_experts_per_tok":\(configuration.expertsPerToken),"rope_type":"\({ if case .string(let s) = configuration.ropeScaling?["rope_type"] { return s } else { return "" } }())","yarn_factor":\(configuration.ropeScaling?["factor"]?.asFloat() ?? 1.0),"yarn_beta_fast":\(configuration.ropeScaling?["beta_fast"]?.asFloat() ?? 32.0),"yarn_beta_slow":\(configuration.ropeScaling?["beta_slow"]?.asFloat() ?? 1.0),"yarn_original_max_pos":\(configuration.ropeScaling?["original_max_position_embeddings"]?.asInt() ?? 4096)}
+            """
+            if bridge.ensureInitialized(modelType: "gpt_oss", model: model, config: json) {
+                let allTokens = input.text.tokens
+                let prefillCount = allTokens.size - 1
+                if prefillCount > 0 {
+                    let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
+                    let (ms, ok) = bridge.runAndInjectKV(
+                        tokenArray: tokenSlice, cache: cache, numLayers: configuration.hiddenLayers)
+                    if ok {
+                        print(String(format: "[GenericPrefill] %d tokens in %.1fms (%.0f t/s)",
+                            prefillCount, ms, Double(prefillCount) / (ms / 1000)))
+                        let lastToken = allTokens[prefillCount ..< allTokens.size]
+                        return .tokens(LMInput.Text(tokens: lastToken))
+                    }
+                }
+            }
+        }
+
+        let prefillStepSize = max(windowSize ?? 512, 2048)
 
         // Match Python mlx-lm: process every prefill token except the LAST one
         // through chunked prefill so we always hit the eval+clearCache between
