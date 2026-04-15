@@ -321,7 +321,7 @@ struct InferenceBenchmarks {
         ("What is my partner's name?", "Alice"),
     ]
     static let minimalSystemPrompt = "You are a helpful assistant. Keep responses concise."
-    static let simpleQuery = "Hello! What is your name and what can you help me with?"
+    static let simpleQuery = ProcessInfo.processInfo.environment["MLX_BENCH_PROMPT"] ?? "Hello! What is your name and what can you help me with?"
     /// Default context limit for non-scaling methods.
     /// Enforced via maxKVSize (RotatingKVCache) to simulate a realistic chat deployment.
     static let defaultContextLimit = 4096
@@ -333,9 +333,44 @@ struct InferenceBenchmarks {
     // MARK: - Entry Point
 
     /// Single benchmark entry point. All configuration comes from env vars.
+    /// Print build environment for debugging — confirms NAX, bridge, model template.
+    /// If prefill < 10K tok/s on Gemma E2B, something is wrong.
+    static func printBuildEnvironment() {
+        let bridge = ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1"
+
+        // NAX check: if Cmlx was compiled with NAX, the .o files exist
+        let naxObj = FileManager.default.fileExists(
+            atPath: ".build/arm64-apple-macosx/release/Cmlx.build/mlx-generated/steel_attention_nax.cpp.o")
+        print("[ENV] NAX: \(naxObj ? "ENABLED ✓" : "DISABLED ✗ — merge ekryski/mlx-swift#2, swift package clean, rebuild")")
+
+        print("[ENV] Bridge: \(bridge ? "ENABLED (NATIVE_PREFILL=1)" : "OFF (Swift prefill)")")
+        if bridge {
+            let paths = ["Sources/NativePrefillBridge/libprefill_bridge_gemma.dylib",
+                         ".build/arm64-apple-macosx/release/libprefill_bridge_gemma.dylib"]
+            let found = paths.first { FileManager.default.fileExists(atPath: $0) }
+            print("[ENV] Bridge dylib: \(found ?? "NOT FOUND — run: ./scripts/build-prefill-bridge.sh")")
+        }
+
+        // Gemma 4 template check
+        if let modelPath = ProcessInfo.processInfo.environment["MLX_BENCH_MODEL"],
+           modelPath.lowercased().contains("gemma") {
+            let tcPath = (modelPath as NSString).expandingTildeInPath + "/tokenizer_config.json"
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: tcPath)),
+               let tc = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let tmpl = tc["chat_template"] as? String, tmpl.count > 100 {
+                    print("[ENV] Gemma template: OK (\(tmpl.count) chars)")
+                } else {
+                    print("[ENV] Gemma template: MISSING ✗ — run: python3 scripts/fix-gemma4-template.py \(modelPath)")
+                }
+            }
+        }
+    }
+
     @Test @MainActor func benchmark() async throws {
         // Force line-buffered stdout so progress lines appear immediately when piped
         setlinebuf(stdout)
+
+        Self.printBuildEnvironment()
 
         let family = try resolveFamily()
         let kv = BenchEnv.kvConfig
@@ -536,7 +571,7 @@ struct InferenceBenchmarks {
         contextSize: Int,
         messages: [Message],
         systemPrompt: String?,
-        maxTokens: Int = 200,
+        maxTokens: Int = Int(ProcessInfo.processInfo.environment["MLX_BENCH_MAX_TOKENS"].flatMap { Int($0) } ?? 200),
         includeTools: Bool = false,
         validation: ValidationCheck? = nil,
         warmup: Bool = false
@@ -613,8 +648,11 @@ struct InferenceBenchmarks {
         do {
             lmInput = try await container.prepare(input: userInput)
         } catch {
-            print("[BENCH] Template error: \(error). Retrying without tools...")
-            let fallbackInput = UserInput(prompt: .messages(allMessages))
+            // Some models (e.g. Mistral) don't support system messages or tools.
+            // Retry with just the user messages, no system prompt, no tools.
+            let userOnly = allMessages.filter { ($0["role"] as? String) != "system" }
+            print("[BENCH] Template error: \(error). Retrying without system/tools...")
+            let fallbackInput = UserInput(prompt: .messages(userOnly))
             lmInput = try await container.prepare(input: fallbackInput)
         }
         var promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
@@ -1362,9 +1400,19 @@ struct InferenceBenchmarks {
         if let cached = ModelCache.shared.get(repoId) {
             return cached
         }
-        let modelConfig = family.extraEOSTokens.isEmpty
-            ? ModelConfiguration(id: repoId)
-            : ModelConfiguration(id: repoId, extraEOSTokens: Set(family.extraEOSTokens))
+        // Support local paths: if repoId starts with / or ~, treat as directory
+        let isLocal = repoId.hasPrefix("/") || repoId.hasPrefix("~") || repoId.hasPrefix(".")
+        let modelConfig: ModelConfiguration
+        if isLocal {
+            let expanded = NSString(string: repoId).expandingTildeInPath
+            modelConfig = family.extraEOSTokens.isEmpty
+                ? ModelConfiguration(directory: URL(fileURLWithPath: expanded))
+                : ModelConfiguration(directory: URL(fileURLWithPath: expanded), extraEOSTokens: Set(family.extraEOSTokens))
+        } else {
+            modelConfig = family.extraEOSTokens.isEmpty
+                ? ModelConfiguration(id: repoId)
+                : ModelConfiguration(id: repoId, extraEOSTokens: Set(family.extraEOSTokens))
+        }
         let container = try await LLMModelFactory.shared.loadContainer(configuration: modelConfig) { p in
             if p.fractionCompleted < 0.01 || p.fractionCompleted > 0.99 {
                 print("[BENCH] Loading: \(String(format: "%.0f", p.fractionCompleted * 100))%")

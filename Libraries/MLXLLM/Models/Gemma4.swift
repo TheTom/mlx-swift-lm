@@ -11,269 +11,154 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+// MARK: - Gemma Prefill Bridge (C++ dylib via dlopen)
 
-// MARK: - Native Prefill Bridge (C++ dylib)
-
-/// Lazy-loaded bridge to native C++ prefill for timing comparison.
+/// Lazy-loaded bridge to native C++ prefill.
+/// Uses dlopen to load the bridge dylib, avoiding SPM's link-time optimization
+/// which miscompiles quantized_matmul. The dylib uses -undefined dynamic_lookup
+/// to share the host's MLX allocator (no dual-allocator OOM).
+///
 /// Activated by setting NATIVE_PREFILL=1 environment variable.
-/// TODO: Once validated, replace Swift prefill entirely with native K/V injection.
-private final class NativePrefillBridge {
-    static let shared = NativePrefillBridge()
+private final class GemmaPrefillBridge {
+    static let shared = GemmaPrefillBridge()
 
     private var handle: UnsafeMutableRawPointer?
-    private var initFn: (@convention(c) (UnsafePointer<CChar>) -> Int32)?
-    private var runFn: (@convention(c) (UnsafePointer<Int32>, Int32, UnsafeMutablePointer<Double>?, UnsafeMutablePointer<Float>?) -> Int32)?
-    private var cleanupFn: (@convention(c) () -> Void)?
     private var initialized = false
 
-    /// Whether native prefill is enabled via env var
-    static var isEnabled: Bool {
-        ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1"
+    // Function pointer types matching the C API
+    private typealias InitFn = @convention(c) (Int32, Int32, Int32, Int32, Int32, Int32) -> Int32
+    private typealias SetWeightFn = @convention(c) (UnsafePointer<CChar>, UnsafeMutableRawPointer) -> Int32
+    private typealias FinalizeFn = @convention(c) () -> Int32
+    private typealias RunFn = @convention(c) (UnsafePointer<Int32>, Int32, UnsafeMutablePointer<Double>, UnsafeMutablePointer<Float>) -> Int32
+    private typealias RunArrayFn = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<Double>, UnsafeMutablePointer<Float>) -> Int32
+    private typealias GetKVFn = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutableRawPointer?>, UnsafeMutablePointer<UnsafeMutableRawPointer?>) -> Void
+    private typealias NumLayersFn = @convention(c) () -> Int32
+
+    // Resolved symbols
+    private var fnInit: InitFn?
+    private var fnSetWeight: SetWeightFn?
+    private var fnFinalize: FinalizeFn?
+    private var fnRun: RunFn?
+    private var fnRunArray: RunArrayFn?
+    private var fnGetKV: GetKVFn?
+    private var fnNumLayers: NumLayersFn?
+
+    private func loadDylib() -> Bool {
+        if handle != nil { return true }
+        let searchPaths = [
+            Bundle.main.executableURL?.deletingLastPathComponent()
+                .appendingPathComponent("libprefill_bridge_gemma.dylib").path,
+            "Sources/NativePrefillBridge/libprefill_bridge_gemma.dylib",
+            ".build/arm64-apple-macosx/release/libprefill_bridge_gemma.dylib",
+        ].compactMap { $0 }
+
+        for path in searchPaths {
+            if let h = dlopen(path, RTLD_NOW) {
+                handle = h
+                print("[GemmaPrefill] Loaded dylib: \(path)")
+                break
+            }
+        }
+        guard let h = handle else {
+            print("[GemmaPrefill] dylib not found. Run: ./scripts/build-prefill-bridge.sh")
+            return false
+        }
+
+        fnInit = unsafeBitCast(dlsym(h, "gemma_init"), to: InitFn.self)
+        fnSetWeight = unsafeBitCast(dlsym(h, "gemma_set_weight"), to: SetWeightFn.self)
+        fnFinalize = unsafeBitCast(dlsym(h, "gemma_finalize"), to: FinalizeFn.self)
+        fnRun = unsafeBitCast(dlsym(h, "gemma_run"), to: RunFn.self)
+        fnRunArray = unsafeBitCast(dlsym(h, "gemma_run_array"), to: RunArrayFn.self)
+        fnGetKV = unsafeBitCast(dlsym(h, "gemma_get_kv_handles"), to: GetKVFn.self)
+        fnNumLayers = unsafeBitCast(dlsym(h, "gemma_num_layers"), to: NumLayersFn.self)
+        return true
     }
 
-    /// Load dylib and init model weights. Returns true on success.
-    func ensureInitialized() -> Bool {
+    func ensureInitialized(model: Gemma4ModelInner, config: Gemma4TextConfiguration) -> Bool {
         if initialized { return true }
+        guard loadDylib(), let fnInit, let fnSetWeight, let fnFinalize, let fnRun else { return false }
 
-        // Load the dylib
-        let dylibPath = "/tmp/libprefill_bridge.dylib"
-        guard let h = dlopen(dylibPath, RTLD_NOW) else {
-            let err = String(cString: dlerror())
-            print("[NativePrefill] Failed to load \(dylibPath): \(err)")
-            return false
-        }
-        handle = h
-
-        // Resolve symbols
-        guard let initSym = dlsym(h, "prefill_bridge_init"),
-              let runSym = dlsym(h, "prefill_bridge_run2"),
-              let cleanSym = dlsym(h, "prefill_bridge_cleanup") else {
-            let err = String(cString: dlerror())
-            print("[NativePrefill] Symbol lookup failed: \(err)")
-            return false
-        }
-
-        initFn = unsafeBitCast(initSym, to: (@convention(c) (UnsafePointer<CChar>) -> Int32).self)
-        runFn = unsafeBitCast(runSym, to: (@convention(c) (UnsafePointer<Int32>, Int32, UnsafeMutablePointer<Double>?, UnsafeMutablePointer<Float>?) -> Int32).self)
-        cleanupFn = unsafeBitCast(cleanSym, to: (@convention(c) () -> Void).self)
-
-        // Init with model path — look for HF cache path via env or use default
-        let modelPath = ProcessInfo.processInfo.environment["NATIVE_PREFILL_MODEL_PATH"]
-            ?? NSString(string: "~/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-4bit").expandingTildeInPath
-        print("[NativePrefill] Initializing with model path: \(modelPath)")
-
-        let status = initFn!(modelPath)
-        if status != 0 {
-            print("[NativePrefill] Init failed with status \(status)")
-            return false
-        }
-
-        initialized = true
-        print("[NativePrefill] Bridge initialized successfully")
-        return true
-    }
-
-    /// Run native prefill and return (elapsed_ms, checksum). Returns nil on failure.
-    func run(tokenIds: [Int32]) -> (elapsedMs: Double, checksum: Float)? {
-        guard initialized, let runFn = runFn else { return nil }
-
-        var elapsedMs: Double = 0
-        var checksum: Float = 0
-
-        let status = tokenIds.withUnsafeBufferPointer { buf in
-            runFn(buf.baseAddress!, Int32(buf.count), &elapsedMs, &checksum)
-        }
-
-        if status != 0 {
-            print("[NativePrefill] Run failed with status \(status)")
-            return nil
-        }
-
-        return (elapsedMs, checksum)
-    }
-
-    /// Export K/V from layer and inject into Swift cache.
-    /// Returns true on success.
-    func exportKVToCache(layerIdx: Int, cache: KVCache) -> Bool {
-        guard initialized, let h = handle else { return false }
-
-        // Resolve export functions lazily
-        typealias KVBytesFn = @convention(c) (Int32) -> Int
-        typealias ExportFn = @convention(c) (Int32, UnsafeMutableRawPointer, UnsafeMutableRawPointer, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>) -> Int32
-
-        guard let bytesSym = dlsym(h, "prefill_bridge_kv_bytes"),
-              let exportSym = dlsym(h, "prefill_bridge_export_kv") else { return false }
-
-        let kvBytes = unsafeBitCast(bytesSym, to: KVBytesFn.self)
-        let exportKV = unsafeBitCast(exportSym, to: ExportFn.self)
-
-        let nbytes = kvBytes(Int32(layerIdx))
-        if nbytes == 0 { return false }
-
-        // Allocate CPU buffers
-        let kBuf = UnsafeMutableRawPointer.allocate(byteCount: nbytes, alignment: 16)
-        let vBuf = UnsafeMutableRawPointer.allocate(byteCount: nbytes, alignment: 16)
-        defer { kBuf.deallocate(); vBuf.deallocate() }
-
-        var kvHeads: Int32 = 0, seqLen: Int32 = 0, headDim: Int32 = 0
-        let status = exportKV(Int32(layerIdx), kBuf, vBuf, &kvHeads, &seqLen, &headDim)
-        if status != 0 { return false }
-
-        // Create MLXArrays from CPU data
-        // bfloat16 is stored as UInt16 in memory — create as UInt16 then reinterpret
-        let shape: [Int32] = [1, kvHeads, seqLen, headDim]
-        let count = Int(kvHeads * seqLen * headDim)
-
-        let kData = Data(bytes: kBuf, count: nbytes)
-        let vData = Data(bytes: vBuf, count: nbytes)
-        let kArray = MLXArray(kData, shape.map { Int($0) }, type: UInt16.self).asType(.bfloat16)
-        let vArray = MLXArray(vData, shape.map { Int($0) }, type: UInt16.self).asType(.bfloat16)
-
-        // Inject into cache by calling update()
-        let _ = cache.update(keys: kArray, values: vArray)
-        return true
-    }
-
-    // MARK: - V2 (weight-sharing bridge)
-
-    private var v2Handle: UnsafeMutableRawPointer?
-    private var v2Initialized = false
-
-    typealias PB2Init = @convention(c) (Int32, Int32, Int32, Int32, Int32, Int32) -> Int32
-    typealias PB2SetWeight = @convention(c) (UnsafePointer<CChar>, UnsafeMutableRawPointer) -> Int32
-    typealias PB2Finalize = @convention(c) () -> Int32
-    typealias PB2Run = @convention(c) (UnsafePointer<Int32>, Int32, UnsafeMutablePointer<Double>, UnsafeMutablePointer<Float>) -> Int32
-    typealias PB2Cleanup = @convention(c) () -> Void
-
-    func ensureInitializedV2(model: Gemma4ModelInner, config: Gemma4TextConfiguration) -> Bool {
-        if v2Initialized { return true }
-
-        guard let h = dlopen("/tmp/libprefill_bridge_v2.dylib", RTLD_NOW) else {
-            print("[NativePrefill] V2 dylib not found")
-            return false
-        }
-        v2Handle = h
-
-        guard let initSym = dlsym(h, "pb2_init"),
-              let setSym = dlsym(h, "pb2_set_weight"),
-              let finSym = dlsym(h, "pb2_finalize") else {
-            print("[NativePrefill] V2 symbols not found")
-            return false
-        }
-
-        let pb2Init = unsafeBitCast(initSym, to: PB2Init.self)
-        let pb2Set = unsafeBitCast(setSym, to: PB2SetWeight.self)
-        let pb2Fin = unsafeBitCast(finSym, to: PB2Finalize.self)
-
-        // Init architecture
-        // slidingWindowPattern: count how many layers before first "full_attention"
         let pattern = config.layerTypes.prefix(while: { $0 != "full_attention" }).count + 1
-        // Only build non-shared layers (first 15)
         let nonShared = config.hiddenLayers - config.numKvSharedLayers
-        let rc = pb2Init(
+        let rc = fnInit(
             Int32(nonShared), Int32(config.hiddenSize),
             Int32(config.attentionHeads), Int32(config.kvHeads),
             Int32(config.slidingWindow), Int32(pattern))
-        if rc != 0 { print("[NativePrefill] V2 init failed"); return false }
+        if rc != 0 { print("[GemmaPrefill] init failed"); return false }
 
-        // Pass model weights
         let params = model.parameters().flattened()
         var weightCount = 0
         for (key, arr) in params {
-            // Bridge expects keys WITHOUT "model." prefix
             let rawPtr = arr.ctx.ctx
             let status = key.withCString { cKey in
-                pb2Set(cKey, rawPtr!)
+                fnSetWeight(cKey, rawPtr!)
             }
             if status == 0 { weightCount += 1 }
         }
-        print("[NativePrefill] V2: passed \(weightCount) weights to bridge")
+        print("[GemmaPrefill] Passed \(weightCount) weights")
 
-        let finRC = pb2Fin()
-        if finRC != 0 { print("[NativePrefill] V2 finalize failed"); return false }
+        let finRC = fnFinalize()
+        if finRC != 0 { print("[GemmaPrefill] finalize failed"); return false }
 
-        v2Initialized = true
-        print("[NativePrefill] V2 initialized (weight-sharing)")
+        initialized = true
+        print("[GemmaPrefill] Initialized")
 
-        // Pre-warm: run a tiny forward to materialize lazy weights on GPU
-        if let runSym = dlsym(h, "pb2_run") {
-            let warmRun = unsafeBitCast(runSym, to: PB2Run.self)
+        // Pre-warm
+        do {
             var warmMs: Double = 0; var warmCk: Float = 0
             let warmTokens: [Int32] = [1, 2, 3, 4]
             warmTokens.withUnsafeBufferPointer { buf in
-                let _ = warmRun(buf.baseAddress!, 4, &warmMs, &warmCk)
+                let _ = fnRun(buf.baseAddress!, 4, &warmMs, &warmCk)
             }
-            print(String(format: "[NativePrefill] V2 pre-warmed in %.0fms", warmMs))
+            print(String(format: "[GemmaPrefill] Pre-warmed in %.0fms", warmMs))
         }
 
         return true
     }
 
-    func runV2(tokenIds: [Int32]) -> (elapsedMs: Double, checksum: Float)? {
-        guard v2Initialized, let h = v2Handle,
-              let runSym = dlsym(h, "pb2_run") else { return nil }
-        let pb2Run = unsafeBitCast(runSym, to: PB2Run.self)
-
+    func run(tokenIds: [Int32]) -> (elapsedMs: Double, checksum: Float)? {
+        guard initialized, let fnRun else { return nil }
         var ms: Double = 0
         var ck: Float = 0
         let rc = tokenIds.withUnsafeBufferPointer { buf in
-            pb2Run(buf.baseAddress!, Int32(buf.count), &ms, &ck)
+            fnRun(buf.baseAddress!, Int32(buf.count), &ms, &ck)
         }
+        return rc == 0 ? (ms, ck) : nil
+    }
+
+    func runZeroCopy(tokenArray: MLXArray) -> (elapsedMs: Double, checksum: Float)? {
+        guard initialized, let fnRunArray else { return nil }
+        var ms: Double = 0
+        var ck: Float = 0
+        let rc = fnRunArray(tokenArray.ctx.ctx, &ms, &ck)
         return rc == 0 ? (ms, ck) : nil
     }
 
     /// Run native prefill and inject K/V into Swift caches.
     /// Returns (elapsed_ms, success). Caches are populated on success.
-    func runAndInjectKV(tokenIds: [Int32], cache: [KVCache], numLayers: Int) -> (Double, Bool) {
-        guard v2Initialized, let h = v2Handle else { return (0, false) }
+    func runAndInjectKV(tokenArray: MLXArray, cache: [KVCache], numLayers: Int) -> (Double, Bool) {
+        guard initialized else { return (0, false) }
 
-        // Run native prefill
-        guard let result = runV2(tokenIds: tokenIds) else { return (0, false) }
+        // Run native prefill — zero-copy, token array stays on GPU
+        guard let result = runZeroCopy(tokenArray: tokenArray) else { return (0, false) }
 
-        // Zero-copy K/V injection: get raw mlx::core::array* pointers from bridge
-        // and wrap in MLXArray by setting the ctx field directly
-        typealias GetPtr = @convention(c) (Int32) -> UnsafeMutableRawPointer?
-
-        guard let kSym = dlsym(h, "pb2_get_k_ptr"),
-              let vSym = dlsym(h, "pb2_get_v_ptr") else {
-            return (result.elapsedMs, false)
-        }
-        let getK = unsafeBitCast(kSym, to: GetPtr.self)
-        let getV = unsafeBitCast(vSym, to: GetPtr.self)
-
-        // Resolve export for CPU-copy fallback
-        typealias KVNb = @convention(c) (Int32) -> Int
-        typealias KVSh = @convention(c) (Int32, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>) -> Int32
-        typealias KVEx = @convention(c) (Int32, UnsafeMutableRawPointer, UnsafeMutableRawPointer) -> Int32
-        let kvNb = unsafeBitCast(dlsym(h, "pb2_kv_nbytes")!, to: KVNb.self)
-        let kvSh = unsafeBitCast(dlsym(h, "pb2_kv_shape")!, to: KVSh.self)
-        let kvEx = unsafeBitCast(dlsym(h, "pb2_export_kv")!, to: KVEx.self)
-
+        // Zero-copy K/V injection: gemma_get_kv_handles creates heap-allocated
+        // mlx::core::array copies (via `new array(attn.last_k)`) that share the
+        // underlying GPU data buffer via shared_ptr. No memcpy of tensor data.
+        // MLXArray.fromCppArray() wraps the pointer, taking ownership.
         for i in 0..<min(numLayers, cache.count) {
-            let nb = kvNb(Int32(i))
-            guard nb > 0 else { return (result.elapsedMs, false) }
-            var kvH: Int32 = 0, seqL: Int32 = 0, hd: Int32 = 0
-            let _ = kvSh(Int32(i), &kvH, &seqL, &hd)
-
-            // CPU copy — correct but adds ~2ms for 15 layers at 1K tokens
-            let kBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
-            let vBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
-            let rc = kvEx(Int32(i), kBuf, vBuf)
-            guard rc == 0 else { kBuf.deallocate(); vBuf.deallocate(); return (result.elapsedMs, false) }
-
-            let shape = [1, Int(kvH), Int(seqL), Int(hd)]
-            let elems = shape.reduce(1, *)
-            let bpe = nb / elems
-            let kArr: MLXArray
-            let vArr: MLXArray
-            if bpe == 2 {
-                kArr = MLXArray(Data(bytes: kBuf, count: nb), shape, type: UInt16.self).view(dtype: .bfloat16)
-                vArr = MLXArray(Data(bytes: vBuf, count: nb), shape, type: UInt16.self).view(dtype: .bfloat16)
-            } else {
-                kArr = MLXArray(Data(bytes: kBuf, count: nb), shape, type: Float.self).asType(.bfloat16)
-                vArr = MLXArray(Data(bytes: vBuf, count: nb), shape, type: Float.self).asType(.bfloat16)
+            var kPtr: UnsafeMutableRawPointer? = nil
+            var vPtr: UnsafeMutableRawPointer? = nil
+            fnGetKV?(Int32(i), &kPtr, &vPtr)
+            guard let k = kPtr, let v = vPtr else {
+                return (result.elapsedMs, false)
             }
-            kBuf.deallocate(); vBuf.deallocate()
+            // Zero-copy: wrap heap-allocated mlx::core::array* as MLXArray.
+            // Force contiguous — bridge arrays have non-standard strides from
+            // transpose/reshape chains in the C++ forward pass. Non-contiguous
+            // K/V in cache causes slower SDPA reads during decode (~5% penalty).
+            let kArr = MLXArray.fromCppArray(k).contiguous()
+            let vArr = MLXArray.fromCppArray(v).contiguous()
             let _ = cache[i].update(keys: kArr, values: vArr)
         }
 
@@ -531,15 +416,17 @@ class Gemma4Attention: Module {
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
+
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
     let rmsNormEps: Float
     let rope: any OffsetLayer
 
-    // Fused RMSNorm + RoPE via MLXFast.rmsNormRoPE (framework-level compiled kernel).
-    // invFreqs stored in wrapper to avoid Module loading issues with bare MLXArray properties.
-    let fusedInvFreqs: FusedNormRoPEKernel?  // reuses class as invFreqs container
+    // Inverse frequencies for fused RMSNorm + RoPE (MLXFast.rmsNormRoPE framework kernel).
+    // Computed at init, not loaded from checkpoint. Underscore prefix prevents
+    // Module weight loading from looking for this key in the checkpoint.
+    let _fusedInvFreqs: MLXArray?
 
     /// Set GEMMA4_FUSED_NORM_ROPE=0 to disable for A/B testing.
     private static let useFusedNormRoPE: Bool = {
@@ -587,9 +474,9 @@ class Gemma4Attention: Module {
                     stride(from: Float(0), to: Float(headDim), by: 2)
                 ) / Float(headDim)
                 let freqs = pow(MLXArray(config.ropeTheta), exponents)
-                self.fusedInvFreqs = FusedNormRoPEKernel(invFreqs: 1.0 / freqs)
+                self._fusedInvFreqs = 1.0 / freqs
             } else {
-                self.fusedInvFreqs = nil
+                self._fusedInvFreqs = nil
             }
         } else {
             // ProportionalRoPE: pairs are formed across the full head_dim (e.g., 512),
@@ -608,9 +495,9 @@ class Gemma4Attention: Module {
                 let paddingCount = (headDim - ropeDim) / 2
                 let infPadding = MLXArray(Array(repeating: Float.infinity, count: paddingCount))
                 let allFreqs = concatenated([realFreqs, infPadding], axis: 0)
-                self.fusedInvFreqs = FusedNormRoPEKernel(invFreqs: 1.0 / allFreqs)
+                self._fusedInvFreqs = 1.0 / allFreqs
             } else {
-                self.fusedInvFreqs = nil
+                self._fusedInvFreqs = nil
             }
         }
 
@@ -680,24 +567,14 @@ class Gemma4Attention: Module {
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        // Log shapes/strides for first call only
-        struct FirstCall { static var logged = false }
-        if !FirstCall.logged && L > 100 {
-            FirstCall.logged = true
-            if let ql = qProj as? QuantizedLinear {
-                print("[ATTN-L0] qProj: w=\(ql.weight.shape) s=\(ql.scales.shape) b=\(ql.biases?.shape ?? []) bits=\(ql.bits) gs=\(ql.groupSize)")
-            }
-            print("[ATTN-L0] x: \(x.shape) dtype=\(x.dtype)")
-        }
-
         var queries = qProj(x).reshaped(B, L, nHeads, -1)
 
         if useSharedKV, let sharedKV = sharedKVArrays {
             let (cachedKeys, cachedValues) = sharedKV
             let offset = donorOffset ?? cache?.offset ?? 0
-            if let fusedInvFreqs {
+            if let _fusedInvFreqs {
                 queries = MLXFast.rmsNormRoPE(
-                    queries, weight: qNorm.weight, invFreqs: fusedInvFreqs.invFreqs,
+                    queries, weight: qNorm.weight, invFreqs: _fusedInvFreqs,
                     eps: rmsNormEps, offset: offset, nHeads: nHeads, seqLen: L)
                 queries = queries.transposed(0, 2, 1, 3)
             } else {
@@ -732,9 +609,9 @@ class Gemma4Attention: Module {
         values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
 
         let offset = cache?.offset ?? 0
-        if let fusedInvFreqs {
+        if let _fusedInvFreqs {
             // Fused norm+rope via framework kernel: 2 dispatches instead of 4
-            let invFreqs = fusedInvFreqs.invFreqs
+            let invFreqs = _fusedInvFreqs
             queries = MLXFast.rmsNormRoPE(
                 queries, weight: qNorm.weight, invFreqs: invFreqs,
                 eps: rmsNormEps, offset: offset, nHeads: nHeads, seqLen: L)
@@ -787,10 +664,11 @@ private let compiledGeglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
 /// Fused RMSNorm + residual add: residual + rmsNorm(x, weight, eps).
 /// Saves 1 encoder dispatch per call (norm and add fused into single kernel).
 /// Applied at every post-attention and post-FFN norm+add site in the decoder layer.
+/// compiledNormResidual is UNUSED — kept for reference.
+/// compile() cannot fuse across fast::RMSNorm (opaque custom primitive).
+/// Use MLXFast.rmsNormResidual() framework kernel instead (rms_norm_residual.metal).
 private let compiledNormResidual: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
     compile(shapeless: true) { x, residual, weight in
-        // eps is captured via the weight's associated norm; we use a standard value.
-        // Note: eps must be a literal for compile() — it's baked into the compiled graph.
         residual + MLXFast.rmsNorm(x, weight: weight, eps: 1e-6)
     }
 
@@ -941,14 +819,12 @@ class Gemma4TransformerBlock: Module {
     ) -> MLXArray {
         let inputNorm = inputLayerNorm(x)
         let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, sharedKVArrays: sharedKVArrays, donorOffset: donorOffset)
-        // Manual `residual + norm(x)` instead of compiledNormResidual.
-        // The compiled fused op was apparently materializing intermediate
-        // copies inside its traced graph at every layer during prefill,
-        // simultaneously slowing prefill 2-3x and ballooning peak GPU memory
-        // by 1-2 GB. Replacing it with the explicit `residual + norm(x)`
-        // recovers prefill throughput AND drops memory.
-        // (See PR description for the measurements.)
-        var h = x + postAttentionLayerNorm(attnOut)
+        // Fused RMSNorm + residual add via framework Metal kernel (rms_norm_residual.metal).
+        // Single dispatch replaces separate rmsNorm + add (saves 90 dispatches/token).
+        var h = MLXFast.rmsNormResidual(
+            attnOut, residual: x,
+            weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps)
 
         // FFN with pre/post norms: shared MLP + MoE
         if let experts, let router,
@@ -973,14 +849,18 @@ class Gemma4TransformerBlock: Module {
             h2 = h2.sum(axis: -2)
             h2 = postNorm2(h2)
 
-            // Manual norm+add (see compiledNormResidual note above).
             let ffnOut = h1 + h2
-            h = h + postFeedforwardLayerNorm(ffnOut)
+            h = MLXFast.rmsNormResidual(
+                ffnOut, residual: h,
+                weight: postFeedforwardLayerNorm.weight,
+                eps: postFeedforwardLayerNorm.eps)
         } else {
-            // Manual norm+add (see compiledNormResidual note above).
             let preFFNNorm = preFeedforwardLayerNorm(h)
             let ffnOut = sharedMLP(preFFNNorm)
-            h = h + postFeedforwardLayerNorm(ffnOut)
+            h = MLXFast.rmsNormResidual(
+                ffnOut, residual: h,
+                weight: postFeedforwardLayerNorm.weight,
+                eps: postFeedforwardLayerNorm.eps)
         }
 
         // Per-Layer Embeddings (PLE) — fuse gelu + mul
@@ -1192,7 +1072,7 @@ public class Gemma4ModelInner: Module {
                 // shared layer ops because they're not ancestors of the cache arrays.
                 // Saves ~580 graph ops per chunk (1318→738) = ~44% fewer GPU dispatches.
                 if prefillMode {
-                    print("[PREFILL-SKIP] layer \(i) shared, skipping")
+                    // Shared layers don't write to cache — skip during prefill
                     continue
                 }
                 h = layer(h, mask: maskMode, cache: nil, perLayerInput: pli,
@@ -1249,26 +1129,31 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = max(windowSize ?? 512, 2048)
+        // Larger chunks reduce per-chunk overhead (graph building, eval barriers,
+        // weight re-reads). 4096 balances speed and memory for pure attention models.
+        let prefillStepSize = max(windowSize ?? 512, 4096)
         var y = input.text
 
-        // Native prefill offload v2 (NATIVE_PREFILL=1)
-        if NativePrefillBridge.isEnabled {
-            let bridge = NativePrefillBridge.shared
-            if bridge.ensureInitializedV2(model: model, config: config) {
+        // Native prefill offload (opt-in via NATIVE_PREFILL=1)
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1" {
+            let bridge = GemmaPrefillBridge.shared
+            if bridge.ensureInitialized(model: model, config: config) {
                 let allTokens = input.text.tokens
                 let prefillCount = allTokens.size - 1
                 if prefillCount > 0 {
+                    // Zero-copy: pass MLXArray directly to bridge (stays on GPU).
+                    // Avoids eval() + .asArray() GPU→CPU→GPU roundtrip.
                     let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
-                    eval(tokenSlice)
-                    let tokenIds = tokenSlice.asArray(Int32.self)
                     let nonShared = config.hiddenLayers - config.numKvSharedLayers
 
                     let (ms, ok) = bridge.runAndInjectKV(
-                        tokenIds: tokenIds, cache: cache, numLayers: nonShared)
+                        tokenArray: tokenSlice, cache: cache, numLayers: nonShared)
 
-                    if ok {
-                        return .tokens(y)
+                    if ok, ms > 0 {
+                        let bridgeTokS = Double(prefillCount) / (ms / 1000.0)
+                        print(String(format: "[GemmaPrefill] bridge: %.1fms = %.0f tok/s (%d tokens)", ms, bridgeTokS, prefillCount))
+                        let lastToken = allTokens[prefillCount ..< allTokens.size]
+                        return .tokens(LMInput.Text(tokens: lastToken))
                     }
                 }
             }
@@ -1285,18 +1170,23 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             let input = y[.newAxis, ..<chunkSize]
             _ = model(input.tokens, cache: cache.isEmpty ? nil : cache, prefillMode: true)
 
-            // Eval only non-shared caches for graph pruning
+            // asyncEval for CPU-GPU overlap: CPU builds chunk N+1 graph while
+            // GPU evaluates chunk N. Only eval non-shared caches — shared layers
+            // are skipped in prefillMode and their computation is dead code.
             var cacheArrays: [MLXArray] = []
             for c in cache.prefix(nonSharedCount) {
                 cacheArrays.append(contentsOf: c.innerState())
             }
-            eval(cacheArrays)
+            asyncEval(cacheArrays)
 
             y = y[chunkSize...]
-            MLX.Memory.clearCache()
+            // No clearCache between chunks — let Metal reuse the buffer pool.
+            // clearCache was forcing reallocation of all intermediates each chunk,
+            // causing 3.6x prefill regression at 32K (16 chunks x flush overhead).
         }
 
-
+        // Free prefill intermediate buffers before decode starts
+        MLX.Memory.clearCache()
 
         return .tokens(y)
     }

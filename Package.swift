@@ -62,10 +62,30 @@ let package = Package(
         ),
     ],
     targets: [
+        // Native C++ prefill bridge — shares Cmlx allocator (single Metal allocator)
+        .target(
+            name: "NativePrefillBridge",
+            dependencies: [
+                .product(name: "Cmlx", package: "mlx-swift"),
+            ],
+            path: "Sources/NativePrefillBridge",
+            exclude: [
+                "libprefill_bridge_gemma.dylib",
+                "libgeneric_prefill.dylib",
+            ],
+            sources: ["generic_prefill.cpp", "prefill_bridge_gemma.cpp", "prefill_bridge_qwen.cpp", "mlx_allocator_repro.cpp"],
+            publicHeadersPath: ".",
+            cxxSettings: [
+                .unsafeFlags(["-std=c++20"]),
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx"),
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx-c"),
+            ]
+        ),
         .target(
             name: "MLXLLM",
             dependencies: [
                 "MLXLMCommon",
+                "NativePrefillBridge",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
@@ -193,6 +213,21 @@ let package = Package(
                 .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Sources/PrefillBench",
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
+        .executableTarget(
+            name: "MLXServer",
+            dependencies: [
+                "MLXLLM",
+                "MLXVLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Hub", package: "swift-transformers"),
+            ],
+            path: "Sources/MLXServer",
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
