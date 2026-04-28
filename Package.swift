@@ -36,7 +36,12 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ekryski/mlx-swift", exact: "0.32.1-alpha"),
+        // vllm-swift-stable snapshot of TheTom/mlx-swift, with mlx submodule
+        // bumped to e8be4854 (retain bound buffers — mirrors ml-explore/mlx#3462)
+        // and to track Eric's v0.32.1-alpha cross-repo tag in our own fork.
+        // Alpha (ekryski/mlx-swift) keeps moving; this branch is frozen at
+        // release time, force-pushed when we adopt new alpha tips.
+        .package(url: "https://github.com/TheTom/mlx-swift", branch: "vllm-swift-stable"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],
