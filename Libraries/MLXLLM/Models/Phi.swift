@@ -56,6 +56,9 @@ class PhiAttention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, headDim).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, headDim).transposed(0, 2, 1, 3)
 
+        // TriAttention V3 hook: capture pre-RoPE Q for engine calibration.
+        captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+
         // Add RoPE to the queries and keys and combine them with the cache
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)

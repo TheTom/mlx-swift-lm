@@ -222,6 +222,9 @@ private class ApertusAttention: Module {
         keys = keys.transposed(0, 2, 1, 3)
         values = values.transposed(0, 2, 1, 3)
 
+        // TriAttention V3 hook
+        captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+
         // 4. RoPE
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)

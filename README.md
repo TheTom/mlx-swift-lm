@@ -146,6 +146,88 @@ let container = try await loadModelContainer(
 
 Or use the underlying API to control every aspect of the evaluation.
 
+## TriAttention V3 + longctx (long-context rescue)
+
+`MLXLMCommon` ships **TriAttention V3** — our independent Swift port and minimal hybrid extension of the trigonometric KV-cache scoring formula introduced in Mao et al., *"TriAttention: Efficient Long Reasoning with Trigonometric KV Compression"* (arXiv:2604.04921, 2026). The hybrid prefix-protect + per-segment-quota policy, the Tier 2 evict-callback to longctx-svc, and the Tier 3 rehydrate hook are ours. Design write-up: [`turboquant_plus/docs/papers/triattention-v3.md`](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/triattention-v3.md).
+
+V3 lets you run effectively unbounded context by spilling evicted spans to a vector index ([longctx](https://github.com/TheTom/longctx)) and rehydrating relevant chunks before the next prefill. Both pieces are **off by default**; this section covers how to turn them on, how to test, and why you should treat them as a single feature.
+
+### Critical: don't enable V3 without longctx
+
+V3 alone evicts cells from the KV cache to stay under a budget. Without a recovery layer, evicted facts are gone — and that breaks long-context recall.
+
+Empirical receipt on Qwen3.5-2B-4bit, M5 Max, 32K → 256K planted-fact NIAH (`Tests/Benchmarks/V3ChatSessionRamp.swift`):
+
+| ctx | baseline turbo8v4 | V3 only | V3 + longctx |
+|-----|------------------:|--------:|-------------:|
+| 32K | ✓HIT | **✗miss** | ✓HIT |
+| 64K | ✓HIT | **✗miss** | ✓HIT |
+| 128K | ✓HIT | **✗miss** | ✓HIT |
+| 256K | ✓HIT | **✗miss** | ✓HIT |
+
+V3 alone misses recall at every rung. **Only enable V3 if you have longctx running.** Otherwise stick with the default FP16 / TurboQuant cache.
+
+### Enabling V3 + longctx
+
+1. **Run `longctx-svc`** locally (FastAPI, port 5054 by default — see [longctx](https://github.com/TheTom/longctx) for setup):
+   ```bash
+   pip install longctx-svc
+   longctx-svc serve --host 127.0.0.1 --port 5054
+   ```
+
+2. **Set environment variables** before instantiating your model:
+   ```bash
+   export VLLM_TRIATT_ENABLED=1
+   export VLLM_TRIATT_BUDGET=230400      # KV cells to keep (e.g. 0.9 × ctxTarget)
+   export VLLM_TRIATT_WINDOW=128         # always-keep recent window
+   export VLLM_TRIATT_PREFIX=32          # always-keep prompt prefix
+   export VLLM_TRIATT_WARMUP=256         # tokens before first eviction
+   export VLLM_TRIATT_HYBRID=2           # eviction policy mode
+   export LONGCTX_ENDPOINT=http://127.0.0.1:5054
+   ```
+
+3. **Drive through `ChatSession`** — the auto-Tier-3 rehydrate hook (which queries longctx for relevant spans before each turn's prefill) is wired only on the `ChatSession` path. Bare `container.generate()` will not rescue evicted facts. See [`Tests/Benchmarks/V3ChatSessionNIAH.swift`](Tests/Benchmarks/V3ChatSessionNIAH.swift) for the working pattern.
+
+### Testing it works
+
+```bash
+RUN_V3_CHAT_NIAH=1 swift test --filter "V3ChatSessionNIAH"
+```
+
+This runs a 256K planted-fact NIAH end-to-end via `ChatSession`. Successful run prints `recall=✓HIT  answer: 481729` and reports the longctx ingest count (~19,000 chunks for a 256K prompt at default eviction rate).
+
+For the full 12-cell ramp:
+
+```bash
+RUN_V3_CHAT_RAMP=1 swift test --filter "V3ChatSessionRamp"
+```
+
+### What V3 evicts vs what longctx rescues
+
+V3 inspects per-token query-key salience and evicts the lowest-scoring cells once the cache passes its budget. The eviction callback streams the evicted token IDs (decoded back to text via the bound tokenizer) to longctx-svc's `/evict/write` endpoint, where they're embedded with MiniLM and indexed in faiss. On the next turn, `ChatSession` auto-fires `rescue.rehydratePrompt(query: <user msg>)` which retrieves top-K relevant chunks and prepends them as a system message before that turn's prefill. The model sees a normal multi-turn chat with extra context.
+
+### Recommended defaults
+
+For a Gemma 4 / Qwen3 / Llama-class model on M-series Apple Silicon at long context:
+
+```bash
+export VLLM_TRIATT_ENABLED=1
+export VLLM_TRIATT_BUDGET=$((CTX_TARGET * 9 / 10))   # 10% eviction headroom
+export VLLM_TRIATT_WINDOW=128
+export VLLM_TRIATT_PREFIX=32
+export VLLM_TRIATT_WARMUP=256
+export VLLM_TRIATT_HYBRID=2
+export LONGCTX_ENDPOINT=http://127.0.0.1:5054
+```
+
+Higher eviction rates (30%+) trade more longctx round-trips for less GPU memory pressure but increase rehydrate latency. 10% is a good starting point.
+
+### Limitations / current state
+
+- V3 cache (`TriAttentionKVCache`) extends `KVCacheSimple` — currently FP16 only. Stacking V3 with TurboQuant codecs (turbo8v4 etc.) is tracked but not yet shipped.
+- V3 hooks are wired on Qwen3 / Qwen3.5 / Qwen3-MoE / Llama / Mistral3 / Phi / Phi3 / Gemma3 / GLM4. Other model families fall back to non-V3 caches.
+- Tier-3 rehydrate auto-binds only through `ChatSession`. Custom drivers must call `TriAttentionRescue.shared.rehydratePrompt(query:)` manually before each prefill.
+
 ## Migrating to Version 3
 
 Version 3 of MLX Swift LM decouples the tokenizer and downloader implementations. See the [integrations](#Tokenizer-and-Downloader-Integrations) section for details.

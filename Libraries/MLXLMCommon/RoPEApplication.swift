@@ -23,5 +23,14 @@ import MLXNN
 public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: KVCache?)
     -> MLXArray
 {
+    // TriAttention V3-aware: when the cache is a TriAttentionKVCache, the
+    // post-compaction `offset` is the storage length (smaller than the
+    // logical position range). RoPE must use the LOGICAL position so the
+    // model sees positional encodings tied to the original token stream,
+    // not the compacted slab. Falls back to `cache?.offset` for non-V3
+    // caches — fully backwards compatible.
+    if let triCache = cache as? TriAttentionKVCache {
+        return rope(x, offset: triCache.logicalOffset)
+    }
     return rope(x, offset: cache?.offset ?? 0)
 }

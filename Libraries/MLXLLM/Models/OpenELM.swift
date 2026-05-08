@@ -78,6 +78,9 @@ class MultiHeadCausalAttention: Module {
             keys = kNorm(keys)
         }
 
+        // TriAttention V3 hook
+        captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 

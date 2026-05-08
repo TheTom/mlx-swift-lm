@@ -75,8 +75,20 @@ class Qwen3Attention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        let triCache = cache as? TriAttentionKVCache
+        if B == 1, let triCache {
+            // V3 calibration consumes pre-RoPE Q shaped [tokens, heads, dim].
+            // Qwen3 has queries as [B, heads, tokens, dim] at this point.
+            let qForCalibration = queries[0].transposed(1, 0, 2).asType(.float32)
+            triCache.engine.accumulateQ(qForCalibration, layerIdx: triCache.layerIdx)
+        }
+
+        // TriAttention physically compacts K/V storage. Keep RoPE position
+        // tied to the original logical token stream, not the compacted
+        // storage length (`cache.offset`).
+        let rotaryOffset = triCache?.logicalOffset ?? (cache?.offset ?? 0)
+        queries = rope(queries, offset: rotaryOffset)
+        keys = rope(keys, offset: rotaryOffset)
 
         let output = attentionWithCacheUpdate(
             queries: queries, keys: keys, values: values,
@@ -215,14 +227,7 @@ class Qwen3Attention: Module {
             cache.update(newKeys: keys, newValues: values)
         }
 
-        let maxOffset = cache.offsets[0..<cache.active].max() ?? 0
-        let allK = cache.keys[..<cache.active, 0..., ..<maxOffset, 0...]
-        let allV = cache.values[..<cache.active, 0..., ..<maxOffset, 0...]
-
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: allK, values: allV,
-            scale: scale, mask: .array(mask)
-        )
+        let output = cache.attention(queries: queries, scale: scale, mask: mask)
 
         return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
@@ -430,6 +435,36 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return weights
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let numLayers = configuration.hiddenLayers
+        let env = ProcessInfo.processInfo.environment
+        let enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        if enabled, parameters?.maxKVSize == nil {
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: configuration.hiddenLayers,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads,
+                headDim: configuration.headDim,
+                ropeTheta: configuration.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0..<numLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+
+        if let maxKVSize = parameters?.maxKVSize {
+            return (0..<numLayers).map { _ in
+                RotatingKVCache(maxSize: maxKVSize, keep: 4)
+            }
+        }
+        return (0..<numLayers).map { _ in KVCacheSimple() }
     }
 }
 

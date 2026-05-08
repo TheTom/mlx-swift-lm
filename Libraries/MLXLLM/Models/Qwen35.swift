@@ -461,6 +461,9 @@ final class Qwen35Attention: Module {
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
+        // TriAttention V3 hook: capture pre-RoPE Q for engine calibration.
+        captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
@@ -528,16 +531,9 @@ final class Qwen35Attention: Module {
             cache.update(newKeys: keys, newValues: values)
         }
 
-        let maxOffset = cache.offsets[0..<cache.active].max() ?? 0
-        let allK = cache.keys[..<cache.active, 0..., ..<maxOffset, 0...]
-        let allV = cache.values[..<cache.active, 0..., ..<maxOffset, 0...]
-
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: allK, values: allV,
-            scale: scale, mask: .array(mask)
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let output = cache.attention(queries: queries, scale: scale, mask: mask)
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
     }
@@ -900,6 +896,42 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             parsed = parseTurboScheme(scheme)
         }
 
+        // TriAttention V3 install (env-gated). Mutually exclusive with
+        // turbo for the moment (TriAttentionKVCache subclasses
+        // KVCacheSimple — V3+TQ+ stacking needs a TriAttentionTurboKVCache
+        // variant; tracked as task #187). When V3 enabled and not in
+        // a turbo run, install per-layer TriAttentionKVCache.
+        let env = ProcessInfo.processInfo.environment
+        let v3Enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+        let attnLayerCount = model.layers.filter { !$0.isLinear }.count
+        if v3Enabled, !isTurbo, parameters?.maxKVSize == nil,
+           attnLayerCount > 0
+        {
+            let headDim = configuration.headDim
+                ?? (configuration.hiddenSize / configuration.attentionHeads)
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: attnLayerCount,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads
+                    ?? configuration.attentionHeads,
+                headDim: headDim,
+                ropeTheta: Float(configuration.ropeTheta ?? 1_000_000)
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            var attnIdx = 0
+            return model.layers.map { layer in
+                if layer.isLinear { return MambaCache() }
+                let cache = TriAttentionKVCache(
+                    layerIdx: attnIdx, engine: engine
+                )
+                attnIdx += 1
+                return cache
+            }
+        }
+
         return model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
@@ -1026,7 +1058,8 @@ extension Qwen35TextModel: BatchedHybridLLM {
     /// dense (Qwen3.5) and MoE (Qwen3.6) checkpoints share the same hybrid
     /// layer pattern, so this single layout serves both.
     public func newBatchedHybridCache(
-        maxBatch: Int, parameters: GenerateParameters?
+        maxBatch: Int, parameters: GenerateParameters?,
+        turboKeyBits: Int?, turboValueBits: Int?
     ) -> BatchedHybridCache {
         // Same shape derivation as Qwen35GatedDeltaNet.init(args).
         let cfg = configuration
@@ -1051,12 +1084,18 @@ extension Qwen35TextModel: BatchedHybridLLM {
                     Dk: cfg.linearKeyHeadDim
                 ))
             } else {
-                return .attention(BatchedKVCache(
-                    maxBatch: maxBatch,
-                    kvHeads: cfg.kvHeads,
-                    headDim: headDim,
-                    maxSeq: maxSeq
-                ))
+                let kvCache: BatchedKVCache
+                if let kb = turboKeyBits, let vb = turboValueBits {
+                    kvCache = BatchedKVCache(
+                        maxBatch: maxBatch, kvHeads: cfg.kvHeads, headDim: headDim,
+                        maxSeq: maxSeq,
+                        turboKeyBits: kb, turboValueBits: vb)
+                } else {
+                    kvCache = BatchedKVCache(
+                        maxBatch: maxBatch, kvHeads: cfg.kvHeads, headDim: headDim,
+                        maxSeq: maxSeq)
+                }
+                return .attention(kvCache)
             }
         }
         return BatchedHybridCache(layers: layers)
@@ -1146,8 +1185,11 @@ extension Qwen35Model: BatchedHybridLLM {
     }
 
     public func newBatchedHybridCache(
-        maxBatch: Int, parameters: GenerateParameters?
+        maxBatch: Int, parameters: GenerateParameters?,
+        turboKeyBits: Int?, turboValueBits: Int?
     ) -> BatchedHybridCache {
-        languageModel.newBatchedHybridCache(maxBatch: maxBatch, parameters: parameters)
+        languageModel.newBatchedHybridCache(
+            maxBatch: maxBatch, parameters: parameters,
+            turboKeyBits: turboKeyBits, turboValueBits: turboValueBits)
     }
 }

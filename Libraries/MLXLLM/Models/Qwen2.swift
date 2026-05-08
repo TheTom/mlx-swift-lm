@@ -70,6 +70,10 @@ class Qwen2Attention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
+        // TriAttention V3 hook: capture pre-RoPE Q for engine calibration.
+        // No-op when V3 is disabled or cache isn't a TriAttentionKVCache.
+        captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
@@ -264,6 +268,41 @@ public struct Qwen2Configuration: Codable, Sendable {
             [String: StringOrNumber].self, forKey: Qwen2Configuration.CodingKeys.ropeScaling)
         self.tieWordEmbeddings =
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+    }
+}
+
+// MARK: - V3 cache install (TriAttention)
+
+extension Qwen2Model {
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let numLayers = configuration.hiddenLayers
+        let env = ProcessInfo.processInfo.environment
+        let enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        if enabled, parameters?.maxKVSize == nil {
+            let headDim = configuration.hiddenSize
+                / configuration.attentionHeads
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: numLayers,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads,
+                headDim: headDim,
+                ropeTheta: configuration.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0..<numLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+        if let maxKVSize = parameters?.maxKVSize {
+            return (0..<numLayers).map { _ in
+                RotatingKVCache(maxSize: maxKVSize, keep: 4)
+            }
+        }
+        return (0..<numLayers).map { _ in KVCacheSimple() }
     }
 }
 
