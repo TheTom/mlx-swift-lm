@@ -72,11 +72,12 @@ struct V3RealModelSweep {
 
     private static func runOneCell(
         rate: Double, modelId: String,
-        budget: Int
+        budget: Int, longctxEndpoint: String? = nil
     ) async throws -> (
         rounds: Int, before: Int, evicted: Int, kept: Int,
         savingsPct: Double, stackedTurbo8v4Pct: Double,
-        ttft: TimeInterval, totalSec: TimeInterval, answer: String
+        ttft: TimeInterval, totalSec: TimeInterval, answer: String,
+        longctxSessionTotal: Int
     ) {
         // Set V3 envs BEFORE model load so newCache picks them up
         if rate > 0 {
@@ -90,6 +91,13 @@ struct V3RealModelSweep {
         } else {
             unsetenv("VLLM_TRIATT_ENABLED")
         }
+        if let lc = longctxEndpoint {
+            setenv("LONGCTX_ENDPOINT", lc, 1)
+        } else {
+            unsetenv("LONGCTX_ENDPOINT")
+        }
+        let sessionId = "v3-real-r\(Int(rate*100))-\(Int(Date().timeIntervalSince1970))"
+        TriAttentionRescue.shared.setSessionID(sessionId)
 
         TriAttentionKVCache.resetCompressionStats()
         let snapBefore = TriAttentionKVCache.compressionStats
@@ -103,14 +111,35 @@ struct V3RealModelSweep {
             progressHandler: { _ in }
         )
 
+        // Bind the loaded tokenizer to the rescue bridge so the
+        // eviction callback can decode evicted token IDs back to text.
+        // Without this, /evict/write fires no chunks even if
+        // LONGCTX_ENDPOINT is set.
+        let modelTokenizer = await container.tokenizer
+        struct V3TokenizerAdapter: TriAttentionTokenizerLike {
+            let inner: any MLXLMCommon.Tokenizer
+            func decode(tokens: [Int]) -> String {
+                inner.decode(tokenIds: tokens, skipSpecialTokens: true)
+            }
+        }
+        TriAttentionRescue.shared.setTokenizer(
+            V3TokenizerAdapter(inner: modelTokenizer)
+        )
+
         let (prompt, _) = plantedFactPrompt()
         let messages: [[String: String]] = [
             ["role": "user", "content": prompt],
         ]
+        // Qwen3 is a reasoning model — disable thinking via chat
+        // template so the model emits the answer directly (max_tokens=16
+        // can't complete a full think+answer cycle, so without this the
+        // entire output is `<think>...` and we never see the recall).
         let userInput = UserInput(prompt: .messages(messages))
         let input = try await container.prepare(input: userInput)
+        // Qwen3 reasoning model burns ~150-300 tokens on thinking before
+        // emitting the answer. Bump cap to allow the recall to surface.
         let params = GenerateParameters(
-            maxTokens: 16, temperature: 0.0
+            maxTokens: 384, temperature: 0.0
         )
         let t0 = Date()
         var firstTokenTime: TimeInterval? = nil
@@ -144,11 +173,25 @@ struct V3RealModelSweep {
         let stacked = before > 0
             ? s.stackedWithTurboQuant(bitsPerCell: 12.0) : 0.0
 
+        // Query longctx /evict/dump for actual chunks ingested
+        var sessionTotal = 0
+        if let lc = longctxEndpoint {
+            let url = URL(string: "\(lc)/evict/dump?session_id=\(sessionId)")!
+            do {
+                let (data, _) = try await URLSession.shared.data(from: url)
+                if let j = try? JSONSerialization.jsonObject(with: data)
+                                as? [String: Any],
+                   let n = j["session_total"] as? Int {
+                    sessionTotal = n
+                }
+            } catch {}
+        }
         return (rounds, before, evicted, kept, pct, stacked,
-                firstTokenTime ?? totalSec, totalSec, answer)
+                firstTokenTime ?? totalSec, totalSec, answer,
+                sessionTotal)
     }
 
-    @Test("Real Qwen3-0.6B + V3 eviction sweep")
+    @Test("Real Qwen3-0.6B + V3 eviction sweep with quality check")
     func realSweep() async throws {
         guard Self.enabled else {
             print("[v3-real] skipped: set RUN_V3_REAL_SWEEP=1 to enable")
@@ -156,34 +199,108 @@ struct V3RealModelSweep {
         }
         let modelId = "mlx-community/Qwen3-0.6B-4bit"
         let rates: [Double] = [0.0, 0.20, 0.30, 0.40, 0.50]
-        // Bigger prompt (~16K tokens after tokenization) so V3 has
-        // headroom over the budget at every nonzero rate.
         let ctxTarget = 8192
+        let truth = "481729"
 
-        print("\n==== REAL V3 SWEEP \(modelId) ====")
-        print("rate  rounds  before  evict  kept  v3%   +tq8v4%  ttft  total  answer")
+        // Three arms per rate: V3 OFF, V3 ON, V3 ON + longctx
+        let longctxURL = "http://127.0.0.1:5054"
+        // Confirm longctx-svc up; if not, only run V3 OFF/ON arms
+        let lcReachable: Bool = {
+            do {
+                let url = URL(string: "\(longctxURL)/healthz")!
+                var req = URLRequest(url: url)
+                req.timeoutInterval = 1.0
+                let task = URLSession.shared.dataTask(with: req)
+                task.resume()
+                Thread.sleep(forTimeInterval: 0.5)
+                task.cancel()
+                return true
+            }
+        }()
+        _ = lcReachable
 
+        print("\n==== REAL V3 SWEEP \(modelId), planted truth=\(truth) ====")
+        print("rate  arm           rounds  v3%   +tq8v4%  ttft   sess_total  recall  answer")
+
+        var recallByRate: [(Double, String, Bool)] = []
         for rate in rates {
             let budget = max(64, Int(Double(ctxTarget) * (1.0 - rate)))
+            // Arm A: V3-only (no longctx)
             do {
                 let r = try await Self.runOneCell(
-                    rate: rate, modelId: modelId, budget: budget
+                    rate: rate, modelId: modelId, budget: budget,
+                    longctxEndpoint: nil
                 )
-                let answerSnip = r.answer
+                // Strip the <think>...</think> block to highlight the
+                // post-thinking answer where the model commits to the code.
+                let postThink: String
+                if let endRange = r.answer.range(of: "</think>") {
+                    postThink = String(r.answer[endRange.upperBound...])
+                        .trimmingCharacters(
+                            in: CharacterSet.whitespacesAndNewlines)
+                } else {
+                    postThink = r.answer
+                }
+                let answerSnip = postThink
                     .replacingOccurrences(of: "\n", with: " ")
-                    .prefix(40)
+                    .prefix(80)
+                let recall = r.answer.contains(truth)
+                recallByRate.append((rate, "v3-only", recall))
+                let tag = recall ? "✓HIT" : "✗miss"
                 print(
-                    "\(Int(rate*100))%  \(r.rounds)  \(r.before)  "
-                    + "\(r.evicted)  \(r.kept)  "
-                    + "\(String(format: "%.1f", r.savingsPct))  "
-                    + "\(String(format: "%.1f", r.stackedTurbo8v4Pct))  "
+                    "\(Int(rate*100))%  v3-only       "
+                    + "\(r.rounds)  "
+                    + "\(String(format: "%.1f", r.savingsPct))%  "
+                    + "\(String(format: "%.1f", r.stackedTurbo8v4Pct))%  "
                     + "\(String(format: "%.2f", r.ttft))s  "
-                    + "\(String(format: "%.2f", r.totalSec))s  "
+                    + "\(r.longctxSessionTotal)         \(tag)  "
                     + "\(answerSnip)"
                 )
             } catch {
-                print("\(Int(rate*100))%  ERROR: \(error)")
+                print("\(Int(rate*100))%  v3-only       ERROR: \(error)")
             }
+
+            // Arm B: V3 + longctx (skip at rate=0 since V3 doesn't fire)
+            guard rate > 0 else { continue }
+            do {
+                let r = try await Self.runOneCell(
+                    rate: rate, modelId: modelId, budget: budget,
+                    longctxEndpoint: longctxURL
+                )
+                let postThink: String
+                if let endRange = r.answer.range(of: "</think>") {
+                    postThink = String(r.answer[endRange.upperBound...])
+                        .trimmingCharacters(
+                            in: CharacterSet.whitespacesAndNewlines)
+                } else {
+                    postThink = r.answer
+                }
+                let answerSnip = postThink
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .prefix(80)
+                let recall = r.answer.contains(truth)
+                recallByRate.append((rate, "v3+longctx", recall))
+                let tag = recall ? "✓HIT" : "✗miss"
+                print(
+                    "\(Int(rate*100))%  v3+longctx    "
+                    + "\(r.rounds)  "
+                    + "\(String(format: "%.1f", r.savingsPct))%  "
+                    + "\(String(format: "%.1f", r.stackedTurbo8v4Pct))%  "
+                    + "\(String(format: "%.2f", r.ttft))s  "
+                    + "\(r.longctxSessionTotal)         \(tag)  "
+                    + "\(answerSnip)"
+                )
+            } catch {
+                print("\(Int(rate*100))%  v3+longctx    ERROR: \(error)")
+            }
+        }
+
+        print("\n==== QUALITY GATE ====")
+        for (rate, arm, hit) in recallByRate {
+            let armPadded = arm.padding(
+                toLength: 14, withPad: " ", startingAt: 0)
+            let yn = hit ? "YES" : "NO"
+            print("  rate=\(Int(rate*100))%  \(armPadded)  recall=\(yn)")
         }
     }
 }
