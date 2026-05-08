@@ -96,7 +96,9 @@ struct V3RealModelSweep {
         } else {
             unsetenv("LONGCTX_ENDPOINT")
         }
-        let sessionId = "v3-real-r\(Int(rate*100))-\(Int(Date().timeIntervalSince1970))"
+        let sessionId = ProcessInfo.processInfo
+            .environment["V3_SESSION_OVERRIDE"]
+            ?? "v3-real-r\(Int(rate*100))-\(Int(Date().timeIntervalSince1970))"
         TriAttentionRescue.shared.setSessionID(sessionId)
 
         TriAttentionKVCache.resetCompressionStats()
