@@ -55,6 +55,9 @@ class LlamaAttention: Module {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
+        // TriAttention V3 hook: capture pre-RoPE Q for engine calibration.
+        captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
@@ -155,6 +158,7 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     public let model: LlamaModelInner
+    let configuration: LlamaConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -162,9 +166,40 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
         self.model = LlamaModelInner(args)
+        self.configuration = args
         if !args.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let numLayers = configuration.hiddenLayers
+        let env = ProcessInfo.processInfo.environment
+        let v3Enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+        if v3Enabled, parameters?.maxKVSize == nil {
+            let headDim = configuration.headDimensions
+                ?? configuration.hiddenSize / configuration.attentionHeads
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: numLayers,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads,
+                headDim: headDim,
+                ropeTheta: configuration.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0..<numLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+        if let maxKVSize = parameters?.maxKVSize {
+            return (0..<numLayers).map { _ in
+                RotatingKVCache(maxSize: maxKVSize, keep: 4)
+            }
+        }
+        return (0..<numLayers).map { _ in KVCacheSimple() }
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {

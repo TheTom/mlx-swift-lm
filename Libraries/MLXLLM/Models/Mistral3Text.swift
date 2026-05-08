@@ -86,6 +86,9 @@ class Mistral3Attention: Module {
         keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
+        // TriAttention V3 hook: capture pre-RoPE Q for engine calibration.
+        captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+
         // Apply RoPE
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
@@ -350,6 +353,20 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Sliding window attention layers use RotatingKVCache,
     /// full attention layers use standard KVCacheSimple.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        // TriAttention V3 install: applies to all layers uniformly,
+        // bypassing the sliding-window-vs-full split. V3-on-sliding is
+        // a future optimization; for the correctness audit we install
+        // TriAttentionKVCache on every layer when V3 is enabled.
+        if let v3 = makeV3CacheStack(
+            nLayers: args.hiddenLayers,
+            nHeads: args.attentionHeads,
+            nKVHeads: args.kvHeads,
+            headDim: args.headDimensions
+                ?? (args.hiddenSize / args.attentionHeads),
+            ropeTheta: args.ropeTheta
+        ) {
+            return v3
+        }
         return model.layers.map { layer in
             if layer.useSliding, let slidingWindow = args.slidingWindow {
                 return RotatingKVCache(maxSize: slidingWindow)

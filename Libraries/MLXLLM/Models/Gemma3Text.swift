@@ -197,6 +197,9 @@ class Gemma3Attention: Module {
         queries = queryNorm(queries)
         keys = keyNorm(keys)
 
+        // TriAttention V3 hook: capture pre-RoPE Q for engine calibration.
+        captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 

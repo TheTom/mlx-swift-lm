@@ -461,6 +461,9 @@ final class Qwen35Attention: Module {
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
+        // TriAttention V3 hook: capture pre-RoPE Q for engine calibration.
+        captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
@@ -891,6 +894,42 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         var parsed: (bits: Int, keyBits: Int?, valueBits: Int?) = (4, nil, nil)
         if isTurbo, let scheme = turboScheme {
             parsed = parseTurboScheme(scheme)
+        }
+
+        // TriAttention V3 install (env-gated). Mutually exclusive with
+        // turbo for the moment (TriAttentionKVCache subclasses
+        // KVCacheSimple — V3+TQ+ stacking needs a TriAttentionTurboKVCache
+        // variant; tracked as task #187). When V3 enabled and not in
+        // a turbo run, install per-layer TriAttentionKVCache.
+        let env = ProcessInfo.processInfo.environment
+        let v3Enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+        let attnLayerCount = model.layers.filter { !$0.isLinear }.count
+        if v3Enabled, !isTurbo, parameters?.maxKVSize == nil,
+           attnLayerCount > 0
+        {
+            let headDim = configuration.headDim
+                ?? (configuration.hiddenSize / configuration.attentionHeads)
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: attnLayerCount,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads
+                    ?? configuration.attentionHeads,
+                headDim: headDim,
+                ropeTheta: Float(configuration.ropeTheta ?? 1_000_000)
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            var attnIdx = 0
+            return model.layers.map { layer in
+                if layer.isLinear { return MambaCache() }
+                let cache = TriAttentionKVCache(
+                    layerIdx: attnIdx, engine: engine
+                )
+                attnIdx += 1
+                return cache
+            }
         }
 
         return model.layers.map { layer in
