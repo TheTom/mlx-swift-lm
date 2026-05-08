@@ -213,9 +213,32 @@ public final class TriAttentionKVCache: KVCacheSimple {
         public var totalBefore: Int = 0
         public var totalEvicted: Int = 0
         public var totalKept: Int = 0
+
+        /// V3 cell-level savings = `evicted / before`. The fraction of
+        /// physical KV cells V3 dropped via removePositions compaction.
+        /// On M5 these cells are physically freed (unlike AMD's vLLM
+        /// path where the block manager doesn't reclaim).
         public var savingsPct: Double {
             guard totalBefore > 0 else { return 0.0 }
             return 100.0 * Double(totalEvicted) / Double(totalBefore)
+        }
+
+        /// V3+TQ+ STACKED savings ESTIMATE (first-order math, not
+        /// measured). When V3 keeps fraction `k = kept/before` of cells
+        /// and TQ+ stores each cell at `b` bits average (vs 16 baseline),
+        /// stacked size fraction = `k * (b/16)`. This is a CEILING —
+        /// real stacking has overhead from slice+repack on V3 evict
+        /// rounds. Track #187 for the actual stacked cache class
+        /// (TriAttentionTurboKVCache).
+        public func stackedWithTurboQuant(bitsPerCell: Double)
+            -> Double
+        {
+            guard totalBefore > 0, bitsPerCell > 0, bitsPerCell < 16
+            else { return savingsPct }
+            let keptFrac = Double(totalKept) / Double(totalBefore)
+            let bitFrac = bitsPerCell / 16.0
+            let stackedSize = keptFrac * bitFrac
+            return 100.0 * (1.0 - stackedSize)
         }
     }
 
