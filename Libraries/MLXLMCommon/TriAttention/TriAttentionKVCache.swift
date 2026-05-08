@@ -209,6 +209,7 @@ public final class TriAttentionKVCache: KVCacheSimple {
     /// Process-wide rolling telemetry: total seen / evicted / kept across
     /// all rounds + caches. Exposed for harness / smoke / dashboard.
     public struct CompressionStats: Sendable {
+        public init() {}
         public var rounds: Int = 0
         public var totalBefore: Int = 0
         public var totalEvicted: Int = 0

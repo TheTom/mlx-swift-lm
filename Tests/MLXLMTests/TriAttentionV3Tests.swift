@@ -303,4 +303,104 @@ struct TriAttentionV3Tests {
         #expect(tri.engine.nHeads == 8)
         #expect(tri.engine.nKVHeads == 2)
     }
+
+    @Test("makeV3CacheStack helper builds proper cache stack")
+    func makeV3StackHelper() {
+        setenv("VLLM_TRIATT_ENABLED", "1", 1)
+        defer { unsetenv("VLLM_TRIATT_ENABLED") }
+        let stack = makeV3CacheStack(
+            nLayers: 4, nHeads: 8, nKVHeads: 2,
+            headDim: 64, ropeTheta: 10_000.0
+        )
+        let caches = try? #require(stack)
+        #expect(caches?.count == 4)
+        #expect(caches?.allSatisfy { $0 is TriAttentionKVCache } == true)
+    }
+
+    @Test("makeV3CacheStack returns nil when V3 disabled")
+    func makeV3StackHelperOff() {
+        unsetenv("VLLM_TRIATT_ENABLED")
+        let stack = makeV3CacheStack(
+            nLayers: 4, nHeads: 8, nKVHeads: 2,
+            headDim: 64, ropeTheta: 10_000.0
+        )
+        #expect(stack == nil)
+    }
+
+    @Test("Defaults: family detection covers known model ids")
+    func defaultsFamilyDetection() {
+        #expect(TriAttentionDefaults.family(of:
+            "mlx-community/Qwen3-4B-4bit") == "qwen3")
+        #expect(TriAttentionDefaults.family(of:
+            "mlx-community/Qwen3.5-2B-4bit") == "qwen3.5")
+        #expect(TriAttentionDefaults.family(of:
+            "mlx-community/Llama-3.2-3B-Instruct-4bit") == "llama3")
+        #expect(TriAttentionDefaults.family(of:
+            "mlx-community/Mistral-7B-Instruct-v0.3-4bit") == "mistral")
+        #expect(TriAttentionDefaults.family(of:
+            "mlx-community/Phi-4-mini-instruct-4bit") == "phi4")
+        #expect(TriAttentionDefaults.family(of:
+            "mlx-community/gemma-3-4b-it-4bit") == "gemma3")
+        #expect(TriAttentionDefaults.family(of:
+            "openai/gpt-4") == "other")
+    }
+
+    @Test("Defaults: defaultRate honors operator override + LONGCTX gate")
+    func defaultsDecisionTree() {
+        let dflt = TriAttentionDefaults.provisional
+        // No LONGCTX_ENDPOINT → off regardless of family
+        #expect(dflt.defaultRate(
+            for: "mlx-community/Qwen3-4B-4bit",
+            env: [:]
+        ) == nil)
+        // LONGCTX_ENDPOINT set + known family → returns safe rate
+        let r = dflt.defaultRate(
+            for: "mlx-community/Qwen3-4B-4bit",
+            env: ["LONGCTX_ENDPOINT": "http://localhost:5054"]
+        )
+        #expect(r != nil)
+        #expect((r ?? 0) > 0)
+        // Operator override (VLLM_TRIATT_ENABLED set) → nil so caller
+        // doesn't double-set the env
+        #expect(dflt.defaultRate(
+            for: "mlx-community/Qwen3-4B-4bit",
+            env: ["LONGCTX_ENDPOINT": "http://localhost:5054",
+                  "VLLM_TRIATT_ENABLED": "0"]
+        ) == nil)
+        // Unknown family → nil
+        #expect(dflt.defaultRate(
+            for: "openai/gpt-4",
+            env: ["LONGCTX_ENDPOINT": "http://localhost:5054"]
+        ) == nil)
+        // Aggressive ≥ safe per family
+        let safe = dflt.defaultRate(
+            for: "mlx-community/Qwen3-4B-4bit",
+            env: ["LONGCTX_ENDPOINT": "http://localhost:5054"]
+        ) ?? 0
+        let aggr = dflt.defaultRate(
+            for: "mlx-community/Qwen3-4B-4bit",
+            env: ["LONGCTX_ENDPOINT": "http://localhost:5054"],
+            useAggressive: true
+        ) ?? 0
+        #expect(aggr >= safe)
+    }
+
+    @Test("CompressionStats stackedWithTurboQuant matches first-order math")
+    func stackedSavingsMath() {
+        // Build a local stats instance via the public init (synthesize)
+        var s = TriAttentionKVCache.CompressionStats()
+        s.rounds = 1
+        s.totalBefore = 100
+        s.totalEvicted = 30
+        s.totalKept = 70
+        // V3 alone: 30%
+        #expect(abs(s.savingsPct - 30.0) < 0.001)
+        // V3 + K8V4 (12 bits avg): keptFrac=0.7, bitFrac=12/16=0.75
+        // stacked size = 0.7 * 0.75 = 0.525 → savings = 47.5%
+        let stacked = s.stackedWithTurboQuant(bitsPerCell: 12.0)
+        #expect(abs(stacked - 47.5) < 0.001)
+        // Sanity: bits=16 → no codec savings, only V3 (30%)
+        let onlyV3 = s.stackedWithTurboQuant(bitsPerCell: 16.0)
+        #expect(abs(onlyV3 - 30.0) < 0.001)
+    }
 }
