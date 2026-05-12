@@ -42,6 +42,22 @@ public struct PrefixCacheRouteState: @unchecked Sendable {
     /// completed prefill (passing the live iterator cache in).
     fileprivate let snapshotter: ((_ liveCache: [KVCache]) -> Void)?
 
+    /// Invoke the snapshotter directly on a live cache. This is the
+    /// stream-free variant of ``wrapStreamForSnapshot(_:cache:)``, for
+    /// callers that drive `TokenIterator` manually (e.g. C/FFI bridges
+    /// that step the iterator outside the AsyncStream<Generation>
+    /// pipeline). No-op when the route had no snapshotter (cache
+    /// disabled / hydrate failure).
+    ///
+    /// Call after the iterator has finished prefill — i.e. after
+    /// `iterator.next()` returns the first sampled token. The
+    /// snapshotter trims to the stable-prefix boundary internally per
+    /// `prefixCachePolicy`.
+    public func snapshot(cache: [KVCache]) {
+        guard let snapshotter else { return }
+        snapshotter(cache)
+    }
+
     /// Wrap an AsyncStream<Generation> so that on stream completion we
     /// snapshot the live cache. When this state has no snapshotter
     /// (e.g. cache disabled), the stream is returned verbatim — no
