@@ -2831,6 +2831,86 @@ struct RetrievalAttentionTests {
         )
     }
 
+    // F-55: validate fused score+topK Metal kernel produces the same
+    // top-K block starts as the MLX-ops baseline.
+    @Test func fusedScoreTopKKernelDeterministic() throws {
+        // Construct features so block b has score == b (per head).
+        // q = ones; features[h, b, 0] = b, other dims = 0.
+        let nHeads = 2
+        let nBlocks = 16
+        let contentDim = 4
+        let k = 4
+        let blockSize = 64
+        var data = [Float](repeating: 0, count: nHeads * nBlocks * contentDim)
+        for h in 0..<nHeads {
+            for b in 0..<nBlocks {
+                data[h * nBlocks * contentDim + b * contentDim + 0] = Float(b)
+            }
+        }
+        let features = MLXArray(data).reshaped(nHeads, nBlocks, contentDim)
+        var qData = [Float](repeating: 0, count: nHeads * contentDim)
+        for h in 0..<nHeads { qData[h * contentDim + 0] = 1.0 }
+        let q = MLXArray(qData).reshaped(nHeads, contentDim)
+
+        let fused = retrievalAttentionScoreTopKFused(
+            blockFeatures: features, projectedQ: q,
+            k: k, blockSize: blockSize, nBlocksRounded: nBlocks
+        )
+        let fusedArr = fused.asArray(Int32.self)
+        // Expected per head: top-k blocks = [15, 14, 13, 12] → starts 960, 896, 832, 768
+        let expectedHead = Set<Int32>([15, 14, 13, 12].map { Int32($0 * blockSize) })
+        var ok = true
+        for h in 0..<nHeads {
+            let got = Set(fusedArr[(h * k) ..< ((h + 1) * k)])
+            print("[F-55-det] head=\(h) expected=\(expectedHead.sorted()) got=\(got.sorted())")
+            if got != expectedHead { ok = false }
+        }
+        #expect(ok, "fused kernel top-K not deterministic-correct")
+    }
+
+    @Test func fusedScoreTopKKernelMatchesBaseline() throws {
+        let nHeads = 4
+        let nBlocks = 64
+        let contentDim = 16
+        let k = 8
+        let blockSize = 64
+        MLXRandom.seed(0xAA)
+        let features = MLXRandom.normal([nHeads, nBlocks, contentDim]).asType(.float32)
+        let q = MLXRandom.normal([nHeads, contentDim]).asType(.float32)
+
+        // Baseline: explicit MLX ops.
+        let scores = (features * q.reshaped(nHeads, 1, contentDim)).sum(axis: -1)
+        let pivotKth = nBlocks - k
+        let partitioned = argPartition(scores, kth: pivotKth, axis: -1)
+        let baselineTopK = partitioned[0..., (nBlocks - k)...] * Int32(blockSize)
+        let baseline = baselineTopK.asArray(Int32.self)
+
+        // Fused kernel.
+        let fused = retrievalAttentionScoreTopKFused(
+            blockFeatures: features,
+            projectedQ: q,
+            k: k,
+            blockSize: blockSize,
+            nBlocksRounded: nBlocks
+        )
+        let fusedArr = fused.asArray(Int32.self)
+
+        // Both produce top-K block starts but possibly in different orders
+        // (argPartition is unordered within the partition; fused kernel
+        // emits in descending score order). Compare as sets per head.
+        var allMatch = true
+        for h in 0..<nHeads {
+            let base = Set(baseline[(h * k) ..< ((h + 1) * k)])
+            let fus = Set(fusedArr[(h * k) ..< ((h + 1) * k)])
+            if base != fus {
+                allMatch = false
+                print("[F-55] head=\(h) baseline=\(base.sorted()) fused=\(fus.sorted())")
+            }
+        }
+        print("[F-55-fused-topk] heads=\(nHeads) k=\(k) match=\(allMatch)")
+        #expect(allMatch, "fused kernel top-K does not match baseline")
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
