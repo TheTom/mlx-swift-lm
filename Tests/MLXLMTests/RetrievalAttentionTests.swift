@@ -2514,6 +2514,68 @@ struct RetrievalAttentionTests {
         }
     }
 
+    // F-42: confirm default config (adaptiveTopK = true) ships the F-41
+    // fix automatically. Repeat F-41's 32K-1 multi-step test on 14B-1M
+    // with DEFAULT config (no manual fineTopK bump).
+    @Test func trainedQwen25_14B_1M_MultiStepAt32K_DefaultIsAdaptive() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32767
+        let decodeSteps = 8
+        MLXRandom.seed(0x14B9)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+
+        let dn = model.newCache(parameters: nil)
+        var dnLogits = model(prefillTokens, cache: dn)
+        // Default config — no overrides. Adaptive top_k should kick in.
+        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        var raLogits = model(prefillTokens, cache: ra)
+
+        var matches = 0
+        var totalCosine: Float = 0
+        for _ in 0..<decodeSteps {
+            let dnNext = dnLogits[0, -1, 0...].asType(.float32).argMax().asType(.int32)
+            let raNext = raLogits[0, -1, 0...].asType(.float32).argMax().asType(.int32)
+            let dnTok = dnNext.asArray(Int32.self)[0]
+            let raTok = raNext.asArray(Int32.self)[0]
+            if dnTok == raTok { matches += 1 }
+            let dFlat = dnLogits[0, -1, 0...].asType(.float32)
+            let rFlat = raLogits[0, -1, 0...].asType(.float32)
+            let dot = (dFlat * rFlat).sum().asArray(Float.self)[0]
+            let dnN = sqrt((dFlat * dFlat).sum()).asArray(Float.self)[0]
+            let rnN = sqrt((rFlat * rFlat).sum()).asArray(Float.self)[0]
+            totalCosine += dot / (dnN * rnN + 1e-12)
+            dnLogits = model(dnNext.reshaped(1, 1), cache: dn)
+            raLogits = model(raNext.reshaped(1, 1), cache: ra)
+        }
+        print(
+            "[F-42-default-adaptive-32K-multistep] matches=\(matches)/\(decodeSteps) "
+                + "mean_cosine=\(totalCosine / Float(decodeSteps))"
+        )
+        #expect(matches >= decodeSteps - 1, "default config (adaptive) should match F-41 fix")
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.

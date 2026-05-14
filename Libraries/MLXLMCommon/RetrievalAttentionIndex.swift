@@ -179,12 +179,14 @@ public final class RetrievalAttentionIndex {
         )
     }
 
-    /// Top-k fine block start positions (in token coordinates).
+    /// Top-k fine block start positions (in token coordinates). Uses
+    /// `config.effectiveFineTopK(seqLen:)` so adaptive-top-k kicks in
+    /// automatically — F-41 measured this matters a LOT for multi-step
+    /// generation at long context.
     public func topKFineBlockStarts(against projectedQ: MLXArray) -> [Int] {
         let scores = scoreFineBlocks(against: projectedQ)
-        let blockIndices = retrievalAttentionTopKBlocks(
-            scores: scores, k: config.fineTopK
-        )
+        let k = config.effectiveFineTopK(seqLen: seqLen)
+        let blockIndices = retrievalAttentionTopKBlocks(scores: scores, k: k)
         return blockIndices.map { $0 * config.fineBlockSize }
     }
 

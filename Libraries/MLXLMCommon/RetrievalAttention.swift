@@ -44,8 +44,30 @@ public struct RetrievalAttentionConfig: Sendable {
     /// the gather memory-coalesced; 64 is the published sweet spot.
     public var fineBlockSize: Int = 64
 
-    /// How many fine blocks to retrieve per query (PRD line 124).
+    /// How many fine blocks to retrieve per query (PRD line 124). When
+    /// `adaptiveTopK` is true (the default), this is the FLOOR; the
+    /// actual top-K at gather time is `max(fineTopK, ceil(seqLen /
+    /// adaptiveTopKDivisor))`. See `effectiveFineTopK(seqLen:)`.
     public var fineTopK: Int = 32
+
+    /// Whether to scale `fineTopK` with sequence length at gather time.
+    /// F-41 measured 14B-1M @ 32K-1: default-32 → 1/8 multi-step match
+    /// vs adaptive-128 → 8/8 match. Adaptive is the SHIP default; the
+    /// flag is here only to expose an opt-out for ablation.
+    public var adaptiveTopK: Bool = true
+
+    /// Divisor for adaptive top-K scaling. `topK = ceil(seqLen / divisor)`.
+    /// F-40/F-41 validated 256 as the sweet spot on Qwen2.5-14B-1M:
+    /// 32 floor at ≤8K, 128 at 32K (8/8 multi-step match), 1024 at 256K.
+    public var adaptiveTopKDivisor: Int = 256
+
+    /// Compute the effective fine top-K to use at gather time given the
+    /// current cache length.
+    public func effectiveFineTopK(seqLen: Int) -> Int {
+        guard adaptiveTopK else { return fineTopK }
+        let scaled = (seqLen + adaptiveTopKDivisor - 1) / adaptiveTopKDivisor
+        return max(fineTopK, scaled)
+    }
 
     // ----- Coarse rescue (Decision 14)
 
