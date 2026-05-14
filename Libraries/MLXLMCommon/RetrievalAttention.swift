@@ -199,6 +199,13 @@ public struct RetrievalAttentionConfig: Sendable {
     /// benches confirm a measurable win over the F-59 mask path.
     public var usePerKVHeadGather: Bool = false
 
+    /// F-76 implicit-positions sparse SDPA — the no-mask terminal path.
+    /// Per layer: F-75 parallel score+topK kernel + F-76 sparse SDPA
+    /// kernel = 2 fused dispatches (vs F-73's 4). Skips mask
+    /// materialization entirely (NSA/Quest/FlexAttention design).
+    /// Aims at dense parity.
+    public var useImplicitSparseSDPA: Bool = false
+
     /// F-75 parallel fine+coarse score+topK kernel. 2 × NKVH
     /// threadgroups in one launch (fine and coarse concurrent), then
     /// the F-73 mask kernel. Total 3 kernel dispatches per sparse layer

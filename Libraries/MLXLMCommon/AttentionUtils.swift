@@ -206,6 +206,17 @@ public func attentionWithCacheUpdate(
                     )
                 }
             }
+            if raCache.raConfig.useImplicitSparseSDPA && sinks == nil {
+                // F-76 — sparse SDPA with implicit position expansion.
+                // 2 kernel dispatches per layer (F-75 selector + F-76 SDPA),
+                // no mask, no gather array.
+                if let out = raCache.implicitSparseSDPA(
+                    queries: queries, keys: cachedKeys, values: cachedValues,
+                    qHeads: qFlat, scale: scale
+                ) {
+                    return out
+                }
+            }
             if raCache.raConfig.useParallelScoreTopK {
                 // F-75 — parallel fine+coarse score+topK kernel + F-73
                 // mask kernel. 3 kernel dispatches per sparse layer.

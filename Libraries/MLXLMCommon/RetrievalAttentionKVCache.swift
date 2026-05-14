@@ -418,6 +418,73 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         return out
     }
 
+    /// F-76 implicit-positions sparse SDPA. Combines F-75 (parallel
+    /// fine+coarse score+topK kernel) + sparse SDPA over the implicit
+    /// static+sliding+topK positions. Total per layer: 3 ops
+    /// (inner.update + F-75 + F-76) vs F-73's 6 ops. Targets parity
+    /// with dense.
+    ///
+    /// Returns SDPA output `[B, nQH, 1, D]` — no mask, no gather array.
+    public func implicitSparseSDPA(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        qHeads: MLXArray,
+        scale: Float
+    ) -> MLXArray? {
+        precondition(qHeads.shape.count == 2, "expected [nHeads, dHead]")
+        guard let index = batchedIndex else { return nil }
+        guard let fineFeatures = index.fineBlockFeatures,
+              let coarseFeatures = index.coarseBlockFeatures
+        else { return nil }
+        let nKVH = index.nKVHeads
+        let groupSize = qHeads.dim(0) / nKVH
+        let nFine = fineFeatures.dim(1)
+        let nCoarse = coarseFeatures.dim(1)
+        let isPow2 = { (n: Int) in n > 0 && (n & (n - 1)) == 0 }
+        if !(isPow2(nFine) && nFine <= 1024 && isPow2(nCoarse) && nCoarse <= 1024) {
+            return nil
+        }
+        let T = keys.dim(2)
+        let kFine = min(raConfig.effectiveFineTopK(seqLen: T), nFine)
+        let kCoarse = raConfig.coarseRescueEnabled
+            ? min(raConfig.coarseTopK, nCoarse) : 0
+        guard kCoarse > 0 else { return nil }
+
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray(
+                (0..<nKVH).map { Int32($0 * groupSize) }
+            )
+            eval(cachedHeadIdx!)
+        }
+        let qStacked = qHeads.take(cachedHeadIdx!, axis: 0).asType(.float32)
+        let projQ = index.projectQueriesBatched(qStacked)
+
+        let (fineStarts, coarseStarts) = retrievalAttentionParallelScoreTopK(
+            projectedQ: projQ,
+            fineFeatures: fineFeatures,
+            coarseFeatures: coarseFeatures,
+            kFine: kFine, kCoarse: kCoarse,
+            fineBlockSize: raConfig.fineBlockSize,
+            coarseBlockSize: raConfig.coarseBlockSize
+        )
+        // Reshape to [B=1, nKVH, K_*] for the F-76 kernel.
+        let fineStarts3D = fineStarts.expandedDimensions(axis: 0)
+        let coarseStarts3D = coarseStarts.expandedDimensions(axis: 0)
+
+        return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+            retrievalAttentionImplicitSparseSDPA(
+                queries: queries, keys: keys, values: values,
+                fineStarts: fineStarts3D, coarseStarts: coarseStarts3D,
+                staticInit: raConfig.staticInit,
+                slidingWindow: raConfig.slidingWindow,
+                fineBlockSize: raConfig.fineBlockSize,
+                coarseBlockSize: raConfig.coarseBlockSize,
+                scale: scale
+            )
+        }
+    }
+
     /// F-75 build-mask via parallel score+topK kernel. Per layer:
     /// projectQ (MLX matmul) + F-75 (one kernel for both fine and
     /// coarse, 2×NKVH threadgroups concurrent) + F-73 mask. Total

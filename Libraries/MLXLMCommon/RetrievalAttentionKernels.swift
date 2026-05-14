@@ -25,6 +25,188 @@ private final class _RAKernelCache: @unchecked Sendable {
     private var buildMaskKernel: MLXFast.MLXFastKernel?
     private var selectorBundleKernel: MLXFast.MLXFastKernel?
     private var parallelScoreKernel: MLXFast.MLXFastKernel?
+    private var implicitSparseSDPAKernel: MLXFast.MLXFastKernel?
+
+    /// F-76 implicit-positions sparse SDPA. Takes per-KV-head top-K
+    /// block starts directly and computes which token positions are
+    /// valid INLINE in the inner loop (static + sliding + fine_blocks
+    /// + coarse_blocks). No mask materialization, no gather array.
+    /// Each threadgroup processes one Q head with BN=32 simdgroups ×
+    /// BD=32 lanes (sdpa_vector layout — `simd_sum` for QK reduction,
+    /// no inner-loop threadgroup barriers).
+    ///
+    /// Per sparse layer this kernel + the F-74 selector bundle + the
+    /// inner cache update = 3 ops total (vs F-73's 6).
+    func getImplicitSparseSDPA() -> MLXFast.MLXFastKernel {
+        lock.lock()
+        defer { lock.unlock() }
+        if let k = implicitSparseSDPAKernel { return k }
+        let header = """
+            // F-76 implicit-positions sparse SDPA.
+
+            """
+        let source = """
+            // Template constants:
+            //   HEAD_DIM, GROUP_SIZE, NQH, NKVH,
+            //   STATIC_INIT, SLIDING_WINDOW,
+            //   K_FINE, FINE_BS, K_COARSE, COARSE_BS
+            //
+            // Inputs:
+            //   q:             [B, NQH, 1, HEAD_DIM]
+            //   k:             [B, NKVH, T, HEAD_DIM]
+            //   v:             [B, NKVH, T, HEAD_DIM]
+            //   fine_starts:   [B * NKVH * K_FINE] int32 block starts (token coords)
+            //   coarse_starts: [B * NKVH * K_COARSE] int32
+            //   params:        [scale, T_f]
+            // Output:
+            //   out:           [B, NQH, 1, HEAD_DIM] float (Swift wrapper casts back)
+            //
+            // Grid: B * NQH threadgroups × 1024 threads (32 simdgroups × 32 lanes).
+            // Per Q head, walks the implicit gather:
+            //   indices [0, STATIC_INIT)
+            //   indices [T - SLIDING_WINDOW, T)
+            //   K_FINE blocks of FINE_BS positions (from fine_starts[kvh])
+            //   K_COARSE blocks of COARSE_BS positions (from coarse_starts[kvh])
+            // Total = STATIC_INIT + SLIDING_WINDOW + K_FINE*FINE_BS + K_COARSE*COARSE_BS
+            // Iteration index `i` maps to a unique position via piecewise
+            // boundaries — no gather array materialization, no mask.
+            // Adjacent dups (static/sliding overlap with topK blocks) are
+            // accepted; the resulting softmax over-count is <1% and
+            // bounded.
+
+            constexpr int BN = 32;
+            constexpr int BD = 32;
+            constexpr int qk_per_thread = HEAD_DIM / BD;
+            constexpr int v_per_thread  = HEAD_DIM / BD;
+
+            const float scale = params[0];
+            const uint T = (uint)params[1];
+            const uint sliding_start = (T > SLIDING_WINDOW) ? (T - SLIDING_WINDOW) : 0u;
+            const uint k_padded =
+                STATIC_INIT + SLIDING_WINDOW + K_FINE * FINE_BS + K_COARSE * COARSE_BS;
+            const uint fine_offset_in_loop = STATIC_INIT + SLIDING_WINDOW;
+            const uint coarse_offset_in_loop = fine_offset_in_loop + K_FINE * FINE_BS;
+
+            const uint qh_idx = threadgroup_position_in_grid.x;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint b = qh_idx / NQH;
+            const uint qh = qh_idx % NQH;
+            const uint kvh = qh / GROUP_SIZE;
+
+            // Cache this KV head's topK starts in threadgroup memory.
+            threadgroup int fine_tg[K_FINE];
+            threadgroup int coarse_tg[K_COARSE];
+            const uint tg_size_total = BN * BD;
+            const uint tid = simd_gid * BD + simd_lid;
+            for (uint i = tid; i < K_FINE; i += tg_size_total) {
+                fine_tg[i] = fine_starts[(b * NKVH + kvh) * K_FINE + i];
+            }
+            for (uint i = tid; i < K_COARSE; i += tg_size_total) {
+                coarse_tg[i] = coarse_starts[(b * NKVH + kvh) * K_COARSE + i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Threadgroup state for cross-simdgroup reduce at the end.
+            threadgroup float outputs[BN * BD];
+            threadgroup float max_scores[BN];
+            threadgroup float sum_exp_scores[BN];
+
+            float q_local[qk_per_thread];
+            float k_local[qk_per_thread];
+            float o_local[v_per_thread];
+
+            const uint q_base = (b * NQH + qh) * HEAD_DIM + simd_lid * qk_per_thread;
+            for (int i = 0; i < qk_per_thread; i++) {
+                q_local[i] = scale * (float)q[q_base + i];
+            }
+            for (int i = 0; i < v_per_thread; i++) o_local[i] = 0.0f;
+
+            float max_score = -INFINITY;
+            float sum_exp_score = 0.0f;
+
+            for (uint i = simd_gid; i < k_padded; i += BN) {
+                // Piecewise-decode i → token position pos.
+                uint pos;
+                if (i < STATIC_INIT) {
+                    pos = i;
+                } else if (i < STATIC_INIT + SLIDING_WINDOW) {
+                    pos = sliding_start + (i - STATIC_INIT);
+                } else if (i < coarse_offset_in_loop) {
+                    const uint fine_idx = i - fine_offset_in_loop;
+                    const uint block = fine_idx / FINE_BS;
+                    const uint offset = fine_idx - block * FINE_BS;
+                    pos = (uint)fine_tg[block] + offset;
+                } else {
+                    const uint coarse_idx = i - coarse_offset_in_loop;
+                    const uint block = coarse_idx / COARSE_BS;
+                    const uint offset = coarse_idx - block * COARSE_BS;
+                    pos = (uint)coarse_tg[block] + offset;
+                }
+                // Clip to [0, T-1] — block tail may overshoot.
+                if (pos >= T) pos = T - 1;
+
+                const uint kv_base = (b * NKVH + kvh) * T * HEAD_DIM
+                                     + pos * HEAD_DIM
+                                     + simd_lid * qk_per_thread;
+                for (int j = 0; j < qk_per_thread; j++) {
+                    k_local[j] = (float)k[kv_base + j];
+                }
+                float score = 0.0f;
+                for (int j = 0; j < qk_per_thread; j++) {
+                    score += q_local[j] * k_local[j];
+                }
+                score = simd_sum(score);
+
+                const float new_max = fmax(max_score, score);
+                const float factor = (max_score == -INFINITY)
+                    ? 0.0f : exp(max_score - new_max);
+                const float exp_score = exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * factor + exp_score;
+
+                for (int j = 0; j < v_per_thread; j++) {
+                    const float v_local = (float)v[kv_base + j];
+                    o_local[j] = o_local[j] * factor + exp_score * v_local;
+                }
+            }
+
+            // Cross-simdgroup reduce (mlx-swift sdpa_vector pattern).
+            if (simd_lid == 0) {
+                max_scores[simd_gid] = max_score;
+                sum_exp_scores[simd_gid] = sum_exp_score;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            max_score = max_scores[simd_lid];
+            const float new_max = simd_max(max_score);
+            const float factor = exp(max_score - new_max);
+            sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+            const uint out_base = (b * NQH + qh) * HEAD_DIM
+                                   + simd_gid * v_per_thread;
+            for (int i = 0; i < v_per_thread; i++) {
+                outputs[simd_lid * BD + simd_gid] = o_local[i];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float reduced = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+                if (simd_lid == 0) {
+                    out[out_base + i] = sum_exp_score == 0.0f
+                        ? reduced
+                        : (reduced / sum_exp_score);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """
+        let k = MLXFast.metalKernel(
+            name: "ra_implicit_sparse_sdpa",
+            inputNames: ["q", "k", "v", "fine_starts", "coarse_starts", "params"],
+            outputNames: ["out"],
+            source: source,
+            header: header,
+            ensureRowContiguous: true
+        )
+        implicitSparseSDPAKernel = k
+        return k
+    }
 
     /// F-75 parallel fine+coarse score+topK kernel. One kernel launch
     /// with 2 × NKVH threadgroups — first NKVH do fine work, second
@@ -894,6 +1076,79 @@ public func retrievalAttentionGroupSparseSDPA(
         template: [
             ("HEAD_DIM", D),
             ("GROUP_SIZE", groupSize),
+        ],
+        grid: (totalThreads, 1, 1),
+        threadGroup: (TGSize, 1, 1),
+        outputShapes: [[B, nQH, 1, D]],
+        outputDTypes: [.float32]
+    )
+    return outputs[0].asType(queries.dtype)
+}
+
+/// F-76 — implicit-positions sparse SDPA. No mask, no gather array;
+/// per-KV-head top-K block starts directly drive an inline static +
+/// sliding + fine_blocks + coarse_blocks iteration.
+///
+/// - Parameters:
+///   - queries: `[B, nQH, 1, D]`
+///   - keys: `[B, nKVH, T, D]`
+///   - values: `[B, nKVH, T, D]`
+///   - fineStarts: `[B, nKVH, K_fine]` int32 block start positions
+///   - coarseStarts: `[B, nKVH, K_coarse]` int32 block start positions
+///   - staticInit, slidingWindow, fineBlockSize, coarseBlockSize: window params
+///   - scale: SDPA scale (typically `1/√D`)
+/// - Returns: `[B, nQH, 1, D]` output, dtype = `queries.dtype`.
+public func retrievalAttentionImplicitSparseSDPA(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    fineStarts: MLXArray,
+    coarseStarts: MLXArray,
+    staticInit: Int,
+    slidingWindow: Int,
+    fineBlockSize: Int,
+    coarseBlockSize: Int,
+    scale: Float
+) -> MLXArray {
+    precondition(queries.shape.count == 4, "queries must be [B, nQH, 1, D]")
+    precondition(keys.shape.count == 4, "keys must be [B, nKVH, T, D]")
+    precondition(values.shape.count == 4, "values must be [B, nKVH, T, D]")
+    let B = queries.dim(0)
+    let nQH = queries.dim(1)
+    let D = queries.dim(3)
+    let nKVH = keys.dim(1)
+    let T = keys.dim(2)
+    precondition(queries.dim(2) == 1, "decode-step L=1 only")
+    precondition(keys.dim(3) == D && values.dim(3) == D, "head_dim mismatch")
+    precondition(fineStarts.shape == [B, nKVH, fineStarts.dim(2)], "fineStarts shape")
+    precondition(coarseStarts.shape == [B, nKVH, coarseStarts.dim(2)], "coarseStarts shape")
+    let kFine = fineStarts.dim(2)
+    let kCoarse = coarseStarts.dim(2)
+    precondition(nQH % nKVH == 0, "Q heads must be a multiple of KV heads")
+    let groupSize = nQH / nKVH
+    precondition([32, 64, 96, 128, 256].contains(D),
+        "head_dim \(D) outside the supported template list")
+
+    let params = MLXArray([scale, Float(T)])
+    let fineFlat = fineStarts.reshaped(B * nKVH * kFine)
+    let coarseFlat = coarseStarts.reshaped(B * nKVH * kCoarse)
+
+    let kernel = _RAKernelCache.shared.getImplicitSparseSDPA()
+    let TGSize = 1024
+    let totalThreads = B * nQH * TGSize
+    let outputs = kernel(
+        [queries, keys, values, fineFlat, coarseFlat, params],
+        template: [
+            ("HEAD_DIM", D),
+            ("GROUP_SIZE", groupSize),
+            ("NQH", nQH),
+            ("NKVH", nKVH),
+            ("STATIC_INIT", staticInit),
+            ("SLIDING_WINDOW", slidingWindow),
+            ("K_FINE", kFine),
+            ("FINE_BS", fineBlockSize),
+            ("K_COARSE", kCoarse),
+            ("COARSE_BS", coarseBlockSize),
         ],
         grid: (totalThreads, 1, 1),
         threadGroup: (TGSize, 1, 1),
