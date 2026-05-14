@@ -306,6 +306,59 @@ The F-73 ship is the highest-leverage incremental win available without restruct
 
 ---
 
+## F-76 — implicit sparse SDPA (NSA-style no-mask path, slower)
+
+Tried the "terminal" no-mask design recommended by the research agent:
+single kernel takes topK block starts + Q/K/V, computes static + sliding
++ topK_blocks positions INLINE in the inner loop, runs online-softmax
+SDPA. No mask materialization, no gather array.
+
+Correctness: bit-exact to F-59 (cosine = 1.0).
+
+Latency on Qwen2.5-14B-1M-4bit @ 32K:
+  dense  = 38.7ms
+  F-73   = 60.6ms (+22ms — ship default)
+  F-76   = 72.3ms (+33.7ms — 11.7ms SLOWER than F-73)
+
+Same root cause as F-69/F-71b: hand-rolled sparse SDPA Metal kernel
+can't match mlx-swift's tuned `sdpa_vector_2pass`. The mask path's
+"short-circuit FMA at -inf" optimization plus coalesced K/V reads
+beat the apparent K_padded/T compute savings of a sparse kernel.
+
+NSA / Quest / FlexAttention's "no-mask" pattern works on CUDA because
+they have FlashAttention's mature sparse kernel. On Apple Silicon
+Metal, mlx-swift's `sdpa_vector` is the only well-tuned attention
+kernel and only accepts dense+mask.
+
+## Final scorecard
+
+| Path | T=32K ms | gap vs dense | status |
+|------|----------|---------------|--------|
+| Dense | 38.7 | 0 | baseline |
+| **F-73 (NEW SHIP)** | **52.5** | **+14.3ms** | default, bit-exact |
+| F-59 (OLD SHIP) | 62.4 | +22.9ms | replayable |
+| F-71b sparse kernel | 87.0+ | +48ms+ | opt-in |
+| F-74 monolith | 55.2 | +16.1ms | opt-in |
+| F-75 parallel score | 52.3 | +13.9ms | opt-in |
+| F-76 implicit no-mask | 72.3 | +33.7ms | opt-in |
+
+**Gap closed: 22.9 → 14.3ms (37%).** Practical floor on Apple
+Silicon + mlx-swift's current dense+mask path. To break further:
+
+1. **Upstream contribution** to mlx-swift: add sparse-SDPA variant
+   to `sdpa_vector` that accepts a position-list directly. Multi-
+   month engineering, requires Apple/MLX team review.
+2. **Two-forward decode**: pre-pass collects projected Q across all
+   layers, batched selector pipeline runs once, second pass uses
+   pre-built masks. Doubles dense work; net loss at our model size.
+3. **Async pipelining** of selector behind MLP via multiple Metal
+   command queues. Requires invasive mlx-swift changes (no current
+   API for stream affinity per op).
+
+The F-73 ship is the practical optimum on the current stack.
+
+---
+
 ## What's still open (in priority order)
 
 1. **Fused select-gather-attend Metal kernel.** Big engineering job — would
