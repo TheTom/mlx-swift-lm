@@ -4162,6 +4162,117 @@ struct RetrievalAttentionTests {
         #expect(minCos >= 0.99999, "F-80 cliff regressed: min_cosine=\(minCos)")
     }
 
+    // F-79 quality at long context (cliff-band: 65K / 96K / 128K).
+    // Validates that F-79 amort=16 + F-80 allocator fix gives clean
+    // quality in the band that was previously cliff-affected.
+    @Test func f79Quality_longContext_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let nSteps = 8
+        let contexts = [65_535, 98_303, 131_071]
+        for prefillLen in contexts {
+            MLXRandom.seed(0xF079)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+                MLXRandom.randInt(
+                    low: MLXArray(Int32(0)),
+                    high: MLXArray(Int32(cfg.vocabularySize)),
+                    [1, 1]
+                ).asType(.int32)
+            }
+            eval(forceTokens)
+
+            func runDense() -> (logits: [MLXArray], ms: [Double]) {
+                let cache = model.newCache(parameters: nil)
+                _ = model(prefillTokens, cache: cache)
+                eval(cache.flatMap { $0.state })
+                var logits: [MLXArray] = []
+                var times: [Double] = []
+                for s in 0..<nSteps {
+                    let t0 = Date()
+                    let l = model(forceTokens[s], cache: cache)
+                    eval(l)
+                    times.append(Date().timeIntervalSince(t0) * 1000)
+                    logits.append(l)
+                }
+                return (logits, times)
+            }
+            func runRA() -> (logits: [MLXArray], ms: [Double]) {
+                let raConfig = RetrievalAttentionConfig()  // F-79 amort=16
+                let caches: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConfig, ropeBase: cfg.ropeTheta
+                    )
+                }
+                _ = model(prefillTokens, cache: caches)
+                eval(caches.flatMap { $0.state })
+                var logits: [MLXArray] = []
+                var times: [Double] = []
+                for s in 0..<nSteps {
+                    let t0 = Date()
+                    let l = model(forceTokens[s], cache: caches)
+                    eval(l)
+                    times.append(Date().timeIntervalSince(t0) * 1000)
+                    logits.append(l)
+                }
+                return (logits, times)
+            }
+            let denseRes = runDense()
+            let raRes = runRA()
+            let dense = denseRes.logits
+            let ra = raRes.logits
+            var sumCos: Double = 0
+            var matches = 0
+            for s in 0..<nSteps {
+                let dF = dense[s].reshaped(dense[s].size).asType(.float32)
+                let rF = ra[s].reshaped(ra[s].size).asType(.float32)
+                let dot = (dF * rF).sum().asArray(Float.self)[0]
+                let dn = sqrt((dF * dF).sum()).asArray(Float.self)[0]
+                let rn = sqrt((rF * rF).sum()).asArray(Float.self)[0]
+                sumCos += Double(dot / (dn * rn + 1e-12))
+                let dArgmax = dense[s].argMax(axis: -1).asArray(Int32.self)[0]
+                let rArgmax = ra[s].argMax(axis: -1).asArray(Int32.self)[0]
+                if dArgmax == rArgmax { matches += 1 }
+            }
+            let meanCos = sumCos / Double(nSteps)
+            // Drop first step (warmup), median rest.
+            func median(_ arr: [Double]) -> Double {
+                let s = arr.sorted()
+                return s.count % 2 == 1
+                    ? s[s.count / 2]
+                    : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
+            }
+            let denseMs = median(Array(denseRes.ms.dropFirst()))
+            let raMs = median(Array(raRes.ms.dropFirst()))
+            let gap = raMs - denseMs
+            print("[F-79-longctx] T=\(prefillLen) "
+                + "mean_cosine=\(String(format: "%.5f", meanCos)) "
+                + "argmax=\(matches)/\(nSteps) "
+                + "dense=\(String(format: "%.1f", denseMs))ms "
+                + "ra=\(String(format: "%.1f", raMs))ms "
+                + "gap=\(String(format: "%+.1f", gap))ms")
+            #expect(meanCos >= 0.99, "F-79 quality regressed at T=\(prefillLen): \(meanCos)")
+        }
+    }
+
     // Phase D: RA + TurboQuant+ composition. RA's inner cache is a
     // TurboQuantizedKVCache in rawKeyMode (K=FP16, V=4bit). Validates:
     //   - prefill + 8 decode steps stays usable
