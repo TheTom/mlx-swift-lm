@@ -21,6 +21,171 @@ private final class _RAKernelCache: @unchecked Sendable {
     private let lock = NSLock()
     private var scoreTopKKernel: MLXFast.MLXFastKernel?
     private var sparseSDPAKernel: MLXFast.MLXFastKernel?
+    private var groupSDPAKernel: MLXFast.MLXFastKernel?
+
+    /// F-71b NSA-style fused sparse SDPA matching mlx-swift's
+    /// `sdpa_vector` layout: BN=32 simdgroups × BD=32 lanes per
+    /// threadgroup, `simd_sum` for QK reduction (no threadgroup
+    /// barriers in inner loop), 32 gather positions per outer-loop
+    /// iteration. Skips F-69's fp32 pre-cast — reads native Q/K/V
+    /// dtype and casts via `(float)k[...]` on load.
+    ///
+    /// One threadgroup per (B, Q head). Each threadgroup walks its
+    /// KV head's per-row gather. (The GQA-group-sharing variant in
+    /// F-71a was bottlenecked on barriers; this matches mlx-swift's
+    /// proven decode kernel structure.)
+    func getGroupSDPA() -> MLXFast.MLXFastKernel {
+        lock.lock()
+        defer { lock.unlock() }
+        if let k = groupSDPAKernel { return k }
+        let header = """
+            // F-71 NSA-style group-centric fused sparse SDPA.
+
+            """
+        let source = """
+            // Template constants: HEAD_DIM, GROUP_SIZE
+            // Inputs:
+            //   q:       [B, NQH, 1, HEAD_DIM]     -- Q dtype (typically fp16)
+            //   k:       [B, NKVH, T, HEAD_DIM]
+            //   v:       [B, NKVH, T, HEAD_DIM]
+            //   gather:  [B * NKVH * K_padded] int32 -- per-KV-head sorted
+            //            positions; -1 sentinel marks deduped positions.
+            //   params:  [scale, NQH_f, NKVH_f, T_f, K_padded_f]
+            // Output:
+            //   out:     [B, NQH, 1, HEAD_DIM]  (fp32 inside kernel; Swift casts)
+            //
+            // Layout matches mlx-swift's `sdpa_vector`:
+            //   - threadgroup = BN(=32) simdgroups × BD(=32) lanes = 1024 threads
+            //   - qk_per_thread = HEAD_DIM / BD; v_per_thread same
+            //   - inner gather loop: `for i = simd_gid; i < K_padded; i += BN`
+            //     → BN simdgroups process BN gather positions in parallel
+            //   - `simd_sum` for QK reduction (no threadgroup barriers)
+            //
+            // Grid: (B * NQH * 1024, 1, 1). One threadgroup per (B, Q head).
+            // GROUP_SIZE is unused at this layer; the group sharing was
+            // dropped in F-71b after F-71a's barrier-bound regression.
+
+            constexpr int BN = 32;
+            constexpr int BD = 32;
+            constexpr int qk_per_thread = HEAD_DIM / BD;
+            constexpr int v_per_thread = HEAD_DIM / BD;
+
+            const float scale = params[0];
+            const uint NQH = (uint)params[1];
+            const uint NKVH = (uint)params[2];
+            const uint T = (uint)params[3];
+            const uint K_padded = (uint)params[4];
+
+            const uint qh_idx = threadgroup_position_in_grid.x;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint b = qh_idx / NQH;
+            const uint qh = qh_idx % NQH;
+            const uint kvh = qh / GROUP_SIZE;
+
+            // Threadgroup state for cross-simd reduce at the end.
+            threadgroup float outputs[BN * BD];
+            threadgroup float max_scores[BN];
+            threadgroup float sum_exp_scores[BN];
+
+            // Per-thread Q register file: qk_per_thread elements pre-scaled.
+            float q_local[qk_per_thread];
+            float k_local[qk_per_thread];
+            float o_local[v_per_thread];
+
+            // Load Q (this thread owns lanes [simd_lid * qk_per_thread, ...])
+            // from q[b, qh, 0, simd_lid * qk_per_thread + i].
+            const uint q_base = (b * NQH + qh) * HEAD_DIM
+                                 + simd_lid * qk_per_thread;
+            for (int i = 0; i < qk_per_thread; i++) {
+                q_local[i] = scale * (float)q[q_base + i];
+            }
+            for (int i = 0; i < v_per_thread; i++) {
+                o_local[i] = 0.0f;
+            }
+
+            float max_score = -INFINITY;
+            float sum_exp_score = 0.0f;
+
+            const uint gather_base = (b * NKVH + kvh) * K_padded;
+
+            // Each simdgroup processes a strided slice of K_padded.
+            for (uint i = simd_gid; i < K_padded; i += BN) {
+                const int pos = gather[gather_base + i];
+                // Sentinel skip: -1 marks adjacent-dup positions deduped
+                // upstream. simd-coherent branch — all lanes in a simdgroup
+                // see the same pos, so the simd_sum below stays well-defined.
+                if (pos < 0) continue;
+
+                const uint kv_base = (b * NKVH + kvh) * T * HEAD_DIM
+                                     + (uint)pos * HEAD_DIM
+                                     + simd_lid * qk_per_thread;
+
+                // Load qk_per_thread K elements
+                for (int j = 0; j < qk_per_thread; j++) {
+                    k_local[j] = (float)k[kv_base + j];
+                }
+
+                // Compute partial QK dot
+                float score = 0.0f;
+                for (int j = 0; j < qk_per_thread; j++) {
+                    score += q_local[j] * k_local[j];
+                }
+                // simd-level reduction across BD=32 lanes — no barriers.
+                score = simd_sum(score);
+
+                // Online softmax update (every lane sees same score).
+                const float new_max = fmax(max_score, score);
+                const float factor = (max_score == -INFINITY)
+                    ? 0.0f : exp(max_score - new_max);
+                const float exp_score = exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * factor + exp_score;
+
+                // V accumulate
+                for (int j = 0; j < v_per_thread; j++) {
+                    const float v_local = (float)v[kv_base + j];
+                    o_local[j] = o_local[j] * factor + exp_score * v_local;
+                }
+            }
+
+            // Cross-simdgroup reduce (mirrors mlx-swift sdpa_vector).
+            if (simd_lid == 0) {
+                max_scores[simd_gid] = max_score;
+                sum_exp_scores[simd_gid] = sum_exp_score;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            max_score = max_scores[simd_lid];
+            const float new_max = simd_max(max_score);
+            const float factor = exp(max_score - new_max);
+            sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+            // Aggregate per-output-dim partials across simdgroups.
+            const uint out_base = (b * NQH + qh) * HEAD_DIM
+                                   + simd_gid * v_per_thread;
+            for (int i = 0; i < v_per_thread; i++) {
+                outputs[simd_lid * BD + simd_gid] = o_local[i];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float reduced = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+                if (simd_lid == 0) {
+                    out[out_base + i] = sum_exp_score == 0.0f
+                        ? reduced
+                        : (reduced / sum_exp_score);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """
+        let k = MLXFast.metalKernel(
+            name: "ra_group_sdpa_decode",
+            inputNames: ["q", "k", "v", "gather", "params"],
+            outputNames: ["out"],
+            source: source,
+            header: header,
+            ensureRowContiguous: true
+        )
+        groupSDPAKernel = k
+        return k
+    }
 
     func getSparseSDPA() -> MLXFast.MLXFastKernel {
         lock.lock()
@@ -296,6 +461,82 @@ public func retrievalAttentionFusedSparseSDPA(
         outputDTypes: [.float32]
     )
     // Cast back to the original Q dtype for downstream compat.
+    return outputs[0].asType(queries.dtype)
+}
+
+/// F-71 — NSA-style group-centric fused sparse SDPA. One threadgroup
+/// per (B, KV head); all `groupSize` Q heads of each KV group share
+/// the per-head sorted gather and reuse K/V reads across the group.
+///
+/// Wins over F-59 mask path:
+///   1. K/V reads scale with K_padded (per-head gather size), not T.
+///   2. Each K/V byte is read once per KV group instead of `groupSize`
+///      times.
+///   3. No fp32 pre-cast — kernel reads native Q/K/V dtype and casts
+///      on load. (F-69 pre-cast was the dominant overhead — 12+ GB
+///      extra allocations per decode step on 14B-1M @ 32K.)
+///
+/// - Parameters:
+///   - queries: `[B, nQH, 1, D]` post-RoPE decode queries.
+///   - keys: `[B, nKVH, T, D]` full cached K.
+///   - values: `[B, nKVH, T, D]` full cached V.
+///   - perKVHeadGather: `[B, nKVH, K_padded]` int32 sorted per-KV-head
+///     positions (with possible adjacent duplicates).
+///   - scale: SDPA scale factor (typically `1/√D`).
+/// - Returns: `[B, nQH, 1, D]` attention output, dtype = `queries.dtype`.
+public func retrievalAttentionGroupSparseSDPA(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    perKVHeadGather: MLXArray,
+    scale: Float
+) -> MLXArray {
+    precondition(queries.shape.count == 4, "queries must be [B, nQH, 1, D]")
+    precondition(keys.shape.count == 4, "keys must be [B, nKVH, T, D]")
+    precondition(values.shape.count == 4, "values must be [B, nKVH, T, D]")
+    precondition(perKVHeadGather.shape.count == 3,
+        "gather must be [B, nKVH, K_padded] (got \(perKVHeadGather.shape))")
+    let B = queries.dim(0)
+    let nQH = queries.dim(1)
+    precondition(queries.dim(2) == 1, "decode-step L=1 only")
+    let D = queries.dim(3)
+    let nKVH = keys.dim(1)
+    let T = keys.dim(2)
+    precondition(perKVHeadGather.dim(0) == B && perKVHeadGather.dim(1) == nKVH,
+        "gather batch/heads mismatch")
+    let kPadded = perKVHeadGather.dim(2)
+    precondition(keys.dim(3) == D, "K head_dim must match Q")
+    precondition(values.dim(3) == D, "V head_dim must equal K (Dv==D)")
+    precondition(nQH % nKVH == 0, "Q heads must be a multiple of KV heads")
+    let groupSize = nQH / nKVH
+    precondition([32, 64, 96, 128, 256].contains(D),
+        "head_dim \(D) outside the supported template list")
+
+    let params = MLXArray([
+        scale,
+        Float(nQH),
+        Float(nKVH),
+        Float(T),
+        Float(kPadded),
+    ])
+    let gatherFlat = perKVHeadGather.reshaped(B * nKVH * kPadded)
+
+    let kernel = _RAKernelCache.shared.getGroupSDPA()
+    // F-71b layout: one threadgroup per (B, Q head). 1024 threads/tg
+    // (32 simdgroups × 32 lanes), matching mlx-swift sdpa_vector.
+    let TGSize = 1024
+    let totalThreads = B * nQH * TGSize
+    let outputs = kernel(
+        [queries, keys, values, gatherFlat, params],
+        template: [
+            ("HEAD_DIM", D),
+            ("GROUP_SIZE", groupSize),
+        ],
+        grid: (totalThreads, 1, 1),
+        threadGroup: (TGSize, 1, 1),
+        outputShapes: [[B, nQH, 1, D]],
+        outputDTypes: [.float32]
+    )
     return outputs[0].asType(queries.dtype)
 }
 

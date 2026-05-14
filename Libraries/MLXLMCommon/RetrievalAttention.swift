@@ -177,6 +177,16 @@ public struct RetrievalAttentionConfig: Sendable {
     /// and a parallelized kernel.
     public var useFusedSparseSDPA: Bool = false
 
+    /// F-71 experimental: NSA-style group-centric fused sparse SDPA Metal
+    /// kernel. One threadgroup per (B, KV head); all `groupSize` Q heads
+    /// in the KV group share the same per-head gather and reuse K/V reads
+    /// across the group — `groupSize`x bandwidth reduction at the KV
+    /// memory layer plus K_padded/T compute reduction. Skips the fp32
+    /// pre-cast that crippled F-69 at long context (12+ GB extra alloc
+    /// per decode step on 14B-1M @ 32K). Off by default until benches
+    /// confirm a win over the F-59 mask path.
+    public var useGroupSparseSDPA: Bool = false
+
     /// F-70 experimental: per-KV-head separate gather + batched dense SDPA.
     /// Avoids the cross-KV-head union that saturates the gather toward T
     /// at long context. Each KV head gets its own sorted gather of

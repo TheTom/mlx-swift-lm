@@ -3381,6 +3381,299 @@ struct RetrievalAttentionTests {
         #expect(diff < 1e-3, "sparse SDPA kernel max_abs_diff \(diff)")
     }
 
+    // F-71 correctness: group-centric fused sparse SDPA kernel vs MLX
+    // gather + dense SDPA reference. Same shape contract as F-69 but
+    // with per-KV-head gather (one row per KV head).
+    @Test func groupSparseSDPAMatchesReference() throws {
+        let B = 1
+        let nQH = 8
+        let nKVH = 2
+        let groupSize = nQH / nKVH
+        let T = 64
+        let D = 128
+        let kPadded = 10
+        // Different gathers per KV head — the whole point of F-71.
+        let gather0: [Int32] = [0, 1, 5, 12, 19, 25, 33, 47, 53, 60]
+        let gather1: [Int32] = [2, 6, 8, 15, 22, 30, 38, 49, 55, 62]
+        let gather = MLXArray(gather0 + gather1).reshaped(B, nKVH, kPadded)
+        let scale: Float = 1.0 / sqrtf(Float(D))
+
+        MLXRandom.seed(0x710B)
+        let q = MLXRandom.normal([B, nQH, 1, D]).asType(.float32)
+        let k = MLXRandom.normal([B, nKVH, T, D]).asType(.float32)
+        let v = MLXRandom.normal([B, nKVH, T, D]).asType(.float32)
+
+        // Reference: per-KV-head gather + dense SDPA on each group.
+        // We emulate F-71's group-centric semantics: each KV group
+        // attends only to its own gather. Build per-q-head reference
+        // by gathering the K/V rows of that group's KV head and running
+        // dense SDPA on the (1, groupSize, 1, D) × (1, 1, K_padded, D).
+        var refSlices: [MLXArray] = []
+        for h in 0..<nKVH {
+            let idx = MLXArray(h == 0 ? gather0 : gather1)
+            let kGather = k[0..., h, 0..., 0...].take(idx, axis: 1)
+                .expandedDimensions(axis: 1)
+            let vGather = v[0..., h, 0..., 0...].take(idx, axis: 1)
+                .expandedDimensions(axis: 1)
+            // Q for this group: [B, groupSize, 1, D]
+            let qStart = h * groupSize
+            let qSub = q[0..., qStart ..< (qStart + groupSize), 0..., 0...]
+            let out = MLXFast.scaledDotProductAttention(
+                queries: qSub, keys: kGather, values: vGather,
+                scale: scale, mask: .none
+            )
+            refSlices.append(out)
+        }
+        let refOut = concatenated(refSlices, axis: 1)  // [B, nQH, 1, D]
+
+        // Kernel
+        let fusedOut = retrievalAttentionGroupSparseSDPA(
+            queries: q, keys: k, values: v,
+            perKVHeadGather: gather, scale: scale
+        )
+
+        let r = refOut.reshaped(refOut.size).asType(.float32)
+        let f = fusedOut.reshaped(fusedOut.size).asType(.float32)
+        let diff = (r - f).abs().max().asArray(Float.self)[0]
+        let dot = (r * f).sum().asArray(Float.self)[0]
+        let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+        let fn = sqrt((f * f).sum()).asArray(Float.self)[0]
+        let cosine = dot / (rn * fn + 1e-12)
+        print("[F-71-group-sdpa] max_abs_diff=\(diff) cosine=\(cosine)")
+        #expect(cosine >= 0.9999, "F-71 kernel cosine \(cosine)")
+        #expect(diff < 1e-3, "F-71 kernel max_abs_diff \(diff)")
+    }
+
+    // F-72b crossover bench: dense vs mask vs perKV vs group across
+    // 16K → 49K. Tests the hypothesis that RA paths win at longer
+    // contexts even on this hardware.
+    @Test func crossoverSweep_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runOne(prefillLen: Int, mode: String) -> Double {
+            let caches: [KVCache]
+            if mode == "dense" {
+                caches = (0..<cfg.hiddenLayers).map { _ in StandardKVCache() }
+            } else {
+                var raConf = RetrievalAttentionConfig()
+                switch mode {
+                case "mask":
+                    raConf.useMaskedDense = true
+                    raConf.usePerKVHeadGather = false
+                    raConf.useGroupSparseSDPA = false
+                case "perKV":
+                    raConf.useMaskedDense = false
+                    raConf.usePerKVHeadGather = true
+                    raConf.useGroupSparseSDPA = false
+                case "group":
+                    raConf.useMaskedDense = false
+                    raConf.usePerKVHeadGather = false
+                    raConf.useGroupSparseSDPA = true
+                default: fatalError("bad mode")
+                }
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            }
+            MLXRandom.seed(0x72B0)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        for prefill in [16384, 32767, 49151, 65535] {
+            let denseMs = runOne(prefillLen: prefill, mode: "dense")
+            let maskMs = runOne(prefillLen: prefill, mode: "mask")
+            let perMs = runOne(prefillLen: prefill, mode: "perKV")
+            let groupMs = runOne(prefillLen: prefill, mode: "group")
+            print(
+                "[F-72b-crossover] prefill=\(prefill) "
+                    + "dense=\(String(format: "%.1f", denseMs))ms "
+                    + "mask=\(String(format: "%.1f", maskMs))ms "
+                    + "perKV=\(String(format: "%.1f", perMs))ms "
+                    + "group=\(String(format: "%.1f", groupMs))ms"
+            )
+        }
+    }
+
+    // F-71c diagnostic: dense (no RA) vs mask vs group at 16K/32K. Tells
+    // us whether attention is the bottleneck at all on 14B-1M decode.
+    @Test func denseBaselineLatency_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runDense(prefillLen: Int) -> Double {
+            let dense: [KVCache] = (0..<cfg.hiddenLayers).map { _ in
+                StandardKVCache()
+            }
+            MLXRandom.seed(0x71D0)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: dense)
+            eval(dense.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: dense)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: dense)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        for prefill in [16384, 32767] {
+            let denseMs = runDense(prefillLen: prefill)
+            print(
+                "[F-71c-dense] prefill=\(prefill) "
+                    + "dense=\(String(format: "%.2f", denseMs))ms/step"
+            )
+        }
+    }
+
+    // F-71 latency: NSA group-centric fused kernel vs F-59 mask path on
+    // Qwen2.5-14B-1M at 16K and 32K-1. Expectation: K/V bandwidth drops
+    // groupSize=5x (shared across the group) PLUS gather reduces from
+    // T to K_padded ≈ T/2.5. Target: 30-50% faster than mask path.
+    @Test func groupSparseSDPALatency_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runRA(prefillLen: Int, mode: String) -> Double {
+            var raConf = RetrievalAttentionConfig()
+            switch mode {
+            case "mask":
+                raConf.useMaskedDense = true
+                raConf.useGroupSparseSDPA = false
+            case "group":
+                raConf.useMaskedDense = false
+                raConf.useGroupSparseSDPA = true
+            default: fatalError("bad mode")
+            }
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raConf, ropeBase: cfg.ropeTheta)
+            }
+            MLXRandom.seed(0x7170)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: ra)
+            eval(ra.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: ra)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: ra)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        for prefill in [16384, 32767] {
+            let maskMs = runRA(prefillLen: prefill, mode: "mask")
+            let groupMs = runRA(prefillLen: prefill, mode: "group")
+            print(
+                "[F-71-group-latency] prefill=\(prefill) "
+                    + "mask=\(String(format: "%.2f", maskMs))ms/step "
+                    + "group=\(String(format: "%.2f", groupMs))ms/step "
+                    + "ratio=\(String(format: "%.2fx", groupMs / maskMs))"
+            )
+        }
+    }
+
     // F-70 latency: per-KV-head batched SDPA vs F-59 mask path on
     // Qwen2.5-14B-1M at 16K and 32K-1. Expected: F-70 amortizes the
     // cross-head union saturation by giving each head its own gather

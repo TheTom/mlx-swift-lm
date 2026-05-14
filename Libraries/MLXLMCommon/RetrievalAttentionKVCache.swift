@@ -147,9 +147,20 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
 
         ensureIndex(nKVHeads: nKVHeads, dHead: dHead)
 
-        // [1, nKVHeads, L, D] → [nKVHeads, L, D]
-        let keysF32 = keys.asType(.float32)[0, 0..., 0..., 0...]
-        batchedIndex!.update(newKeys: keysF32)
+        // F-72: skip the selector index update at decode steps (L==1).
+        // Decode tokens always live in the sliding window — they don't
+        // need to be in the block features for top-K selection. This
+        // removes ~24ms / step of MLX-op overhead at 14B-1M @ 32K (the
+        // entire RA-over-dense gap). Assumes decode count < sliding
+        // window (default 2048) so the oldest decode tokens never fall
+        // outside the always-attended trailing region. Prefill (L > 1)
+        // still updates the index as before.
+        let L = keys.dim(2)
+        if L > 1 {
+            // [1, nKVHeads, L, D] → [nKVHeads, L, D]
+            let keysF32 = keys.asType(.float32)[0, 0..., 0..., 0...]
+            batchedIndex!.update(newKeys: keysF32)
+        }
         return (cachedK, cachedV)
     }
 
@@ -240,6 +251,68 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         let clipped = clip(allPositions, min: Int32(0), max: Int32(T - 1))
         // Sort so kernel can adjacent-diff-skip duplicates.
         return sorted(clipped)
+    }
+
+    /// F-71 NSA-style group-centric fused sparse SDPA path. Builds the
+    /// per-KV-head sorted gather, then calls the fused Metal kernel that
+    /// reads each K/V byte once per KV group (shared across `groupSize`
+    /// Q heads).
+    ///
+    /// - Parameters:
+    ///   - queries: `[1, nQH, 1, D]` post-RoPE decode query
+    ///   - keys: `[1, nKVH, T, D]` full cached keys
+    ///   - values: `[1, nKVH, T, D]` full cached values
+    ///   - qHeads: `[nQH, D]` flat post-RoPE query (for selector projection)
+    ///   - scale: SDPA scale factor (typically `1/√D`)
+    /// - Returns: SDPA output `[1, nQH, 1, D]`
+    public func groupSparseSDPA(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        qHeads: MLXArray,
+        scale: Float
+    ) -> MLXArray {
+        precondition(qHeads.shape.count == 2, "expected [nHeads, dHead]")
+        precondition(keys.shape.count == 4, "expected [B, nKVH, T, D]")
+        guard let index = batchedIndex else {
+            fatalError("indices not initialized; call update first")
+        }
+        let T = keys.dim(2)
+        let nKVH = keys.dim(1)
+        let nQH = queries.dim(1)
+        let groupSize = nQH / nKVH
+
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray(
+                (0..<nKVH).map { Int32($0 * groupSize) }
+            )
+            eval(cachedHeadIdx!)
+        }
+        let qStacked = qHeads.take(cachedHeadIdx!, axis: 0).asType(.float32)
+        let projQ = index.projectQueriesBatched(qStacked)
+
+        let (gather, _) = index.perKVHeadGatherGPU(
+            projectedQ: projQ, seqLen: T
+        )
+        // F-71b deliberately skips the sentinel-marking pre-pass — at 48
+        // layers the per-step `MLX.where` adds ~14ms (the entire gap we'd
+        // be trying to close). Dups in the sorted per-row gather appear
+        // only when sliding overlaps top-K-fine or top-K-coarse — usually
+        // 1–4% of K_padded and not in the high-weight positions. The
+        // resulting softmax double-count biases output by <0.001 cosine
+        // below the F-59 mask path. The kernel still honours the -1
+        // sentinel if a caller chooses to pre-dedupe.
+        let perHeadGather = gather.expandedDimensions(axis: 0)
+
+        return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+            retrievalAttentionGroupSparseSDPA(
+                queries: queries,
+                keys: keys,
+                values: values,
+                perKVHeadGather: perHeadGather,
+                scale: scale
+            )
+        }
     }
 
     /// F-70 per-KV-head gather + batched SDPA: each KV head gathers its

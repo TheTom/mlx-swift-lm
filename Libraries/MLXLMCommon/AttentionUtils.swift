@@ -159,6 +159,17 @@ public func attentionWithCacheUpdate(
             let qFlat = queries[0, 0..., 0, 0...]
             let D = cachedKeys.dim(3)
             let supportsFusedSparse = [32, 64, 96, 128, 256].contains(D)
+            if raCache.raConfig.useGroupSparseSDPA && supportsFusedSparse && sinks == nil {
+                // F-71 NSA-style group-centric fused kernel. K/V read once
+                // per KV group, shared across all groupSize Q heads.
+                return raCache.groupSparseSDPA(
+                    queries: queries,
+                    keys: cachedKeys,
+                    values: cachedValues,
+                    qHeads: qFlat,
+                    scale: scale
+                )
+            }
             if raCache.raConfig.usePerKVHeadGather && sinks == nil {
                 // F-70 per-KV-head batched SDPA. Skips cross-head union
                 // so each head's gather is bounded by preBudget (not T).
