@@ -199,6 +199,13 @@ public struct RetrievalAttentionConfig: Sendable {
     /// benches confirm a measurable win over the F-59 mask path.
     public var usePerKVHeadGather: Bool = false
 
+    /// F-74 fused selector-bundle path: collapse projectQ + scoreTopK_fine
+    /// + scoreTopK_coarse + buildMask into 2 Metal kernel calls per
+    /// sparse layer (vs F-73's 4 calls, vs F-59's ~10 MLX ops). Targets
+    /// the remaining ~13ms RA-over-dense gap after F-73 closed 9.8ms of
+    /// the original 22.8ms gap.
+    public var useFusedSelectorBundle: Bool = false
+
     /// F-73 build-mask path: replace the multi-op buildAttentionMaskGPU
     /// pipeline with a single fused Metal kernel that writes the
     /// `[1, 1, 1, T]` additive mask from the top-K block starts in one

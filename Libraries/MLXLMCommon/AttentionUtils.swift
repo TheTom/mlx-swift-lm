@@ -206,6 +206,21 @@ public func attentionWithCacheUpdate(
                     )
                 }
             }
+            if raCache.raConfig.useFusedSelectorBundle {
+                // F-74 — fused selector bundle (projectQ + scoreTopK_fine
+                // + scoreTopK_coarse) followed by F-73 mask build.
+                // 2 Metal kernels per layer instead of F-73's 5 MLX ops.
+                let T = cachedKeys.dim(2)
+                let raMask = raCache.buildAttentionMaskFusedBundleKernel(
+                    q: qFlat, dtype: cachedKeys.dtype, T: T
+                )
+                return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                    MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: cachedKeys, values: cachedValues,
+                        scale: scale, mask: .array(raMask), sinks: sinks
+                    )
+                }
+            }
             if raCache.raConfig.useFusedMaskBuild {
                 // F-73 — single Metal kernel writes the mask in one
                 // launch (vs F-59's ~6 MLX ops). Selector pipeline is

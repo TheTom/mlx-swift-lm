@@ -23,6 +23,165 @@ private final class _RAKernelCache: @unchecked Sendable {
     private var sparseSDPAKernel: MLXFast.MLXFastKernel?
     private var groupSDPAKernel: MLXFast.MLXFastKernel?
     private var buildMaskKernel: MLXFast.MLXFastKernel?
+    private var selectorBundleKernel: MLXFast.MLXFastKernel?
+
+    /// F-74 selector-bundle kernel: in one launch, per KV head, projects
+    /// Q against the JL matrix → projQ, scores all fine blocks +
+    /// picks top-K_fine, scores all coarse blocks + picks top-K_coarse.
+    /// Writes per-head top-K start positions to two outputs. Replaces
+    /// projectQueriesBatched + 2× computeTopKBlockStarts (3 MLX ops)
+    /// with one Metal kernel launch.
+    ///
+    /// Constraints (matched in the Swift wrapper):
+    ///   - nFineBlocks, nCoarseBlocks must each be a power of 2 ≤ 1024
+    ///     (same constraint as F-48 scoreTopKFused).
+    ///   - groupSize = nQH / nKVH.
+    func getSelectorBundle() -> MLXFast.MLXFastKernel {
+        lock.lock()
+        defer { lock.unlock() }
+        if let k = selectorBundleKernel { return k }
+        let header = """
+            inline void _ra74_swap(thread float& a_score, thread int& a_idx,
+                                   thread float& b_score, thread int& b_idx) {
+                float ts = a_score; int ti = a_idx;
+                a_score = b_score; a_idx = b_idx;
+                b_score = ts; b_idx = ti;
+            }
+            """
+        let source = """
+            // Template constants:
+            //   D_HEAD, CONTENT_DIM, GROUP_SIZE, NQH, NKVH,
+            //   N_FINE, K_FINE, FINE_BS,
+            //   N_COARSE, K_COARSE, COARSE_BS
+            //
+            // Inputs:
+            //   q:              [NQH * D_HEAD] float (post-RoPE strided in Swift
+            //                   to representative-per-group)
+            //   jl_w:           [D_HEAD * CONTENT_DIM] float JL projection (W)
+            //   fine_features:  [NKVH * N_FINE * CONTENT_DIM] float fine block features
+            //   coarse_features:[NKVH * N_COARSE * CONTENT_DIM] float coarse features
+            //
+            // Outputs:
+            //   fine_starts:    [NKVH * K_FINE] int32 fine top-K block starts
+            //   coarse_starts:  [NKVH * K_COARSE] int32 coarse top-K block starts
+            //
+            // Grid: NKVH threadgroups × tg_size threads.
+            // tg_size = max(N_FINE, N_COARSE) up to 1024. Both N_FINE
+            // and N_COARSE must be powers of 2 ≤ 1024.
+
+            const uint head = threadgroup_position_in_grid.x;
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint tg_size = threads_per_threadgroup.x;
+
+            // Phase 1: project Q for this head.
+            // projQ[c] = sum_d Q[head, d] * jl_w[d, c]   for c in 0..CONTENT_DIM
+            // Q lives at q[(head * GROUP_SIZE) * D_HEAD + d] (rep-per-group).
+            threadgroup float projQ_tg[CONTENT_DIM];
+            const uint q_base = head * GROUP_SIZE * D_HEAD;
+            if (tid < CONTENT_DIM) {
+                float acc = 0.0f;
+                for (uint d = 0; d < D_HEAD; d++) {
+                    acc += q[q_base + d] * jl_w[d * CONTENT_DIM + tid];
+                }
+                projQ_tg[tid] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 2a: score fine blocks.
+            threadgroup float fine_scores[N_FINE];
+            threadgroup int fine_idxs[N_FINE];
+            for (uint b = tid; b < N_FINE; b += tg_size) {
+                float s = 0.0f;
+                const uint feat_base = head * N_FINE * CONTENT_DIM + b * CONTENT_DIM;
+                for (uint c = 0; c < CONTENT_DIM; c++) {
+                    s += fine_features[feat_base + c] * projQ_tg[c];
+                }
+                fine_scores[b] = s;
+                fine_idxs[b] = (int)b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 2b: K iterations of parallel argmax + knock-out.
+            threadgroup float reduce_score[N_FINE];
+            threadgroup int reduce_idx[N_FINE];
+            for (uint kk = 0; kk < K_FINE; kk++) {
+                for (uint i = tid; i < N_FINE; i += tg_size) {
+                    reduce_score[i] = fine_scores[i];
+                    reduce_idx[i] = fine_idxs[i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                uint stride_half = N_FINE / 2;
+                while (stride_half > 0) {
+                    if (tid < stride_half) {
+                        if (reduce_score[tid + stride_half] > reduce_score[tid]) {
+                            reduce_score[tid] = reduce_score[tid + stride_half];
+                            reduce_idx[tid] = reduce_idx[tid + stride_half];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    stride_half = stride_half / 2;
+                }
+                if (tid == 0) {
+                    int best = reduce_idx[0];
+                    fine_starts[head * K_FINE + kk] = best * FINE_BS;
+                    fine_scores[best] = -INFINITY;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // Phase 3a: score coarse blocks (reuse projQ_tg).
+            threadgroup float coarse_scores[N_COARSE];
+            threadgroup int coarse_idxs[N_COARSE];
+            for (uint b = tid; b < N_COARSE; b += tg_size) {
+                float s = 0.0f;
+                const uint feat_base = head * N_COARSE * CONTENT_DIM + b * CONTENT_DIM;
+                for (uint c = 0; c < CONTENT_DIM; c++) {
+                    s += coarse_features[feat_base + c] * projQ_tg[c];
+                }
+                coarse_scores[b] = s;
+                coarse_idxs[b] = (int)b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Phase 3b: top-K_COARSE argmax + knock-out.
+            threadgroup float c_red_score[N_COARSE];
+            threadgroup int c_red_idx[N_COARSE];
+            for (uint kk = 0; kk < K_COARSE; kk++) {
+                for (uint i = tid; i < N_COARSE; i += tg_size) {
+                    c_red_score[i] = coarse_scores[i];
+                    c_red_idx[i] = coarse_idxs[i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                uint stride_half = N_COARSE / 2;
+                while (stride_half > 0) {
+                    if (tid < stride_half) {
+                        if (c_red_score[tid + stride_half] > c_red_score[tid]) {
+                            c_red_score[tid] = c_red_score[tid + stride_half];
+                            c_red_idx[tid] = c_red_idx[tid + stride_half];
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    stride_half = stride_half / 2;
+                }
+                if (tid == 0) {
+                    int best = c_red_idx[0];
+                    coarse_starts[head * K_COARSE + kk] = best * COARSE_BS;
+                    coarse_scores[best] = -INFINITY;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """
+        let k = MLXFast.metalKernel(
+            name: "ra_selector_bundle",
+            inputNames: ["q", "jl_w", "fine_features", "coarse_features"],
+            outputNames: ["fine_starts", "coarse_starts"],
+            source: source,
+            header: header,
+            ensureRowContiguous: true
+        )
+        selectorBundleKernel = k
+        return k
+    }
 
     /// F-71b NSA-style fused sparse SDPA matching mlx-swift's
     /// `sdpa_vector` layout: BN=32 simdgroups × BD=32 lanes per
@@ -687,6 +846,80 @@ public func retrievalAttentionBuildMaskFused(
         outputDTypes: [.float32]
     )
     return outputs[0].asType(outputDtype)
+}
+
+/// F-74 — fused projectQ + scoreTopK_fine + scoreTopK_coarse wrapper.
+/// One Metal kernel call replaces 3 MLX op chains
+/// (`projectQueriesBatched` + 2× `computeTopKBlockStarts`).
+///
+/// - Parameters:
+///   - q: `[nQH, dHead]` float32 (post-RoPE; from `q.take(cachedHeadIdx)`
+///     etc. — the kernel reads strided rep-per-group)
+///   - jlW: `[dHead, contentDim]` float32 JL projection
+///   - fineFeatures: `[nKVH, nFineBlocks, contentDim]` float32
+///   - coarseFeatures: `[nKVH, nCoarseBlocks, contentDim]` float32
+///   - groupSize: nQH / nKVH
+///   - kFine: top-K count for fine
+///   - kCoarse: top-K count for coarse
+///   - fineBlockSize: token-block stride for fine
+///   - coarseBlockSize: token-block stride for coarse
+/// - Returns: `(fineStarts [nKVH, kFine], coarseStarts [nKVH, kCoarse])`
+public func retrievalAttentionSelectorBundleFused(
+    q: MLXArray,
+    jlW: MLXArray,
+    fineFeatures: MLXArray,
+    coarseFeatures: MLXArray,
+    groupSize: Int,
+    kFine: Int,
+    kCoarse: Int,
+    fineBlockSize: Int,
+    coarseBlockSize: Int
+) -> (fineStarts: MLXArray, coarseStarts: MLXArray) {
+    precondition(q.shape.count == 2, "q must be [nQH, dHead]")
+    precondition(jlW.shape.count == 2, "jl_w must be [dHead, contentDim]")
+    precondition(fineFeatures.shape.count == 3, "fineFeatures must be [nKVH, nBlocks, D]")
+    precondition(coarseFeatures.shape.count == 3, "coarseFeatures must be [nKVH, nBlocks, D]")
+    let dHead = jlW.dim(0)
+    let contentDim = jlW.dim(1)
+    let nKVH = fineFeatures.dim(0)
+    let nFine = fineFeatures.dim(1)
+    let nCoarse = coarseFeatures.dim(1)
+    precondition(coarseFeatures.dim(0) == nKVH, "head count mismatch")
+    precondition(fineFeatures.dim(2) == contentDim, "content dim mismatch")
+    precondition(coarseFeatures.dim(2) == contentDim, "content dim mismatch")
+    precondition(q.dim(0) == nKVH * groupSize, "q rows must be nKVH * groupSize")
+    precondition(q.dim(1) == dHead, "q D mismatch")
+    // Both block counts must be powers of 2 ≤ 1024 (tree-reduce constraint).
+    precondition(nFine > 0 && (nFine & (nFine - 1)) == 0 && nFine <= 1024,
+        "nFine \(nFine) must be a power of 2 ≤ 1024")
+    precondition(nCoarse > 0 && (nCoarse & (nCoarse - 1)) == 0 && nCoarse <= 1024,
+        "nCoarse \(nCoarse) must be a power of 2 ≤ 1024")
+
+    let nQH = nKVH * groupSize
+    let tgSize = min(1024, max(nFine, nCoarse))
+
+    let kernel = _RAKernelCache.shared.getSelectorBundle()
+    let outputs = kernel(
+        [q, jlW, fineFeatures, coarseFeatures],
+        template: [
+            ("D_HEAD", dHead),
+            ("CONTENT_DIM", contentDim),
+            ("GROUP_SIZE", groupSize),
+            ("NQH", nQH),
+            ("NKVH", nKVH),
+            ("N_FINE", nFine),
+            ("K_FINE", kFine),
+            ("FINE_BS", fineBlockSize),
+            ("N_COARSE", nCoarse),
+            ("K_COARSE", kCoarse),
+            ("COARSE_BS", coarseBlockSize),
+        ],
+        grid: (nKVH * tgSize, 1, 1),
+        threadGroup: (tgSize, 1, 1),
+        outputShapes: [[nKVH, kFine], [nKVH, kCoarse]],
+        outputDTypes: [.int32, .int32]
+    )
+    return (fineStarts: outputs[0], coarseStarts: outputs[1])
 }
 
 /// Run the fused score+top-K kernel.

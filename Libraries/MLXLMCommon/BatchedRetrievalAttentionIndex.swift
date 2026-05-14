@@ -27,6 +27,12 @@ public final class BatchedRetrievalAttentionIndex {
     public let layerIdx: Int
 
     private var jlMatrix: MLXArray?
+
+    /// Read-only accessor for the cached transposed JL projection matrix
+    /// (shape `[dHead, contentDim]`). Used by F-74 fused selector-bundle
+    /// kernel to do projectQ inside the kernel as `Q @ W^T`. Nil if
+    /// `update(...)` hasn't run yet.
+    public var jlW: MLXArray? { jlMatrixT }
     /// Pre-transposed JL matrix `[dHead, contentDim]` for matmul. Cached
     /// once so we don't transpose on every update.
     private var jlMatrixT: MLXArray?

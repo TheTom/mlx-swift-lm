@@ -418,6 +418,66 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         return out
     }
 
+    /// F-74 fused mask build via selector-bundle kernel. One kernel call
+    /// does projectQ + scoreTopK_fine + scoreTopK_coarse (replacing 3
+    /// MLX ops), then the F-73 build-mask kernel produces the
+    /// [1, 1, 1, T] mask. Final per-sparse-layer op count: 2 (instead
+    /// of 5 in F-73-bundle and ~10 in F-59).
+    public func buildAttentionMaskFusedBundleKernel(
+        q: MLXArray, dtype: DType, T: Int
+    ) -> MLXArray {
+        precondition(q.shape.count == 2, "expected [nHeads, dHead]")
+        guard let index = batchedIndex else {
+            fatalError("indices not initialized; call update first")
+        }
+        guard let jlW = index.jlW else {
+            fatalError("JL projection not initialized — call update first")
+        }
+        guard let fineFeatures = index.fineBlockFeatures,
+              let coarseFeatures = index.coarseBlockFeatures
+        else {
+            // No coarse — fall back to the non-bundle path.
+            return buildAttentionMaskFusedKernel(q: q, dtype: dtype, T: T)
+        }
+        let nKVH = index.nKVHeads
+        let groupSize = q.dim(0) / nKVH
+        let nFine = fineFeatures.dim(1)
+        let nCoarse = coarseFeatures.dim(1)
+        // Both must be powers of 2 ≤ 1024 for the fused bundle kernel
+        // (tree-reduce constraint). Fall back to non-bundle F-73 path
+        // otherwise.
+        let isPow2 = { (n: Int) in n > 0 && (n & (n - 1)) == 0 }
+        if !(isPow2(nFine) && nFine <= 1024 && isPow2(nCoarse) && nCoarse <= 1024) {
+            return buildAttentionMaskFusedKernel(q: q, dtype: dtype, T: T)
+        }
+        let kFine = min(raConfig.effectiveFineTopK(seqLen: T), nFine)
+        let kCoarse = raConfig.coarseRescueEnabled
+            ? min(raConfig.coarseTopK, nCoarse) : 0
+        guard kCoarse > 0 else {
+            return buildAttentionMaskFusedKernel(q: q, dtype: dtype, T: T)
+        }
+        // q is [nQH, dHead] (rep-per-group stride happens INSIDE the
+        // kernel via the GROUP_SIZE template parameter).
+        let qF32 = q.asType(.float32)
+        let (fineStarts, coarseStarts) = retrievalAttentionSelectorBundleFused(
+            q: qF32, jlW: jlW,
+            fineFeatures: fineFeatures, coarseFeatures: coarseFeatures,
+            groupSize: groupSize,
+            kFine: kFine, kCoarse: kCoarse,
+            fineBlockSize: raConfig.fineBlockSize,
+            coarseBlockSize: raConfig.coarseBlockSize
+        )
+        return retrievalAttentionBuildMaskFused(
+            fineStarts: fineStarts, coarseStarts: coarseStarts,
+            T: T,
+            staticInit: raConfig.staticInit,
+            slidingWindow: raConfig.slidingWindow,
+            fineBS: raConfig.fineBlockSize,
+            coarseBS: raConfig.coarseBlockSize,
+            outputDtype: dtype
+        )
+    }
+
     /// F-73 fused build-mask path: compute top-K block starts then call
     /// the single Metal kernel that writes the `[1, 1, 1, T]` additive
     /// mask in one launch. Replaces the ~6-op `buildAttentionMaskGPU`
