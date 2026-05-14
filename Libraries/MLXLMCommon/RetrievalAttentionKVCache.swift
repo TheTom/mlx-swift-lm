@@ -176,10 +176,12 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         let qStacked = q.take(headIdx, axis: 0).asType(.float32)
         let projQ = index.projectQueriesBatched(qStacked)
 
-        let fineStartsPerHead = index.topKFineBlockStartsAllHeads(projectedQ: projQ)
-        let coarseStartsPerHead = raConfig.coarseRescueEnabled
-            ? index.topKCoarseBlockStartsAllHeads(projectedQ: projQ)
-            : Array(repeating: [], count: index.nKVHeads)
+        // Fine + coarse topK in a single GPU op chain with ONE asArray.
+        // Halves the per-sparse-layer sync count vs the prior pattern of
+        // calling topKFineBlockStartsAllHeads + topKCoarseBlockStartsAllHeads
+        // (which did two separate asArrays).
+        let (fineStartsPerHead, coarseStartsPerHead) =
+            index.topKBlockStartsAllHeadsCombined(projectedQ: projQ)
 
         var allFine = Set<Int>()
         var allCoarse = Set<Int>()

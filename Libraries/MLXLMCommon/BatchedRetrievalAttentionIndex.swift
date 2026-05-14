@@ -288,4 +288,84 @@ public final class BatchedRetrievalAttentionIndex {
             scores: scores, k: config.coarseTopK, blockSize: config.coarseBlockSize
         )
     }
+
+    /// Combined fine + coarse topK in ONE asArray sync. Both topK MLX op
+    /// chains stay queued, get concat'd into a single [nKVHeads, kFine +
+    /// kCoarse] tensor, and one CPU↔GPU sync pulls all the indices. Halves
+    /// the per-layer sync count vs separate fine/coarse calls.
+    ///
+    /// Returns fine and coarse block starts (in token coordinates) per head.
+    /// When coarseRescueEnabled is false or no coarse features exist, the
+    /// coarse arrays come back empty.
+    public func topKBlockStartsAllHeadsCombined(
+        projectedQ: MLXArray
+    ) -> (fine: [[Int]], coarse: [[Int]]) {
+        // Fine path.
+        let fineScores = scoreFineBlocksBatched(projectedQ: projectedQ)
+        let fineN = fineScores.dim(1)
+        let kFine = min(config.effectiveFineTopK(seqLen: seqLen), fineN)
+        guard kFine > 0 else {
+            return (Array(repeating: [], count: nKVHeads), Array(repeating: [], count: nKVHeads))
+        }
+        let fineStarts = topKBlockStartsMLX(
+            scores: fineScores, k: kFine, blockSize: config.fineBlockSize
+        )
+
+        // Coarse path (optional).
+        let hasCoarse = config.coarseRescueEnabled && coarseBlockFeatures != nil
+        let combined: MLXArray
+        var kCoarse = 0
+        if hasCoarse {
+            let coarseScores = scoreBlocksBatched(
+                features: coarseBlockFeatures!, projectedQ: projectedQ
+            )
+            kCoarse = min(config.coarseTopK, coarseScores.dim(1))
+            if kCoarse > 0 {
+                let coarseStarts = topKBlockStartsMLX(
+                    scores: coarseScores, k: kCoarse, blockSize: config.coarseBlockSize
+                )
+                combined = concatenated([fineStarts, coarseStarts], axis: -1)
+            } else {
+                combined = fineStarts
+            }
+        } else {
+            combined = fineStarts
+        }
+
+        // ONE sync.
+        let cpu = combined.asArray(Int32.self)
+        let stride = kFine + kCoarse
+        var fine: [[Int]] = []
+        var coarse: [[Int]] = []
+        fine.reserveCapacity(nKVHeads)
+        coarse.reserveCapacity(nKVHeads)
+        for h in 0..<nKVHeads {
+            let base = h * stride
+            fine.append((0..<kFine).map { Int(cpu[base + $0]) })
+            if kCoarse > 0 {
+                coarse.append((0..<kCoarse).map { Int(cpu[base + kFine + $0]) })
+            } else {
+                coarse.append([])
+            }
+        }
+        return (fine: fine, coarse: coarse)
+    }
+
+    /// Build the `[nKVHeads, k]` topK block-starts MLXArray (in token
+    /// coords). Pure GPU op chain — no sync.
+    private func topKBlockStartsMLX(
+        scores: MLXArray, k: Int, blockSize: Int
+    ) -> MLXArray {
+        let nBlocks = scores.dim(1)
+        let pivotKth = nBlocks - k
+        let partitioned: MLXArray
+        if pivotKth <= 0 {
+            let rangeArr = MLXArray(0..<Int32(nBlocks)).reshaped(1, nBlocks)
+            partitioned = broadcast(rangeArr, to: [nKVHeads, nBlocks])
+        } else {
+            partitioned = argPartition(scores, kth: pivotKth, axis: -1)
+        }
+        let topKIdx = partitioned[0..., (nBlocks - k)...]
+        return topKIdx * Int32(blockSize)
+    }
 }
