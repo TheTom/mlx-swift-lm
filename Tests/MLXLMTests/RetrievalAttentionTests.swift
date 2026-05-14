@@ -2664,6 +2664,83 @@ struct RetrievalAttentionTests {
         )
     }
 
+    // F-47: latency sweep across context lengths on 14B-1M. F-43 measured
+    // 24K (35x slower). Question: is there a crossover where RA's bounded
+    // gather wins vs dense's O(N) attention? Sweep 4K, 8K, 16K, 24K, 32K-1.
+    @Test func trainedQwen25_14B_1M_LatencySweep() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let decodeSteps = 16  // smaller than F-43 to keep sweep tractable
+        for prefillLen in [4096, 8192, 16384, 24576, 32767] {
+            MLXRandom.seed(UInt64(0x14CC + prefillLen))
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+
+            // Dense.
+            let dn = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: dn)
+            eval(dn.flatMap { $0.state })
+            var dnNext = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            let dnStart = Date()
+            for _ in 0..<decodeSteps {
+                let logits = model(dnNext, cache: dn)
+                dnNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(dnNext)
+            }
+            let dnTime = Date().timeIntervalSince(dnStart)
+
+            // RA.
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    ropeBase: cfg.ropeTheta)
+            }
+            _ = model(prefillTokens, cache: ra)
+            eval(ra.flatMap { $0.state })
+            var raNext = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            let raStart = Date()
+            for _ in 0..<decodeSteps {
+                let logits = model(raNext, cache: ra)
+                raNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(raNext)
+            }
+            let raTime = Date().timeIntervalSince(raStart)
+
+            let dnMs = dnTime / Double(decodeSteps) * 1000
+            let raMs = raTime / Double(decodeSteps) * 1000
+            print(
+                "[F-47-sweep] prefill=\(prefillLen) "
+                    + "dense=\(String(format: "%.1f", dnMs))ms "
+                    + "ra=\(String(format: "%.1f", raMs))ms "
+                    + "ratio=\(String(format: "%.2fx", raMs / dnMs))"
+            )
+        }
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
