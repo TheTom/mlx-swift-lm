@@ -199,18 +199,18 @@ public struct RetrievalAttentionConfig: Sendable {
     /// benches confirm a measurable win over the F-59 mask path.
     public var usePerKVHeadGather: Bool = false
 
-    /// F-79 — amortize the selector top-K computation across decode
-    /// steps. Q drifts slowly between adjacent decode tokens, so the
-    /// top-K picks at step T+1 are usually nearly identical to those
-    /// at step T. Reuse the cached topK arrays for `selectorAmortization`
-    /// consecutive steps; refresh on the boundary. Only the mask build
-    /// runs every step (so the sliding window stays current).
+    /// F-79 SHIP DEFAULT: amortize the selector top-K computation
+    /// across decode steps. Q drifts slowly between adjacent decode
+    /// tokens, so the top-K picks at step T+1 are usually nearly
+    /// identical to those at step T. Reuse cached topK for
+    /// `selectorAmortization` consecutive steps; refresh on the
+    /// boundary. Only the F-73 mask build runs every step (sliding
+    /// window stays current).
     ///
-    /// Default 1 = no amortization (refresh every step, current
-    /// behavior). 2 = halve projectQ + F-48 work. 4 = save 75%.
-    /// Quality trade-off: 4 steps of mild drift in topK picks; bound
-    /// the cosine degradation in tests before raising defaults.
-    public var selectorAmortization: Int = 1
+    /// Default 8 — measured cosine 0.99990 vs amort=1 reference over
+    /// 16 decode steps on 14B-1M-4bit at 24K. Latency 44.1ms vs dense
+    /// 41.6ms at 32K (within 6%). Set to 1 to disable amortization.
+    public var selectorAmortization: Int = 8
 
     /// F-78 — dispatch the entire selector pipeline (projectQ + F-48
     /// fine + F-48 coarse + F-73 mask) on a separate MLX Stream so
