@@ -4162,6 +4162,194 @@ struct RetrievalAttentionTests {
         #expect(minCos >= 0.99999, "F-80 cliff regressed: min_cosine=\(minCos)")
     }
 
+    // Phase D: RA + TurboQuant+ composition. RA's inner cache is a
+    // TurboQuantizedKVCache in rawKeyMode (K=FP16, V=4bit). Validates:
+    //   - prefill + 8 decode steps stays usable
+    //   - cosine vs dense baseline ≥ 0.99 (PRD target)
+    //   - cosine vs RA-alone (F-79) measures TQ impact in isolation
+    @Test func raTurboCompose_32K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32_767
+        let nSteps = 8
+        MLXRandom.seed(0xD400)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+
+        // Dense baseline (StandardKVCache).
+        func runDense() -> [MLXArray] {
+            let cache = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: cache)
+            eval(cache.flatMap { $0.state })
+            return (0..<nSteps).map { s in
+                let l = model(forceTokens[s], cache: cache)
+                eval(l)
+                return l
+            }
+        }
+
+        // RA F-79 amort=16 with StandardKVCache inner.
+        func runRA() -> [MLXArray] {
+            let raConfig = RetrievalAttentionConfig()  // F-79 amort=16 default
+            let caches: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raConfig, ropeBase: cfg.ropeTheta
+                )
+            }
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            return (0..<nSteps).map { s in
+                let l = model(forceTokens[s], cache: caches)
+                eval(l)
+                return l
+            }
+        }
+
+        // RA + TurboQuant+ rawKeyMode V=4bit.
+        func runRATQ() -> [MLXArray] {
+            let raConfig = RetrievalAttentionConfig()
+            let caches: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raConfig, ropeBase: cfg.ropeTheta,
+                    valueBits: 4
+                )
+            }
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            return (0..<nSteps).map { s in
+                let l = model(forceTokens[s], cache: caches)
+                eval(l)
+                return l
+            }
+        }
+
+        func cosine(_ a: MLXArray, _ b: MLXArray) -> Float {
+            let aF = a.reshaped(a.size).asType(.float32)
+            let bF = b.reshaped(b.size).asType(.float32)
+            let dot = (aF * bF).sum().asArray(Float.self)[0]
+            let an = sqrt((aF * aF).sum()).asArray(Float.self)[0]
+            let bn = sqrt((bF * bF).sum()).asArray(Float.self)[0]
+            return dot / (an * bn + 1e-12)
+        }
+
+        let dense = runDense()
+        let ra = runRA()
+        let raTQ = runRATQ()
+        var sumRA: Double = 0
+        var sumRATQ: Double = 0
+        var sumRAvsRATQ: Double = 0
+        for s in 0..<nSteps {
+            sumRA += Double(cosine(dense[s], ra[s]))
+            sumRATQ += Double(cosine(dense[s], raTQ[s]))
+            sumRAvsRATQ += Double(cosine(ra[s], raTQ[s]))
+        }
+        let meanRA = sumRA / Double(nSteps)
+        let meanRATQ = sumRATQ / Double(nSteps)
+        let meanRAvsRATQ = sumRAvsRATQ / Double(nSteps)
+        print("[F-81-compose] T=32K dense-vs-RA mean_cosine=\(String(format: "%.5f", meanRA))")
+        print("[F-81-compose] T=32K dense-vs-RA+TQ4 mean_cosine=\(String(format: "%.5f", meanRATQ))")
+        print("[F-81-compose] T=32K RA-vs-RA+TQ4 mean_cosine=\(String(format: "%.5f", meanRAvsRATQ))")
+        // PRD target.
+        #expect(meanRATQ >= 0.99, "RA+TQ4 quality regressed: \(meanRATQ)")
+    }
+
+    // F-80 long-context regression. Cliff fix should hold at 65K, 96K, 128K.
+    // Run dense vs dense at each context, assert bit-exact determinism.
+    @Test func denseNonDeterminism_longContext_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let nSteps = 8
+        let contexts = [65_535, 98_303, 131_071]
+        for prefillLen in contexts {
+            MLXRandom.seed(0x4910)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+                MLXRandom.randInt(
+                    low: MLXArray(Int32(0)),
+                    high: MLXArray(Int32(cfg.vocabularySize)),
+                    [1, 1]
+                ).asType(.int32)
+            }
+            eval(forceTokens)
+
+            func runDense() -> [MLXArray] {
+                let dn = model.newCache(parameters: nil)
+                _ = model(prefillTokens, cache: dn)
+                eval(dn.flatMap { $0.state })
+                var out: [MLXArray] = []
+                for s in 0..<nSteps {
+                    let logits = model(forceTokens[s], cache: dn)
+                    eval(logits)
+                    out.append(logits)
+                }
+                return out
+            }
+            let a = runDense()
+            let b = runDense()
+            var sumCos: Double = 0
+            var minCos: Float = 1.0
+            for s in 0..<nSteps {
+                let aF = a[s].reshaped(a[s].size).asType(.float32)
+                let bF = b[s].reshaped(b[s].size).asType(.float32)
+                let dot = (aF * bF).sum().asArray(Float.self)[0]
+                let an = sqrt((aF * aF).sum()).asArray(Float.self)[0]
+                let bn = sqrt((bF * bF).sum()).asArray(Float.self)[0]
+                let cos = dot / (an * bn + 1e-12)
+                sumCos += Double(cos)
+                if cos < minCos { minCos = cos }
+            }
+            let meanCos = sumCos / Double(nSteps)
+            print("[F-80-longctx] T=\(prefillLen) dense-vs-dense "
+                + "mean_cosine=\(String(format: "%.5f", meanCos)) "
+                + "min_cosine=\(String(format: "%.5f", minCos))")
+            #expect(meanCos >= 0.99999, "F-80 cliff at T=\(prefillLen): mean=\(meanCos)")
+            #expect(minCos >= 0.99999, "F-80 cliff at T=\(prefillLen): min=\(minCos)")
+        }
+    }
+
     // F-80 isolation: which layer of the model forward starts to
     // diverge between two identical prefill runs?
     // Compares K-cache snapshots between two fresh prefills, layer-by-

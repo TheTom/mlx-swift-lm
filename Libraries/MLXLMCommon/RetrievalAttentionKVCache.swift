@@ -30,8 +30,12 @@ import MLX
 /// KV cache that backs `RetrievalAttention` block-sparse decode.
 public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConvertible {
 
-    /// Inner raw K/V cache — same storage layout as `StandardKVCache`.
-    public let inner: StandardKVCache
+    /// Inner raw K/V cache. Default is `StandardKVCache`. For TurboQuant+
+    /// composition (PRD Phase D), this may be a `TurboQuantizedKVCache` in
+    /// rawKeyMode (K=FP16 raw, V=4bit compressed) — RA's selector index
+    /// continues to project from raw K while V gets memory savings via
+    /// TQ compression at the cost of V dequant at decode.
+    public let inner: BaseKVCache
 
     /// Batched selector index covering all KV heads for this layer.
     /// Populated lazily on the first `update(...)` once we know
@@ -121,6 +125,34 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         super.init()
     }
 
+    /// TurboQuant+ composition init — Phase D PRD goal. The inner cache is
+    /// a `TurboQuantizedKVCache` in rawKeyMode (K stays FP16, V is
+    /// compressed at the configured bitwidth). RA's selector still projects
+    /// from raw K; V compression yields the memory win.
+    /// - parameters:
+    ///   - valueBits: V compression bitwidth (default 4)
+    ///   - tqStep: TQ allocation step (default 1024 to match TQ defaults)
+    public init(
+        layerIdx: Int,
+        totalLayers: Int,
+        raConfig: RetrievalAttentionConfig = RetrievalAttentionConfig(),
+        ropeBase: Float = 10_000.0,
+        valueBits: Int,
+        tqStep: Int = 1024
+    ) {
+        self.inner = TurboQuantizedKVCache(
+            keyBits: 0,             // rawKeyMode: K stays FP16
+            valueBits: valueBits,   // V compressed
+            step: tqStep,
+            useCompressedAttention: false  // RA does its own gather/SDPA path
+        )
+        self.raConfig = raConfig
+        self.layerIdx = layerIdx
+        self.totalLayers = totalLayers
+        self.ropeBase = ropeBase
+        super.init()
+    }
+
     /// Allocate the batched selector index on first sight of the cache
     /// shape. Cheap to call on every update; idempotent after the first.
     private func ensureIndex(nKVHeads: Int, dHead: Int) {
@@ -148,7 +180,21 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         let nKVHeads = keys.dim(1)
         let dHead = keys.dim(3)
 
-        let (cachedK, cachedV) = inner.update(keys: keys, values: values)
+        // F-80 compose: when inner is TurboQuantizedKVCache (rawKeyMode), call
+        // updateAndDequant — handles both prefill raw-store AND decode-time
+        // compression transition + V dequant. Standard cache path is untouched.
+        let cachedK: MLXArray
+        let cachedV: MLXArray
+        if let tqInner = inner as? TurboQuantizedKVCache {
+            precondition(
+                tqInner.rawKeyMode,
+                "RetrievalAttention + TurboQuant compose requires rawKeyMode "
+                + "(keyBits=0); K must stay raw FP16 for the JL selector index."
+            )
+            (cachedK, cachedV) = tqInner.updateAndDequant(keys: keys, values: values)
+        } else {
+            (cachedK, cachedV) = inner.update(keys: keys, values: values)
+        }
 
         if !isSparseEligible {
             return (cachedK, cachedV)
