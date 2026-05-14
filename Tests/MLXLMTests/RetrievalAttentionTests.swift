@@ -3599,6 +3599,62 @@ struct RetrievalAttentionTests {
         print(line)
     }
 
+    // F-48 fallback parity — confirm the MLX-ops fallback path (used
+    // when nBlocks != power of 2 ≤ 1024) produces the same top-K set
+    // as the fused Metal kernel given identical scores. Order within
+    // the top-K may differ; we compare as sets.
+    @Test func scoreTopKFallbackMatchesFused() throws {
+        let nKVHeads = 4
+        let nBlocks = 256  // pow2, fits in fused kernel
+        let contentDim = 16
+        let k = 16
+        let blockSize = 64
+
+        MLXRandom.seed(0xF48F)
+        let blockFeatures = MLXRandom.normal(
+            [nKVHeads, nBlocks, contentDim]
+        ).asType(.float32)
+        let projectedQ = MLXRandom.normal(
+            [nKVHeads, contentDim]
+        ).asType(.float32)
+        eval(blockFeatures, projectedQ)
+
+        // Fused kernel
+        let fusedStarts = retrievalAttentionScoreTopKFused(
+            blockFeatures: blockFeatures, projectedQ: projectedQ,
+            k: k, blockSize: blockSize, nBlocksRounded: nBlocks
+        )
+        let fusedCpu = fusedStarts.asArray(Int32.self)
+
+        // MLX fallback path (replicates computeTopKBlockStarts fallback)
+        let scores = (blockFeatures * projectedQ.expandedDimensions(axis: 1)).sum(axis: -1)
+        let nBlocksDim = scores.dim(1)
+        let pivotKth = nBlocksDim - k
+        let partitioned: MLXArray
+        if pivotKth <= 0 {
+            let rangeArr = MLXArray(0..<Int32(nBlocksDim)).reshaped(1, nBlocksDim)
+            partitioned = broadcast(rangeArr, to: [nKVHeads, nBlocksDim])
+        } else {
+            partitioned = argPartition(scores, kth: pivotKth, axis: -1)
+        }
+        let topKIdx = partitioned[0..., (nBlocksDim - k)...]
+        let mlxStarts = topKIdx * Int32(blockSize)
+        let mlxCpu = mlxStarts.asArray(Int32.self)
+
+        // Compare as sets per head
+        for h in 0..<nKVHeads {
+            let fusedSet = Set(fusedCpu[h*k..<(h+1)*k])
+            let mlxSet = Set(mlxCpu[h*k..<(h+1)*k])
+            let intersect = fusedSet.intersection(mlxSet).count
+            let onlyFused = fusedSet.subtracting(mlxSet)
+            let onlyMlx = mlxSet.subtracting(fusedSet)
+            print("[F-48-parity] head=\(h) overlap=\(intersect)/\(k) "
+                + "only_fused=\(onlyFused) only_mlx=\(onlyMlx)")
+            #expect(intersect == k,
+                "head \(h) topK sets diverge: only_fused=\(onlyFused) only_mlx=\(onlyMlx)")
+        }
+    }
+
     // F-79 cross-architecture validation on Qwen3-0.6B-4bit.
     // Confirms the selector-amortization technique generalizes beyond
     // Qwen2.5-14B-1M. Smaller model + different arch + same amort=16
