@@ -207,10 +207,13 @@ public struct RetrievalAttentionConfig: Sendable {
     /// boundary. Only the F-73 mask build runs every step (sliding
     /// window stays current).
     ///
-    /// Default 8 — measured cosine 0.99990 vs amort=1 reference over
-    /// 16 decode steps on 14B-1M-4bit at 24K. Latency 44.1ms vs dense
-    /// 41.6ms at 32K (within 6%). Set to 1 to disable amortization.
-    public var selectorAmortization: Int = 8
+    /// Default 16. Fine-grained quality sweep at amort∈{6,8,10,12,
+    /// 16,24,32} on 14B-1M-4bit at 24K showed PERFECT 16/16 argmax
+    /// match with the amort=1 reference at every value tested, and
+    /// cosine plateau at ~0.99974. At 32K the +1.8ms gap to dense is
+    /// 96% of the original F-59 gap closed. Set to 1 to disable
+    /// amortization.
+    public var selectorAmortization: Int = 16
 
     /// F-78 — dispatch the entire selector pipeline (projectQ + F-48
     /// fine + F-48 coarse + F-73 mask) on a separate MLX Stream so
