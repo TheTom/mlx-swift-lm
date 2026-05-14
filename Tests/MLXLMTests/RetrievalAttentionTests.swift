@@ -573,6 +573,122 @@ struct RetrievalAttentionTests {
 
     // MARK: - Real Qwen3 attention K capture (Week 1 diagnostic)
 
+    /// Cosine vs dense at SCALING context lengths. THE PRD-load-bearing
+    /// question: does cosine hold when gather coverage shrinks to a
+    /// few percent (where real long-context inference lives)?
+    @Test func trainedQwen3CosineScalingByContext() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        if !FileManager.default.fileExists(atPath: modelPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let config = try JSONDecoder().decode(
+            Qwen3Configuration.self,
+            from: Data(contentsOf: modelPath.appendingPathComponent("config.json"))
+        )
+        let model = Qwen3Model(config)
+        let quant = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        try loadWeights(modelDirectory: modelPath, model: model, quantization: quant)
+
+        let dHead = config.headDim
+        let scale = Float(1.0 / Float(dHead).squareRoot())
+        let middleLayer = config.hiddenLayers / 2
+
+        for seqLen in [2048, 4096, 8192, 16384, 32768] {
+            MLXRandom.seed(UInt64(500 + seqLen))
+            let tokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(config.vocabularySize)),
+                [1, seqLen],
+            ).asType(.int32)
+            let caches = model.newCache(parameters: nil)
+            _ = model(tokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            guard let std = caches[middleLayer] as? StandardKVCache,
+                let K = std.keys, let V = std.values
+            else {
+                Issue.record("no K/V at \(seqLen)")
+                continue
+            }
+            let K0 = K[0, 0, 0..., 0...]
+            let V0 = V[0, 0, 0..., 0...]
+
+            // Use PRD-locked default: fineK=32, coarse=2 (~6272 budget),
+            // sentinel on, λ=0, static=128, sliding=2048.
+            var raCfg = RetrievalAttentionConfig()
+            raCfg.fineTopK = 32
+            raCfg.coarseRescueEnabled = true
+            raCfg.coarseTopK = 2
+            raCfg.fineBlockSize = 64
+            raCfg.coarseBlockSize = 1024
+            raCfg.lambdaPos = 0.0
+            raCfg.sentinelEnabled = true
+            raCfg.staticInit = 128
+            raCfg.slidingWindow = 2048
+
+            let nQueries = 10
+            var cosines: [Float] = []
+            var gathers: [Int] = []
+            for qSeed in 1000..<(1000 + nQueries) {
+                MLXRandom.seed(UInt64(qSeed))
+                let needlePos = Int.random(in: 500..<(seqLen - 500))
+                let qDir = K0[needlePos]
+                let noise = MLXRandom.normal([dHead]).asType(qDir.dtype) * 0.3
+                let mixed = qDir * 0.7 + noise
+                let qNorm = mixed / sqrt((mixed * mixed).sum())
+
+                // Dense
+                let dScores = matmul(K0, qNorm.reshaped(dHead, 1))
+                    .reshaped(seqLen) * scale
+                let dW = softmax(dScores, axis: 0)
+                let dOut = matmul(dW.reshaped(1, seqLen), V0).reshaped(dHead)
+
+                // Sparse
+                let idx = RetrievalAttentionIndex(
+                    config: raCfg, dHead: dHead, ropeBase: config.ropeTheta,
+                    layerIdx: middleLayer,
+                )
+                idx.update(newK: K0)
+                let projQ = idx.projectQuery(qNorm)
+                let fineStarts = idx.topKFineBlockStarts(against: projQ)
+                let coarseStarts = idx.topKCoarseBlockStarts(against: projQ)
+                let gatherIdx = retrievalAttentionGatherIndices(
+                    seqLen: seqLen,
+                    fineBlockStarts: fineStarts,
+                    coarseBlockStarts: coarseStarts,
+                    config: raCfg,
+                )
+                let idxArr = MLXArray(gatherIdx.map { Int32($0) })
+                let sK = K0.take(idxArr, axis: 0)
+                let sV = V0.take(idxArr, axis: 0)
+                let sScores = matmul(sK, qNorm.reshaped(dHead, 1))
+                    .reshaped(gatherIdx.count) * scale
+                let sW = softmax(sScores, axis: 0)
+                let sOut = matmul(sW.reshaped(1, gatherIdx.count), sV).reshaped(dHead)
+
+                let dot = (dOut * sOut).sum().item(Float.self)
+                let dn = sqrt((dOut * dOut).sum().item(Float.self))
+                let sn = sqrt((sOut * sOut).sum().item(Float.self))
+                cosines.append(dot / max(dn * sn, 1e-9))
+                gathers.append(gatherIdx.count)
+            }
+            let m = cosines.reduce(0, +) / Float(cosines.count)
+            let stdv = sqrt(
+                cosines.map { ($0 - m) * ($0 - m) }
+                    .reduce(0, +) / Float(cosines.count)
+            )
+            let avgGather = gathers.reduce(0, +) / gathers.count
+            let cov = Float(avgGather) / Float(seqLen) * 100
+            let s = String(format: "%.4f ± %.4f", m, stdv)
+            let c = String(format: "%.1f", cov)
+            print(
+                "[F-21-cosine-scaling] seqLen=\(seqLen) gather=\(avgGather) (\(c)% of cache) cos=\(s)"
+            )
+        }
+    }
+
     /// Attention output cosine similarity vs dense — the PRD success
     /// criterion (line 524: "≥ 0.85 averaged across sparse layers").
     /// THE LLM-quality metric. Recall@k tells you whether the selector
