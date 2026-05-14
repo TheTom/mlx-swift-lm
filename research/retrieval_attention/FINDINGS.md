@@ -359,6 +359,59 @@ The F-73 ship is the practical optimum on the current stack.
 
 ---
 
+## F-79 — SELECTOR AMORTIZATION (the breakthrough)
+
+**The 14ms gap is GPU work, not encoding** (confirmed by parallel
+research agent reading mlx-c source). The fix: don't do the work
+every step.
+
+Q drifts slowly between adjacent decode tokens. The top-K block
+picks at step T+1 are usually nearly identical to those at step T.
+F-79 caches the topK arrays from the last full selector refresh and
+reuses them for `selectorAmortization` consecutive decode steps. The
+F-73 mask kernel still runs every step (so the sliding window stays
+current — that's the bulk of the per-step mask anyway).
+
+**Latency on Qwen2.5-14B-1M-4bit / M5 Max / 32K decode:**
+
+```
+dense          = 41.6ms (baseline)
+F-79 amort=1   = 54.9ms (+13.3ms — equivalent to F-73)
+F-79 amort=2   = 47.4ms (+5.8ms)
+F-79 amort=4   = 45.6ms (+4.0ms)
+F-79 amort=8   = 44.1ms (+2.5ms — within 6% of dense)
+```
+
+**Quality vs the amort=1 reference (16 decode steps, T=24K):**
+
+```
+amort=2 mean_cosine = 0.99997
+amort=4 mean_cosine = 0.99992
+amort=8 mean_cosine = 0.99990
+```
+
+Cosine drop is effectively zero through amort=8. The intuition (Q
+drifts slowly so top-K picks are stable) holds empirically.
+
+**Combined scorecard:**
+
+| Path | T=32K | Gap | Cosine vs F-73 |
+|------|-------|-----|----------------|
+| Dense | 41.6ms | 0 | — |
+| F-59 mask (original ship) | 62.4ms | +20.8ms | 1.0 |
+| F-73 fused mask (mid-session ship) | 54.9ms | +13.3ms | 1.0 |
+| **F-79 amort=8 (new candidate ship)** | **44.1ms** | **+2.5ms** | **0.99990** |
+
+vs F-59 → -89% of gap closed. vs F-73 → -81% additional gap closed.
+**Within 6% of dense.**
+
+Wider ablation pending: amort∈{1,2,4,8,16,32} × T∈{16K,32K,49K,65K}.
+Adaptive-amort (F-80) — refresh based on actual Q-drift instead of
+fixed window — is the natural next step but may not add much over
+fixed=8 given the already-excellent cosine numbers.
+
+---
+
 ## What's still open (in priority order)
 
 1. **Fused select-gather-attend Metal kernel.** Big engineering job — would

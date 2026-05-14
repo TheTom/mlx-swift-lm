@@ -3444,6 +3444,85 @@ struct RetrievalAttentionTests {
         #expect(diff < 1e-3, "F-71 kernel max_abs_diff \(diff)")
     }
 
+    // F-79 wider ablation: amort × context sweep on 14B-1M.
+    // Reports decode latency for amort ∈ {1, 2, 4, 8, 16, 32} at
+    // contexts {16K, 32K, 49K, 65K}. Quality is checked separately
+    // in `selectorAmortizationQuality_14B1M`.
+    @Test func selectorAmortizationAblation_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let warmupSteps = 2
+        let timedSteps = 16
+
+        func runOne(prefillLen: Int, amort: Int) -> Double {
+            let caches: [KVCache]
+            if amort == 0 {
+                caches = (0..<cfg.hiddenLayers).map { _ in StandardKVCache() }
+            } else {
+                var raConf = RetrievalAttentionConfig()
+                raConf.selectorAmortization = amort
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            }
+            MLXRandom.seed(0x7902)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        for prefill in [16384, 32767, 49151, 65535] {
+            let dense = runOne(prefillLen: prefill, amort: 0)
+            var perAmort: [(Int, Double)] = []
+            for a in [1, 2, 4, 8, 16, 32] {
+                let ms = runOne(prefillLen: prefill, amort: a)
+                perAmort.append((a, ms))
+            }
+            var line = "[F-79-ablation] prefill=\(prefill) dense=\(String(format: "%.1f", dense))"
+            for (a, ms) in perAmort {
+                let gap = ms - dense
+                line += " a\(a):\(String(format: "%.1f", ms))(+\(String(format: "%.1f", gap)))"
+            }
+            print(line)
+        }
+    }
+
     // F-79 latency + cosine: selector amortization across N=2,4,8
     // decode steps. Measure both speed gain and quality drop vs F-73
     // (amort=1).
