@@ -189,6 +189,69 @@ Test coverage: 40+ tests in `Tests/MLXLMTests/RetrievalAttentionTests.swift`.
 
 ---
 
+## F-70 — per-KV-head gather + batched SDPA (CORRECT, NOT FASTER)
+
+**Hypothesis:** the F-69 fused-sparse-SDPA kernel didn't beat the F-59
+mask path because the cross-KV-head union saturates the gather to ≈T at
+default adaptive top_k. If each KV head gets its OWN sorted gather (no
+union) we cut the gather to per-head K_padded ≈ T/2.5 at 32K, and a
+single batched MLXFast SDPA call on `[1, nKVH, K_padded, D]` should beat
+the mask path's dense-over-T pass.
+
+**What was built.**
+
+- `BatchedRetrievalAttentionIndex.perKVHeadGatherGPU(...)`: per-row
+  sorted gather (static + sliding + per-head fineTopK*BS + per-head
+  coarseTopK*coarseBS), shape `[nKVH, K_padded]`, entirely on GPU.
+- `RetrievalAttentionKVCache.perKVHeadGatherAndAttend(...)`:
+  `takeAlong(K/V, gather_idx_expanded, axis: 2)` → gathered K/V at
+  `[1, nKVH, K_padded, D]`. Adjacent-diff dup mask `[nKVH, K_padded]`
+  expanded via broadcast to `[1, nQH, 1, K_padded]` (each KVH row
+  repeated `groupSize` times to satisfy MLX SDPA's mask broadcast).
+- Single MLXFast.scaledDotProductAttention call on Q `[1, nQH, 1, D]`
+  × K/V `[1, nKVH, K_padded, D]` with mask=.array.
+- Config flag `usePerKVHeadGather` (default false; opt-in alongside
+  `useMaskedDense=false`).
+
+**Correctness.** Cosine 0.9994 vs F-59 mask path on Qwen3-0.6B-4bit at
+17K. Per-head set membership ≠ mask path's cross-head union → outputs
+differ slightly, but well within drift tolerance.
+
+**Latency on Qwen2.5-14B-1M-4bit (default adaptive top_k):**
+
+```
+[F-70-perKV-latency] prefill=16384 mask=49.55ms perKV=63.84ms  ratio=1.29x slower
+[F-70-perKV-latency] prefill=32767 mask=55.16ms perKV=71.11ms  ratio=1.29x slower
+```
+
+**Latency at fixed top_k=32 (K_padded ≈ 4.2K, 12x smaller than T at 49K):**
+
+```
+[F-70-fixedTopK] prefill=16384 mask=50.65ms perKV=59.03ms ratio=1.17x slower
+[F-70-fixedTopK] prefill=32767 mask=54.23ms perKV=62.23ms ratio=1.15x slower
+[F-70-fixedTopK] prefill=49151 mask=56.27ms perKV=61.31ms ratio=1.09x slower
+```
+
+**Conclusion.** F-70 is correct, doesn't help at any tested config.
+Even at 12x gather reduction (49K context, top_k=32), F-70 lags mask by
+1.09x. The arithmetic intuition was wrong: mlx-swift's `sdpa_vector` /
+`sdpa_vector_2pass` with `mask=.array` short-circuits the inner FMA at
+-inf positions, so mask path's actual compute scales with K_padded, NOT
+T. The path walks T positions in the iteration space but only does work
+proportional to the unmasked count. Per-KV-head gather doesn't reduce
+work compared to per-union mask; it only adds `takeAlong` motion + mask
+build overhead.
+
+The real bottleneck is not attention compute on this model. At 56ms /
+decode step with 48 layers, attention is ~15ms, MLP is ~40ms. Sparse
+attention can't beat dense by more than ~15ms at the layer level for
+14B-1M-4bit decode on M5 Max.
+
+**Filed as opt-in (`usePerKVHeadGather=false` default) for future use
+cases that benefit from per-head divergence semantics.**
+
+---
+
 ## What's still open (in priority order)
 
 1. **Fused select-gather-attend Metal kernel.** Big engineering job — would

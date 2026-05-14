@@ -353,6 +353,76 @@ public final class BatchedRetrievalAttentionIndex {
         )
     }
 
+    /// F-70 path: per-KV-head sorted gather indices for batched SDPA.
+    /// Each row is one KV head's gather: static + sliding + this head's
+    /// top-K fine + top-K coarse, sorted, padded to a fixed size.
+    /// Padding positions hold a sentinel (T-1 reuse, mask handles it).
+    ///
+    /// - Returns: (gather [nKVHeads, K_padded] int32 with sentinel padding,
+    ///   K_padded). Gather is SORTED per row; duplicates within a row are
+    ///   marked via adjacent-diff mask at SDPA time.
+    public func perKVHeadGatherGPU(
+        projectedQ: MLXArray, seqLen T: Int
+    ) -> (MLXArray, Int) {
+        let staticInit = config.staticInit
+        let slidingWindow = config.slidingWindow
+        let fineBS = config.fineBlockSize
+        let coarseBS = config.coarseBlockSize
+        let kFineEff = min(config.effectiveFineTopK(seqLen: seqLen),
+                           (fineBlockFeatures?.dim(1) ?? 0))
+        let kCoarseEff = config.coarseRescueEnabled
+            ? min(config.coarseTopK, (coarseBlockFeatures?.dim(1) ?? 0)) : 0
+        let staticEnd = min(staticInit, T)
+        let slidingStart = max(0, T - slidingWindow)
+        let staticCount = staticEnd
+        let slidingCount = max(0, T - slidingStart)
+        // Per-head total = static + sliding + topK_fine*bs + topK_coarse*coarseBS.
+        let kPadded = staticCount + slidingCount + kFineEff * fineBS + kCoarseEff * coarseBS
+
+        // Build per-head rows in MLX. Each row is [staticRange, slidingRange,
+        // fine_expanded[h], coarse_expanded[h]] all on GPU.
+        let staticPositions = staticCount > 0
+            ? MLXArray(Int32(0)..<Int32(staticEnd))
+            : MLXArray.zeros([0], dtype: .int32)  // [staticCount]
+        let slidingPositions = slidingCount > 0
+            ? MLXArray(Int32(slidingStart)..<Int32(T))
+            : MLXArray.zeros([0], dtype: .int32)
+        // Broadcast static + sliding across nKVHeads (same rows).
+        let staticPlus = concatenated([staticPositions, slidingPositions], axis: 0)
+            .reshaped(1, staticCount + slidingCount)
+        let staticBroadcast = broadcast(staticPlus, to: [nKVHeads, staticCount + slidingCount])
+
+        var pieces: [MLXArray] = [staticBroadcast]
+
+        if kFineEff > 0, let ff = fineBlockFeatures {
+            let fineStarts = computeTopKBlockStarts(
+                features: ff, projectedQ: projectedQ,
+                k: kFineEff, blockSize: fineBS
+            )  // [nKVH, kFineEff] block starts in token coords
+            let offsets = MLXArray(0..<Int32(fineBS)).reshaped(1, 1, fineBS)
+            let expanded = fineStarts.expandedDimensions(axis: 2) + offsets
+            // [nKVH, kFineEff * fineBS]
+            pieces.append(expanded.reshaped(nKVHeads, kFineEff * fineBS))
+        }
+        if kCoarseEff > 0, let cf = coarseBlockFeatures {
+            let coarseStarts = computeTopKBlockStarts(
+                features: cf, projectedQ: projectedQ,
+                k: kCoarseEff, blockSize: coarseBS
+            )
+            let offsets = MLXArray(0..<Int32(coarseBS)).reshaped(1, 1, coarseBS)
+            let expanded = coarseStarts.expandedDimensions(axis: 2) + offsets
+            pieces.append(expanded.reshaped(nKVHeads, kCoarseEff * coarseBS))
+        }
+
+        let unsorted = concatenated(pieces, axis: 1)  // [nKVHeads, kPadded]
+        // Clip to valid token range — guards against the last-block tail
+        // overshooting T.
+        let clipped = clip(unsorted, min: Int32(0), max: Int32(T - 1))
+        // Sort per row → enables adjacent-diff dedupe at SDPA time.
+        let sortedGather = sorted(clipped, axis: 1)
+        return (sortedGather, kPadded)
+    }
+
     /// F-59 path: return expanded per-token positions for fine + coarse
     /// top-K, ENTIRELY ON GPU (no asArray sync). Used by the
     /// mask-not-gather attention path.

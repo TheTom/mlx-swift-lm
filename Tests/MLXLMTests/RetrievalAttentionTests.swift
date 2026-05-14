@@ -3381,6 +3381,241 @@ struct RetrievalAttentionTests {
         #expect(diff < 1e-3, "sparse SDPA kernel max_abs_diff \(diff)")
     }
 
+    // F-70 latency: per-KV-head batched SDPA vs F-59 mask path on
+    // Qwen2.5-14B-1M at 16K and 32K-1. Expected: F-70 amortizes the
+    // cross-head union saturation by giving each head its own gather
+    // (12-13K per head vs ~T union), so the mask path's dense O(T)
+    // SDPA pass should shrink to a per-head O(K_padded) pass.
+    @Test func perKVHeadGatherLatency_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runRA(prefillLen: Int, mode: String) -> Double {
+            var raConf = RetrievalAttentionConfig()
+            switch mode {
+            case "mask":
+                raConf.useMaskedDense = true
+                raConf.usePerKVHeadGather = false
+            case "perKV":
+                raConf.useMaskedDense = false
+                raConf.usePerKVHeadGather = true
+            default:
+                fatalError("unknown mode \(mode)")
+            }
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raConf, ropeBase: cfg.ropeTheta)
+            }
+            MLXRandom.seed(0x7070)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: ra)
+            eval(ra.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: ra)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: ra)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        for prefill in [16384, 32767] {
+            let maskMs = runRA(prefillLen: prefill, mode: "mask")
+            let perMs = runRA(prefillLen: prefill, mode: "perKV")
+            print(
+                "[F-70-perKV-latency] prefill=\(prefill) "
+                    + "mask=\(String(format: "%.2f", maskMs))ms/step "
+                    + "perKV=\(String(format: "%.2f", perMs))ms/step "
+                    + "ratio=\(String(format: "%.2fx", perMs / maskMs))"
+            )
+        }
+    }
+
+    // F-70b: sweep at fixed-top_k (adaptive off, top_k=32) to isolate the
+    // effect of gather size on F-70 vs mask. Per-head K_padded stays at
+    // ~4.2K regardless of context — F-70 should win as T/K_padded grows.
+    @Test func perKVHeadGatherLatency_14B1M_fixedTopK() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runRA(prefillLen: Int, mode: String) -> Double {
+            var raConf = RetrievalAttentionConfig()
+            raConf.adaptiveTopK = false   // fixed top_k=32
+            raConf.fineTopK = 32
+            switch mode {
+            case "mask":
+                raConf.useMaskedDense = true
+                raConf.usePerKVHeadGather = false
+            case "perKV":
+                raConf.useMaskedDense = false
+                raConf.usePerKVHeadGather = true
+            default: fatalError("bad mode")
+            }
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raConf, ropeBase: cfg.ropeTheta)
+            }
+            MLXRandom.seed(0x7071)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: ra)
+            eval(ra.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: ra)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: ra)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        for prefill in [16384, 32767, 49151] {
+            let maskMs = runRA(prefillLen: prefill, mode: "mask")
+            let perMs = runRA(prefillLen: prefill, mode: "perKV")
+            print(
+                "[F-70-fixedTopK] prefill=\(prefill) "
+                    + "mask=\(String(format: "%.2f", maskMs))ms/step "
+                    + "perKV=\(String(format: "%.2f", perMs))ms/step "
+                    + "ratio=\(String(format: "%.2fx", perMs / maskMs))"
+            )
+        }
+    }
+
+    // F-70: per-KV-head gather + batched SDPA bit-identical (within fp
+    // tolerance) to the F-59 mask path on Qwen3-0.6B-4bit at 8K.
+    @Test func perKVHeadGatherMatchesMaskPath() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        // 17K context — past sparseMinContext so the dispatcher actually
+        // routes to RA paths instead of falling through to dense.
+        let seqLen = 17_000
+        MLXRandom.seed(0xF70A)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        // Mask path (F-59 default).
+        var maskCfg = RetrievalAttentionConfig()
+        maskCfg.useMaskedDense = true
+        maskCfg.usePerKVHeadGather = false
+        let raMask: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: maskCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raMask)
+        let maskLog = model(nextTok, cache: raMask)
+        eval(maskLog)
+
+        // F-70 per-KV-head path.
+        var perCfg = RetrievalAttentionConfig()
+        perCfg.useMaskedDense = false
+        perCfg.usePerKVHeadGather = true
+        let raPer: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: perCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raPer)
+        let perLog = model(nextTok, cache: raPer)
+        eval(perLog)
+
+        let m = maskLog.reshaped(maskLog.size).asType(.float32)
+        let p = perLog.reshaped(perLog.size).asType(.float32)
+        let dot = (m * p).sum().asArray(Float.self)[0]
+        let mn = sqrt((m * m).sum()).asArray(Float.self)[0]
+        let pn = sqrt((p * p).sum()).asArray(Float.self)[0]
+        let cosine = dot / (mn * pn + 1e-12)
+        let diff = (m - p).abs().max().asArray(Float.self)[0]
+        // Note: F-70 union-skip changes set membership (each head only
+        // sees its own gather instead of the cross-head union), so per-
+        // head outputs differ. Mask-vs-perKV cosine should still be high
+        // but won't be 1.0. Spec sanity: ≥0.97.
+        print("[F-70-perKV-vs-mask] seqLen=\(seqLen) "
+            + "cosine=\(cosine) max_abs_diff=\(diff)")
+        #expect(cosine >= 0.97,
+            "perKV diverges too far from mask path; cosine=\(cosine)")
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.

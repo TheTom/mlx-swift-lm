@@ -159,6 +159,17 @@ public func attentionWithCacheUpdate(
             let qFlat = queries[0, 0..., 0, 0...]
             let D = cachedKeys.dim(3)
             let supportsFusedSparse = [32, 64, 96, 128, 256].contains(D)
+            if raCache.raConfig.usePerKVHeadGather && sinks == nil {
+                // F-70 per-KV-head batched SDPA. Skips cross-head union
+                // so each head's gather is bounded by preBudget (not T).
+                return raCache.perKVHeadGatherAndAttend(
+                    queries: queries,
+                    keys: cachedKeys,
+                    values: cachedValues,
+                    qHeads: qFlat,
+                    scale: scale
+                )
+            }
             if raCache.raConfig.useFusedSparseSDPA && supportsFusedSparse && sinks == nil {
                 // F-69 fused sparse SDPA: actually skips attention compute
                 // over masked positions. Wins vs mask path at long context.

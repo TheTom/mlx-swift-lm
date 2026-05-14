@@ -242,6 +242,109 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         return sorted(clipped)
     }
 
+    /// F-70 per-KV-head gather + batched SDPA: each KV head gathers its
+    /// own sorted set of static + sliding + top-K-fine + top-K-coarse
+    /// positions. We reshape the KV-heads dim into the batch dim and call
+    /// `MLXFast.scaledDotProductAttention` once on
+    /// `[nKVH, groupSize, 1, D]` queries against `[nKVH, 1, K_padded, D]`
+    /// gathered K/V — staying on the fused tiled SDPA fast path while
+    /// each head only sees its own gather (no cross-head union).
+    /// Sorted-row duplicates are masked via an adjacent-diff additive mask.
+    ///
+    /// - Parameters:
+    ///   - queries: `[1, nQH, 1, D]` post-RoPE decode query
+    ///   - keys: `[1, nKVH, T, D]` full cached keys
+    ///   - values: `[1, nKVH, T, D]` full cached values
+    ///   - qHeads: `[nQH, D]` flat post-RoPE query (for selector projection)
+    ///   - scale: SDPA scale (typically `1/√D`)
+    /// - Returns: SDPA output `[1, nQH, 1, D]`
+    public func perKVHeadGatherAndAttend(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        qHeads: MLXArray,
+        scale: Float
+    ) -> MLXArray {
+        precondition(qHeads.shape.count == 2, "expected [nHeads, dHead]")
+        precondition(keys.shape.count == 4, "expected [B, nKVH, T, D]")
+        guard let index = batchedIndex else {
+            fatalError("indices not initialized; call update first")
+        }
+        let T = keys.dim(2)
+        let nKVH = keys.dim(1)
+        let D = keys.dim(3)
+        let nQH = queries.dim(1)
+        precondition(
+            nQH % nKVH == 0,
+            "Q heads (\(nQH)) must be a multiple of KV heads (\(nKVH))"
+        )
+        let groupSize = nQH / nKVH
+
+        // Project query via selector. Reuse strided rep-head pick from
+        // gatherIndicesForDecode / gatherIndicesGPU.
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray(
+                (0..<nKVH).map { Int32($0 * groupSize) }
+            )
+            eval(cachedHeadIdx!)
+        }
+        let qStacked = qHeads.take(cachedHeadIdx!, axis: 0).asType(.float32)
+        let projQ = index.projectQueriesBatched(qStacked)
+
+        // Per-KV-head sorted gather [nKVH, K_padded] (clipped to [0, T-1],
+        // dups possible only within a row since static+sliding+head_topK
+        // can overlap; cross-head overlap is NOT collapsed — that's the
+        // whole point).
+        let (gather, kPadded) = index.perKVHeadGatherGPU(
+            projectedQ: projQ, seqLen: T
+        )
+
+        // Per-head gather via takeAlong on axis 2 of K/V. Indices reshape
+        // to [1, nKVH, K_padded, 1] and broadcast across D inside the
+        // op — this keeps the result in the mlx-fast SDPA fast path
+        // layout `[1, nKVH, K_padded, D]` (B=1, nKVH unchanged) instead
+        // of moving heads into the batch dim. F-70a observed the latter
+        // layout (B=nKVH) regresses 9x at 32K, even though work is
+        // smaller, because the decode kernel's parallelism is best
+        // tuned for B=1.
+        let gatherForTake = gather.expandedDimensions(axes: [0, 3])  // [1, nKVH, K_padded, 1]
+        let gatheredK = takeAlong(keys, gatherForTake, axis: 2)   // [1, nKVH, K_padded, D]
+        let gatheredV = takeAlong(values, gatherForTake, axis: 2) // [1, nKVH, K_padded, D]
+
+        // Adjacent-diff additive mask. For a sorted row, position k is a
+        // duplicate iff gather[h, k] == gather[h, k-1]. Position 0 always
+        // valid. Mask must broadcast to [B, nQH, L, K_padded] for MLX's
+        // SDPA. We expand the per-KVH mask to per-QH by repeating each
+        // KVH row `groupSize` times along a new axis, then reshape.
+        let prev = gather[0..., 0 ..< (kPadded - 1)]
+        let curr = gather[0..., 1 ..< kPadded]
+        let dupInner = (curr .== prev)  // [nKVH, K_padded-1] Bool
+        let leadFalse = MLXArray.zeros([nKVH, 1], dtype: .bool)
+        let dupMask = concatenated([leadFalse, dupInner], axis: 1)  // [nKVH, K_padded]
+        let zeroLike = MLXArray(Float(0)).asType(keys.dtype)
+        let negInfLike = MLXArray(-Float.infinity).asType(keys.dtype)
+        // [nKVH, K_padded] → [1, nKVH, 1, 1, K_padded] → expand to
+        //   [1, nKVH, groupSize, 1, K_padded] → reshape [1, nQH, 1, K_padded].
+        let baseMask = MLX.where(dupMask, negInfLike, zeroLike)
+            .reshaped(1, nKVH, 1, 1, kPadded)
+        let expanded = broadcast(
+            baseMask, to: [1, nKVH, groupSize, 1, kPadded]
+        )
+        let addMask = expanded.reshaped(1, nKVH * groupSize, 1, kPadded)
+
+        let out = BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+            MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: gatheredK,
+                values: gatheredV,
+                scale: scale,
+                mask: .array(addMask),
+                sinks: nil
+            )
+        }
+        return out
+    }
+
     /// F-59 mask-not-gather path: build a [1, 1, 1, T] additive attention
     /// mask on GPU with 0 at gathered positions and -inf elsewhere.
     /// Scatter is idempotent for setting to 0, so duplicate positions

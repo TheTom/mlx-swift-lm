@@ -177,6 +177,18 @@ public struct RetrievalAttentionConfig: Sendable {
     /// and a parallelized kernel.
     public var useFusedSparseSDPA: Bool = false
 
+    /// F-70 experimental: per-KV-head separate gather + batched dense SDPA.
+    /// Avoids the cross-KV-head union that saturates the gather toward T
+    /// at long context. Each KV head gets its own sorted gather of
+    /// static + sliding + top-K-fine + top-K-coarse positions; we reshape
+    /// the heads dim into the batch dim and call MLXFast SDPA once on
+    /// `[nKVH, groupSize, 1, D]` queries against `[nKVH, 1, K_padded, D]`
+    /// gathered K/V — staying on the fused tiled SDPA fast path. Duplicate
+    /// positions per row are masked via an adjacent-diff additive mask
+    /// (sorted gather → dups are adjacent). Off by default until F-70
+    /// benches confirm a measurable win over the F-59 mask path.
+    public var usePerKVHeadGather: Bool = false
+
     /// F-63: minimum cache size before RA mask/gather even kicks in.
     /// Below this threshold the dispatcher falls through to standard
     /// dense SDPA — at small caches RA's selector + mask construction
