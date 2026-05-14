@@ -3232,31 +3232,43 @@ struct RetrievalAttentionTests {
             [1, 1]
         ).asType(.int32)
 
-        // Dense.
-        MLX.GPU.resetPeakMemory()
-        let dn = model.newCache(parameters: nil)
-        _ = model(prefillTokens, cache: dn)
-        eval(dn.flatMap { $0.state })
-        let densePrefMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
-        MLX.GPU.resetPeakMemory()
-        let dnLog = model(nextTok, cache: dn)
-        eval(dnLog)
-        let denseDecMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
-
-        // RA.
-        MLX.GPU.resetPeakMemory()
-        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
-            RetrievalAttentionKVCache(
-                layerIdx: i, totalLayers: cfg.hiddenLayers,
-                ropeBase: cfg.ropeTheta)
+        // Scope each path so the cache ARC-releases BEFORE the other
+        // path's measurement. Otherwise ~5 GB of inactive cache state
+        // inflates the "peak" comparison.
+        func runDense() -> (Double, Double) {
+            MLX.GPU.clearCache()
+            MLX.GPU.resetPeakMemory()
+            let dn = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: dn)
+            eval(dn.flatMap { $0.state })
+            let prefMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+            MLX.GPU.clearCache()
+            MLX.GPU.resetPeakMemory()
+            let dnLog = model(nextTok, cache: dn)
+            eval(dnLog)
+            return (prefMB, Double(MLX.GPU.peakMemory) / (1024 * 1024))
         }
-        _ = model(prefillTokens, cache: ra)
-        eval(ra.flatMap { $0.state })
-        let raPrefMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
-        MLX.GPU.resetPeakMemory()
-        let raLog = model(nextTok, cache: ra)
-        eval(raLog)
-        let raDecMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+        func runRA() -> (Double, Double) {
+            MLX.GPU.clearCache()
+            MLX.GPU.resetPeakMemory()
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    ropeBase: cfg.ropeTheta)
+            }
+            _ = model(prefillTokens, cache: ra)
+            eval(ra.flatMap { $0.state })
+            let prefMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+            MLX.GPU.clearCache()
+            MLX.GPU.resetPeakMemory()
+            let raLog = model(nextTok, cache: ra)
+            eval(raLog)
+            return (prefMB, Double(MLX.GPU.peakMemory) / (1024 * 1024))
+        }
+        let (densePrefMB, denseDecMB) = runDense()
+        // Force dense scope cleanup before RA.
+        MLX.GPU.clearCache()
+        let (raPrefMB, raDecMB) = runRA()
 
         print(
             "[F-66-memory] prefill=\(prefillLen) "
@@ -3266,6 +3278,63 @@ struct RetrievalAttentionTests {
                 + "dense_dec=\(String(format: "%.1f", denseDecMB))MB "
                 + "ra_dec=\(String(format: "%.1f", raDecMB))MB "
                 + "(+\(String(format: "%.1f", raDecMB - denseDecMB))MB)"
+        )
+    }
+
+    // F-68: instrument decode-step memory growth to find the 5GB source.
+    @Test func decodeMemoryAttribution() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 24576
+        MLXRandom.seed(0x6868)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        // Build RA cache + run prefill (warm everything up).
+        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        _ = model(prefillTokens, cache: ra)
+        eval(ra.flatMap { $0.state })
+
+        // After prefill, snapshot baseline.
+        MLX.GPU.clearCache()
+        let baseMB = Double(MLX.GPU.activeMemory) / (1024 * 1024)
+        print("[F-68] post-prefill active: \(String(format: "%.1f", baseMB))MB")
+
+        MLX.GPU.resetPeakMemory()
+        let logits = model(nextTok, cache: ra)
+        eval(logits)
+        let peakMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+        let activeAfterMB = Double(MLX.GPU.activeMemory) / (1024 * 1024)
+        print(
+            "[F-68] decode peak=\(String(format: "%.1f", peakMB))MB "
+                + "active_after=\(String(format: "%.1f", activeAfterMB))MB "
+                + "delta_peak=\(String(format: "%.1f", peakMB - baseMB))MB "
+                + "delta_active=\(String(format: "%.1f", activeAfterMB - baseMB))MB"
         )
     }
 
