@@ -1,0 +1,175 @@
+{
+  "config": {
+    "seq_len": 16384,
+    "n_topics": 32,
+    "topic_persistence": 0.95,
+    "needle_band": "anchored",
+    "n_queries": 15,
+    "top_k": 32
+  },
+  "wall_time_s": 9.02,
+  "grid": [
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 0.0,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": false,
+      "recall_mean": 0.20208333333333334,
+      "recall_std": 0.12953576297258176
+    },
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 0.0,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.22291666666666668,
+      "recall_std": 0.09469431814469594
+    },
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 0.25,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": false,
+      "recall_mean": 0.18958333333333333,
+      "recall_std": 0.11938790651578668
+    },
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 0.25,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.225,
+      "recall_std": 0.09960860906568267
+    },
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 0.5,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": false,
+      "recall_mean": 0.15625,
+      "recall_std": 0.07306532465312576
+    },
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 0.5,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.22916666666666666,
+      "recall_std": 0.09727181274940629
+    },
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 0.75,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": false,
+      "recall_mean": 0.15,
+      "recall_std": 0.057282196186948006
+    },
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 0.75,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.21458333333333332,
+      "recall_std": 0.08138343743593587
+    },
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 1.0,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": false,
+      "recall_mean": 0.1125,
+      "recall_std": 0.0568257570707744
+    },
+    {
+      "ab": "A/B-1 lambda",
+      "lambda": 1.0,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.10625,
+      "recall_std": 0.05907269532815761
+    },
+    {
+      "ab": "A/B-3 recency",
+      "lambda": 0.0,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.22291666666666668,
+      "recall_std": 0.09469431814469594
+    },
+    {
+      "ab": "A/B-3 recency",
+      "lambda": 0.0,
+      "recency_alpha": 0.05,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.22291666666666668,
+      "recall_std": 0.09469431814469594
+    },
+    {
+      "ab": "A/B-3 recency",
+      "lambda": 0.0,
+      "recency_alpha": 0.1,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.22083333333333333,
+      "recall_std": 0.09578803277143873
+    },
+    {
+      "ab": "A/B-3 recency",
+      "lambda": 0.0,
+      "recency_alpha": 0.25,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.225,
+      "recall_std": 0.09960860906568267
+    },
+    {
+      "ab": "A/B-3 recency",
+      "lambda": 0.0,
+      "recency_alpha": 0.5,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.225,
+      "recall_std": 0.10026007846263303
+    },
+    {
+      "ab": "A/B-5 block_size",
+      "lambda": 0.0,
+      "recency_alpha": 0.0,
+      "block_size": 32,
+      "sentinel": true,
+      "recall_mean": 0.21041666666666667,
+      "recall_std": 0.10487260790544349
+    },
+    {
+      "ab": "A/B-5 block_size",
+      "lambda": 0.0,
+      "recency_alpha": 0.0,
+      "block_size": 64,
+      "sentinel": true,
+      "recall_mean": 0.22291666666666668,
+      "recall_std": 0.09469431814469594
+    },
+    {
+      "ab": "A/B-5 block_size",
+      "lambda": 0.0,
+      "recency_alpha": 0.0,
+      "block_size": 128,
+      "sentinel": true,
+      "recall_mean": 0.3,
+      "recall_std": 0.09395810236483067
+    }
+  ]
+}
