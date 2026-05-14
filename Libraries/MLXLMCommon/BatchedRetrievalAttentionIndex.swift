@@ -105,11 +105,13 @@ public final class BatchedRetrievalAttentionIndex {
             }
         }
 
-        // Materialize the index state to break the lazy graph chain.
-        // Without this, every decode step accumulates the deferred graph of
-        // prior updates, and asArray() in topK has to walk back to prefill.
-        // Mirrors StandardKVCache's eval() pattern on buffer resize.
-        var toEval: [MLXArray] = [perTokenFeatures!, fineBlockFeatures!]
+        // Materialize the block-pooled state to break the lazy graph chain.
+        // Evaling only block features (not perTokenFeatures) — block
+        // features transitively depend on perTokenFeatures via the slice
+        // + mean, so they get materialized along the way. Skipping the
+        // explicit perTokenFeatures eval saves the broadcast-of-the-full
+        // tensor when only its tail is needed.
+        var toEval: [MLXArray] = [fineBlockFeatures!]
         if let coarse = coarseBlockFeatures { toEval.append(coarse) }
         eval(toEval)
     }
