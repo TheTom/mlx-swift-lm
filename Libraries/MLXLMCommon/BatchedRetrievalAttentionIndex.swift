@@ -27,6 +27,9 @@ public final class BatchedRetrievalAttentionIndex {
     public let layerIdx: Int
 
     private var jlMatrix: MLXArray?
+    /// Pre-transposed JL matrix `[dHead, contentDim]` for matmul. Cached
+    /// once so we don't transpose on every update.
+    private var jlMatrixT: MLXArray?
 
     /// Pre-allocated per-token features buffer. Grown in `featureChunkSize`
     /// chunks to avoid per-step concat reallocation. Only positions
@@ -88,15 +91,18 @@ public final class BatchedRetrievalAttentionIndex {
 
         if jlMatrix == nil {
             jlMatrix = retrievalAttentionJLProjection(dHead: dHead, config: config)
+            jlMatrixT = jlMatrix!.transposed(1, 0)
+            eval(jlMatrix!, jlMatrixT!)
         }
-        let W = jlMatrix!  // [contentDim, dHead]
+        let W = jlMatrix!
+        let WT = jlMatrixT!
 
         let oldSeqLen = seqLen
         let L = newKeys.dim(1)
         let newSeqLen = oldSeqLen + L
 
         // Project: [nKVHeads, L, dHead] @ [dHead, contentDim] = [nKVHeads, L, contentDim]
-        let contentNew = matmul(newKeys, W.transposed(1, 0)).asType(.float32)
+        let contentNew = matmul(newKeys, WT).asType(.float32)
 
         // Trig features only when lambdaPos > 0 — pure content (default
         // λ=0 ship config per F-46) ignores the trig half of the selector.
@@ -235,10 +241,13 @@ public final class BatchedRetrievalAttentionIndex {
         precondition(q.shape == [nKVHeads, dHead], "expected [\(nKVHeads), \(dHead)], got \(q.shape)")
         if jlMatrix == nil {
             jlMatrix = retrievalAttentionJLProjection(dHead: dHead, config: config)
+            jlMatrixT = jlMatrix!.transposed(1, 0)
+            eval(jlMatrix!, jlMatrixT!)
         }
-        let W = jlMatrix!  // [contentDim, dHead]
+        let W = jlMatrix!
+        let WT = jlMatrixT!
         // [nh, dHead] @ [dHead, contentDim] = [nh, contentDim]
-        let contentQ = matmul(q.asType(.float32), W.transposed(1, 0))
+        let contentQ = matmul(q.asType(.float32), WT)
         guard config.usesTrigFeatures else { return contentQ }
         let trigQ = broadcast(
             retrievalAttentionTrigFeatures(
