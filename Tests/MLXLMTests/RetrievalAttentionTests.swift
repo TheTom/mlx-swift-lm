@@ -2576,6 +2576,84 @@ struct RetrievalAttentionTests {
         #expect(matches >= decodeSteps - 1, "default config (adaptive) should match F-41 fix")
     }
 
+    // F-43: profile decode-step latency dense vs RA on 14B-1M at 24K.
+    // RA should be faster because the gather is ~25% of cache; the SDPA
+    // call sees a smaller K matrix.
+    @Test func trainedQwen25_14B_1M_LatencyProfile() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 24576
+        let decodeSteps = 32
+        MLXRandom.seed(0x14B6)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+
+        // Run dense path: prefill + 32 decode steps, total time.
+        let dn = model.newCache(parameters: nil)
+        _ = model(prefillTokens, cache: dn)
+        eval(dn.flatMap { $0.state })
+        var dnNext = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+        let dnStart = Date()
+        for _ in 0..<decodeSteps {
+            let logits = model(dnNext, cache: dn)
+            dnNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            eval(dnNext)
+        }
+        let dnTotal = Date().timeIntervalSince(dnStart)
+
+        // Run RA path: prefill + 32 decode steps.
+        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        _ = model(prefillTokens, cache: ra)
+        eval(ra.flatMap { $0.state })
+        var raNext = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+        let raStart = Date()
+        for _ in 0..<decodeSteps {
+            let logits = model(raNext, cache: ra)
+            raNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            eval(raNext)
+        }
+        let raTotal = Date().timeIntervalSince(raStart)
+
+        let dnPerStep = dnTotal / Double(decodeSteps)
+        let raPerStep = raTotal / Double(decodeSteps)
+        let speedup = dnPerStep / raPerStep
+        print(
+            "[F-43-latency-24K] dense_total=\(String(format: "%.3f", dnTotal))s "
+                + "ra_total=\(String(format: "%.3f", raTotal))s "
+                + "dn_per_step=\(String(format: "%.4f", dnPerStep))s "
+                + "ra_per_step=\(String(format: "%.4f", raPerStep))s "
+                + "speedup=\(String(format: "%.2fx", speedup))"
+        )
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
