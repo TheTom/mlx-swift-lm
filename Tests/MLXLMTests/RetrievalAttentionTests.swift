@@ -4151,9 +4151,263 @@ struct RetrievalAttentionTests {
             sumCos += Double(cos)
             if cos < minCos { minCos = cos }
         }
+        let meanCos = sumCos / Double(nSteps)
         print("[F-79-dense-noise-49K] dense vs dense steps=\(nSteps) "
-            + "mean_cosine=\(String(format: "%.5f", sumCos / Double(nSteps))) "
+            + "mean_cosine=\(String(format: "%.5f", meanCos)) "
             + "min_cosine=\(String(format: "%.5f", minCos))")
+        // F-80 regression lock: TheTom/mlx allocator zero-on-recycle
+        // patch must keep two-run dense determinism bit-exact at 49K.
+        // Pre-fix: 0.34 mean, 0.14 min. Post-fix: 1.0 / 1.0.
+        #expect(meanCos >= 0.99999, "F-80 cliff regressed: mean_cosine=\(meanCos)")
+        #expect(minCos >= 0.99999, "F-80 cliff regressed: min_cosine=\(minCos)")
+    }
+
+    // F-80 isolation: which layer of the model forward starts to
+    // diverge between two identical prefill runs?
+    // Compares K-cache snapshots between two fresh prefills, layer-by-
+    // layer, to pinpoint where bit-identical inputs first stop
+    // producing bit-identical outputs.
+    @Test func denseCliffLayerIsolation_49K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 49_151
+        MLXRandom.seed(0x4910)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+
+        func runPrefillAndSnapshot() -> [(keys: MLXArray, values: MLXArray)] {
+            let cache = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: cache)
+            eval(cache.flatMap { $0.state })
+            var snap: [(keys: MLXArray, values: MLXArray)] = []
+            for c in cache {
+                let s = c.state
+                snap.append((keys: s[0], values: s[1]))
+            }
+            return snap
+        }
+
+        let a = runPrefillAndSnapshot()
+        let b = runPrefillAndSnapshot()
+        #expect(a.count == b.count, "layer count mismatch")
+        for layer in 0..<a.count {
+            let aK = a[layer].keys.reshaped(a[layer].keys.size).asType(.float32)
+            let bK = b[layer].keys.reshaped(b[layer].keys.size).asType(.float32)
+            let diff = (aK - bK).abs()
+            let maxDiff = diff.max().asArray(Float.self)[0]
+            let meanDiff = diff.mean().asArray(Float.self)[0]
+            let dot = (aK * bK).sum().asArray(Float.self)[0]
+            let an = sqrt((aK * aK).sum()).asArray(Float.self)[0]
+            let bn = sqrt((bK * bK).sum()).asArray(Float.self)[0]
+            let cos = dot / (an * bn + 1e-12)
+            print("[F-80-layer-iso] layer=\(layer) "
+                + "cosine=\(String(format: "%.6f", cos)) "
+                + "maxDiff=\(String(format: "%.4e", maxDiff)) "
+                + "meanDiff=\(String(format: "%.4e", meanDiff))")
+        }
+    }
+
+    // F-80 decode-step isolation: after identical prefill, run ONE
+    // decode step and compare K/V cache contents PLUS logits.
+    // If cache contents at position T differ → matmul is the source.
+    // If cache identical but logits differ → SDPA at decode is the source.
+    @Test func denseCliffDecodeStepIsolation_49K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 49_151
+        MLXRandom.seed(0x4910)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceToken = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+        eval(forceToken)
+
+        func runPrefillAndOneDecode() -> (cache: [KVCache], logits: MLXArray) {
+            let cache = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: cache)
+            eval(cache.flatMap { $0.state })
+            let logits = model(forceToken, cache: cache)
+            eval(logits)
+            return (cache, logits)
+        }
+
+        // Per-step decode isolation — run BOTH runs and capture per-step
+        // logits + post-step cache state.
+        func runEightDecodeSteps() -> (logitsPerStep: [MLXArray], finalCache: [KVCache]) {
+            let cache = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: cache)
+            eval(cache.flatMap { $0.state })
+            var logits: [MLXArray] = []
+            for _ in 0..<8 {
+                let l = model(forceToken, cache: cache)
+                eval(l)
+                logits.append(l)
+            }
+            return (logits, cache)
+        }
+
+        let aRun = runEightDecodeSteps()
+        let bRun = runEightDecodeSteps()
+
+        for s in 0..<8 {
+            let aL = aRun.logitsPerStep[s].reshaped(aRun.logitsPerStep[s].size).asType(.float32)
+            let bL = bRun.logitsPerStep[s].reshaped(bRun.logitsPerStep[s].size).asType(.float32)
+            let dot = (aL * bL).sum().asArray(Float.self)[0]
+            let an = sqrt((aL * aL).sum()).asArray(Float.self)[0]
+            let bn = sqrt((bL * bL).sum()).asArray(Float.self)[0]
+            let cos = dot / (an * bn + 1e-12)
+            print("[F-80-decode-iso] step=\(s) logit_cosine=\(String(format: "%.6f", cos))")
+        }
+
+        for layer in 0..<aRun.finalCache.count {
+            let aK = aRun.finalCache[layer].state[0].reshaped(aRun.finalCache[layer].state[0].size).asType(.float32)
+            let bK = bRun.finalCache[layer].state[0].reshaped(bRun.finalCache[layer].state[0].size).asType(.float32)
+            let diff = (aK - bK).abs()
+            let maxDiff = diff.max().asArray(Float.self)[0]
+            if maxDiff > 0 || layer < 3 || layer >= aRun.finalCache.count - 3 {
+                let meanDiff = diff.mean().asArray(Float.self)[0]
+                print("[F-80-decode-iso] final-Kcache layer=\(layer) maxDiff=\(String(format: "%.4e", maxDiff)) meanDiff=\(String(format: "%.4e", meanDiff))")
+            }
+        }
+    }
+
+    // F-80 standalone SDPA reproducer. No model load needed.
+    // Try to reproduce the multi-step decode cliff with synthetic Q/K/V
+    // and synthetic contention (matmul busywork between SDPA calls).
+    @Test func standaloneSDPAClliff_49K() throws {
+        MLXRandom.seed(0xC11F)
+        let B = 1
+        let nHeads = 40
+        let nKVHeads = 8
+        let D = 128
+        let S = 49152
+        // Allocate once, reuse — same K/V across A and B.
+        let k = MLXRandom.normal([B, nKVHeads, S, D]).asType(.float16)
+        let v = MLXRandom.normal([B, nKVHeads, S, D]).asType(.float16)
+        eval(k, v)
+        // Q changes per "step" but is reused between A and B.
+        let qSteps: [MLXArray] = (0..<8).map { _ in
+            MLXRandom.normal([B, nHeads, 1, D]).asType(.float16)
+        }
+        eval(qSteps)
+        // Busy tensors to simulate model-forward contention.
+        let busyA = MLXRandom.normal([1, 5120, 5120]).asType(.float16)
+        let busyB = MLXRandom.normal([1, 5120, 5120]).asType(.float16)
+        eval(busyA, busyB)
+        let scale = 1.0 / sqrt(Float(D))
+
+        func runEightSDPA() -> [MLXArray] {
+            var outs: [MLXArray] = []
+            for s in 0..<8 {
+                // Simulate per-layer matmul work (gqa proj + mlp) before SDPA.
+                let dummy = MLX.matmul(busyA, busyB)
+                eval(dummy)
+                let out = MLXFast.scaledDotProductAttention(
+                    queries: qSteps[s], keys: k, values: v,
+                    scale: scale, mask: .none
+                )
+                eval(out)
+                outs.append(out)
+            }
+            return outs
+        }
+        let aOut = runEightSDPA()
+        let bOut = runEightSDPA()
+        for s in 0..<8 {
+            let aF = aOut[s].reshaped(aOut[s].size).asType(.float32)
+            let bF = bOut[s].reshaped(bOut[s].size).asType(.float32)
+            let dot = (aF * bF).sum().asArray(Float.self)[0]
+            let an = sqrt((aF * aF).sum()).asArray(Float.self)[0]
+            let bn = sqrt((bF * bF).sum()).asArray(Float.self)[0]
+            let cos = dot / (an * bn + 1e-12)
+            let diff = (aOut[s] - bOut[s]).abs().max().asArray(Float.self)[0]
+            print("[F-80-standalone] step=\(s) cosine=\(String(format: "%.6f", cos)) maxDiff=\(String(format: "%.4e", diff))")
+        }
+    }
+
+    // F-80-H1 test: isolated quantized matmul determinism.
+    // Hypothesis (from research agent): `wo` and `down_proj` at decode
+    // route to qvm_split_k + strided_reduce which is non-deterministic
+    // across launches under GPU contention. Test directly.
+    @Test func quantMatmulDeterminism_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        // Reach into layer 0's attention and MLP modules to grab wo and down_proj.
+        let attn = model.model.layers[0].attention
+        let mlp = model.model.layers[0].mlp
+
+        MLXRandom.seed(0x4910)
+        let h = cfg.hiddenSize  // 5120 for 14B
+        let intermediateSize = cfg.intermediateSize  // 13824
+        let xWo = MLXRandom.normal([1, 1, h]).asType(.float16)
+        eval(xWo)
+        let yWoA = attn.wo(xWo); eval(yWoA)
+        let yWoB = attn.wo(xWo); eval(yWoB)
+        let dWo = (yWoA - yWoB).abs().max().asArray(Float.self)[0]
+        print("[F-80-H1] wo [1,1,\(h)]@[\(h),\(h)] maxDiff=\(String(format: "%.6e", dWo))")
+
+        let xDown = MLXRandom.normal([1, 1, intermediateSize]).asType(.float16)
+        eval(xDown)
+        let yDownA = mlp.down(xDown); eval(yDownA)
+        let yDownB = mlp.down(xDown); eval(yDownB)
+        let dDown = (yDownA - yDownB).abs().max().asArray(Float.self)[0]
+        print("[F-80-H1] down_proj [1,1,\(intermediateSize)]@[\(intermediateSize),\(h)] maxDiff=\(String(format: "%.6e", dDown))")
+
+        // Also test wq/wk/wv for comparison (should be deterministic qmv).
+        let xQ = MLXRandom.normal([1, 1, h]).asType(.float16)
+        eval(xQ)
+        let yQA = attn.wq(xQ); eval(yQA)
+        let yQB = attn.wq(xQ); eval(yQB)
+        let dQ = (yQA - yQB).abs().max().asArray(Float.self)[0]
+        print("[F-80-H1] wq [1,1,\(h)]@[\(h),\(h)] maxDiff=\(String(format: "%.6e", dQ))")
     }
 
     // MLX non-determinism floor test at 49K: run amort=1 TWICE and

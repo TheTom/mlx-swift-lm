@@ -1,5 +1,94 @@
 import Foundation
 import MLX
+import MLXNN
+
+/// F-80 cliff investigation: deterministic matmul-based SDPA fallback.
+/// Set `MLX_DETERMINISTIC_SDPA=1` to route ALL attention calls through
+/// explicit matmul + softmax + matmul instead of `MLXFast.scaledDotProductAttention`.
+/// Used to isolate whether the long-context decode cliff is in MLX's
+/// SDPA kernels or elsewhere in the pipeline.
+nonisolated(unsafe) private let _deterministicSDPAEnabled: Bool = {
+    if let env = ProcessInfo.processInfo.environment["MLX_DETERMINISTIC_SDPA"] {
+        return env == "1" || env.lowercased() == "true"
+    }
+    return false
+}()
+
+/// Hand-rolled matmul-based attention. Bypasses `MLXFast.scaledDotProductAttention`.
+/// Expected to be bit-deterministic across launches if matmul + softmax are themselves
+/// deterministic (Tom's earlier quant-matmul cold test confirms matmul is deterministic).
+/// - q: [B, nHeads, L, D]
+/// - k: [B, nKVHeads, S, D]
+/// - v: [B, nKVHeads, S, D]
+/// - mask: optional additive mask, broadcastable to [B, nHeads, L, S]
+/// Returns: [B, nHeads, L, D]
+private func matmulSDPA(
+    queries q: MLXArray,
+    keys k: MLXArray,
+    values v: MLXArray,
+    scale: Float,
+    mask: MLXArray?
+) -> MLXArray {
+    let B = q.dim(0)
+    let nHeads = q.dim(1)
+    let L = q.dim(2)
+    let D = q.dim(3)
+    let nKVHeads = k.dim(1)
+    let S = k.dim(2)
+    let vD = v.dim(3)
+
+    // GQA-aware matmul without materializing nHeads-broadcast K/V.
+    // Trick: reshape q to [B, nKVHeads, factor*L, D], matmul with k.T
+    // (no broadcasting needed), reshape result back.
+    let factor = nHeads / nKVHeads
+    let qR = q.reshaped([B, nKVHeads, factor * L, D])
+    let kT = k.swappedAxes(-2, -1)  // [B, nKVHeads, D, S]
+    var scoresR = MLX.matmul(qR, kT) * scale  // [B, nKVHeads, factor*L, S]
+    if let mask = mask {
+        // Mask shape varies. For [B, nHeads, L, S] mask, reshape to
+        // [B, nKVHeads, factor*L, S]. For [B, 1, L, S] or [1, 1, L, S],
+        // broadcast handles it.
+        if mask.dim(1) == nHeads {
+            scoresR = scoresR + mask.reshaped([B, nKVHeads, factor * L, S])
+        } else {
+            scoresR = scoresR + mask
+        }
+    }
+    let probsR = MLX.softmax(scoresR, axis: -1, precise: true)
+    let outR = MLX.matmul(probsR, v)  // [B, nKVHeads, factor*L, vD]
+    return outR.reshaped([B, nHeads, L, vD])
+}
+
+/// Convert an SDPA mask mode to an additive mask MLXArray, or nil for `.none`.
+/// - q: query tensor for shape context
+/// - S: total key sequence length
+private func sdpaMaskToAdditive(
+    _ mode: MLXFast.ScaledDotProductAttentionMaskMode,
+    qShape: (Int, Int, Int, Int),
+    S: Int,
+    dtype: DType
+) -> MLXArray? {
+    switch mode {
+    case .none:
+        return nil
+    case .causal:
+        // [B, nHeads, L, S] additive mask — -inf above diagonal aligned to S.
+        let (_, _, L, _) = qShape
+        let qIdx = MLXArray(0..<Int32(L)).reshaped([L, 1])
+        let kIdx = MLXArray(0..<Int32(S)).reshaped([1, S])
+        let offset = S - L
+        let causal = (kIdx .> (qIdx + Int32(offset)))
+        let inf = MLXArray(Float(-1e30)).asType(dtype)
+        let zero = MLXArray(Float(0)).asType(dtype)
+        return MLX.`where`(causal, inf, zero)
+    case .array(let m):
+        return m
+    case .arrays(let arr):
+        return arr.first
+    @unknown default:
+        return nil
+    }
+}
 
 /// Attention utilities that match Python mlx-lm's interface
 ///
@@ -338,6 +427,21 @@ public func attentionWithCacheUpdate(
         let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         BenchmarkSignpost.end(updH)
+        if _deterministicSDPAEnabled && queries.dim(2) == 1 {
+            // F-80 cliff investigation. Replace MLXFast.SDPA with matmul+softmax+matmul
+            // only at decode (L=1). Prefill uses steel attention which is deterministic.
+            // sinks unsupported on this path (no Qwen2 uses sinks).
+            return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                let qS = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
+                let addMask = sdpaMaskToAdditive(
+                    mask, qShape: qS, S: cachedKeys.dim(2), dtype: queries.dtype
+                )
+                return matmulSDPA(
+                    queries: queries, keys: cachedKeys, values: cachedValues,
+                    scale: scale, mask: addMask
+                )
+            }
+        }
         return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
             MLXFast.scaledDotProductAttention(
                 queries: queries,
