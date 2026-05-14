@@ -485,6 +485,57 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         }
     }
 
+    /// F-77 build-mask via parallel bundle (projectQ + score+topK in
+    /// one launch) + F-73 mask kernel. Per layer: 2 kernel dispatches
+    /// + 2 small MLX ops (q.take + cache update) — total ~4 ops/layer
+    /// vs F-73's 5.
+    public func buildAttentionMaskFusedParallelBundleKernel(
+        q: MLXArray, dtype: DType, T: Int
+    ) -> MLXArray {
+        precondition(q.shape.count == 2, "expected [nHeads, dHead]")
+        guard let index = batchedIndex else {
+            fatalError("indices not initialized; call update first")
+        }
+        guard let jlW = index.jlW,
+              let fineFeatures = index.fineBlockFeatures,
+              let coarseFeatures = index.coarseBlockFeatures
+        else {
+            return buildAttentionMaskFusedKernel(q: q, dtype: dtype, T: T)
+        }
+        let nKVH = index.nKVHeads
+        let groupSize = q.dim(0) / nKVH
+        let nFine = fineFeatures.dim(1)
+        let nCoarse = coarseFeatures.dim(1)
+        let isPow2 = { (n: Int) in n > 0 && (n & (n - 1)) == 0 }
+        if !(isPow2(nFine) && nFine <= 1024 && isPow2(nCoarse) && nCoarse <= 1024) {
+            return buildAttentionMaskFusedKernel(q: q, dtype: dtype, T: T)
+        }
+        let kFine = min(raConfig.effectiveFineTopK(seqLen: T), nFine)
+        let kCoarse = raConfig.coarseRescueEnabled
+            ? min(raConfig.coarseTopK, nCoarse) : 0
+        guard kCoarse > 0 else {
+            return buildAttentionMaskFusedKernel(q: q, dtype: dtype, T: T)
+        }
+        let qF32 = q.asType(.float32)
+        let (fineStarts, coarseStarts) = retrievalAttentionParallelBundle(
+            q: qF32, jlW: jlW,
+            fineFeatures: fineFeatures, coarseFeatures: coarseFeatures,
+            groupSize: groupSize,
+            kFine: kFine, kCoarse: kCoarse,
+            fineBlockSize: raConfig.fineBlockSize,
+            coarseBlockSize: raConfig.coarseBlockSize
+        )
+        return retrievalAttentionBuildMaskFused(
+            fineStarts: fineStarts, coarseStarts: coarseStarts,
+            T: T,
+            staticInit: raConfig.staticInit,
+            slidingWindow: raConfig.slidingWindow,
+            fineBS: raConfig.fineBlockSize,
+            coarseBS: raConfig.coarseBlockSize,
+            outputDtype: dtype
+        )
+    }
+
     /// F-75 build-mask via parallel score+topK kernel. Per layer:
     /// projectQ (MLX matmul) + F-75 (one kernel for both fine and
     /// coarse, 2×NKVH threadgroups concurrent) + F-73 mask. Total

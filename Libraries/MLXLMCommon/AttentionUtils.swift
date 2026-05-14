@@ -206,6 +206,20 @@ public func attentionWithCacheUpdate(
                     )
                 }
             }
+            if raCache.raConfig.useParallelBundleSelector {
+                // F-77 — projectQ folded into parallel fine+coarse score
+                // kernel, then F-73 mask. 2 dispatches per sparse layer.
+                let T = cachedKeys.dim(2)
+                let raMask = raCache.buildAttentionMaskFusedParallelBundleKernel(
+                    q: qFlat, dtype: cachedKeys.dtype, T: T
+                )
+                return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                    MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: cachedKeys, values: cachedValues,
+                        scale: scale, mask: .array(raMask), sinks: sinks
+                    )
+                }
+            }
             if raCache.raConfig.useImplicitSparseSDPA && sinks == nil {
                 // F-76 — sparse SDPA with implicit position expansion.
                 // 2 kernel dispatches per layer (F-75 selector + F-76 SDPA),

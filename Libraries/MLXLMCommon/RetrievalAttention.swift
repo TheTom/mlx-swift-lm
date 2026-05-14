@@ -199,6 +199,12 @@ public struct RetrievalAttentionConfig: Sendable {
     /// benches confirm a measurable win over the F-59 mask path.
     public var usePerKVHeadGather: Bool = false
 
+    /// F-77 — projectQ + parallel fine+coarse score+topK in ONE Metal
+    /// kernel (F-74's matmul fold + F-75's parallel layout), followed
+    /// by F-73 mask kernel. 2 kernel dispatches per layer + 1 cache
+    /// update. Targets the ~1.2ms of MLX-matmul dispatch overhead.
+    public var useParallelBundleSelector: Bool = false
+
     /// F-76 implicit-positions sparse SDPA — the no-mask terminal path.
     /// Per layer: F-75 parallel score+topK kernel + F-76 sparse SDPA
     /// kernel = 2 fused dispatches (vs F-73's 4). Skips mask

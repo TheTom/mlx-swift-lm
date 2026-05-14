@@ -3444,6 +3444,156 @@ struct RetrievalAttentionTests {
         #expect(diff < 1e-3, "F-71 kernel max_abs_diff \(diff)")
     }
 
+    // F-77 correctness: parallel bundle (projectQ + score+topK) +
+    // F-73 mask vs F-59 reference. Bit-exact (projQ matmul inlined in
+    // Metal kernel).
+    @Test func parallelBundleMatchesReference() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let seqLen = 17_000
+        MLXRandom.seed(0xF77A)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        var refCfg = RetrievalAttentionConfig()
+        refCfg.useMaskedDense = true
+        refCfg.useFusedMaskBuild = false
+        let raRef: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: refCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raRef)
+        let refLog = model(nextTok, cache: raRef)
+        eval(refLog)
+
+        var f77Cfg = RetrievalAttentionConfig()
+        f77Cfg.useParallelBundleSelector = true
+        let raF77: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: f77Cfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raF77)
+        let f77Log = model(nextTok, cache: raF77)
+        eval(f77Log)
+
+        let r = refLog.reshaped(refLog.size).asType(.float32)
+        let f = f77Log.reshaped(f77Log.size).asType(.float32)
+        let dot = (r * f).sum().asArray(Float.self)[0]
+        let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+        let fn = sqrt((f * f).sum()).asArray(Float.self)[0]
+        let cosine = dot / (rn * fn + 1e-12)
+        let diff = (r - f).abs().max().asArray(Float.self)[0]
+        print("[F-77-parallel-bundle-vs-mask] seqLen=\(seqLen) cosine=\(cosine) max_abs_diff=\(diff)")
+        #expect(cosine >= 0.999, "F-77 cosine \(cosine)")
+    }
+
+    // F-77 latency vs F-73 on 14B-1M @ 32K.
+    @Test func parallelBundleLatency_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32767
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runOne(mode: String) -> Double {
+            let caches: [KVCache]
+            switch mode {
+            case "dense":
+                caches = (0..<cfg.hiddenLayers).map { _ in StandardKVCache() }
+            case "F-73":
+                let raConf = RetrievalAttentionConfig()  // default
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            case "F-77":
+                var raConf = RetrievalAttentionConfig()
+                raConf.useParallelBundleSelector = true
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            default: fatalError("bad mode")
+            }
+            MLXRandom.seed(0x7700)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        let denseMs = runOne(mode: "dense")
+        let f73Ms = runOne(mode: "F-73")
+        let f77Ms = runOne(mode: "F-77")
+        let savedVsF73 = f73Ms - f77Ms
+        print(
+            "[F-77-latency] T=32K "
+                + "dense=\(String(format: "%.1f", denseMs)) "
+                + "F-73=\(String(format: "%.1f", f73Ms)) "
+                + "F-77=\(String(format: "%.1f", f77Ms)) | "
+                + "F-77-overhead=\(String(format: "%.1f", f77Ms - denseMs))ms "
+                + "saved-vs-F-73=\(String(format: "%.1f", savedVsF73))ms"
+        )
+    }
+
     // F-76 correctness: implicit-positions sparse SDPA vs F-59 mask
     // path. F-76 has slight dup over-counting (static + sliding overlap
     // with topK blocks contributes softmax weight twice) — cosine
