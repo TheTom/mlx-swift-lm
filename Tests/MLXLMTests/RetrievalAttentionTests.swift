@@ -1731,6 +1731,252 @@ struct RetrievalAttentionTests {
         }
     }
 
+    // F-29: structured / periodic token prompt at 32K. Hypothesis: F-28's
+    // 32K random-token cliff is a harness artifact — Qwen3-0.6B produces
+    // unpredictable distributions on random tokens at 32K, not an RA
+    // architectural failure. Structured tokens with periodic content should
+    // produce attention with clear high-mass positions; selector should
+    // recover near-dense cosine.
+    @Test func trainedQwen3DispatcherStructuredAt32K() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        // Build a structured 32K token sequence: 128 unique tokens repeated
+        // 256 times. Strong periodic content — every 128th position has the
+        // same token; attention should naturally concentrate on positions
+        // matching the query's local context.
+        let seqLen = 32768
+        let period = 128
+        MLXRandom.seed(0xDEAD)
+        let seedTokensMlx = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [period]
+        ).asType(.int32)
+        let seedTokens = seedTokensMlx.asArray(Int32.self)
+        var structured = [Int32]()
+        structured.reserveCapacity(seqLen)
+        for _ in 0..<(seqLen / period) {
+            structured.append(contentsOf: seedTokens)
+        }
+        let tokens = MLXArray(structured).reshaped(1, seqLen)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        let dn = model.newCache(parameters: nil)
+        _ = model(tokens, cache: dn)
+        let dnLog = model(nextTok, cache: dn)
+
+        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: ra)
+        let raLog = model(nextTok, cache: ra)
+
+        let dFlat = dnLog.reshaped(dnLog.size).asType(.float32)
+        let rFlat = raLog.reshaped(raLog.size).asType(.float32)
+        let dot = (dFlat * rFlat).sum().asArray(Float.self)[0]
+        let dnN = sqrt((dFlat * dFlat).sum()).asArray(Float.self)[0]
+        let rnN = sqrt((rFlat * rFlat).sum()).asArray(Float.self)[0]
+        let cosine = dot / (dnN * rnN + 1e-12)
+        print(
+            "[F-29-structured-32K] seqLen=\(seqLen) period=\(period) "
+                + "cosine=\(cosine) dn_norm=\(dnN) ra_norm=\(rnN)"
+        )
+        // If hypothesis holds: should land back near 0.99+ as at 8K-28K.
+        #expect(cosine >= 0.5, "structured 32K cosine \(cosine) below 0.5 floor")
+    }
+
+    // F-30: massive-coverage 32K test. If we give the selector enough rope
+    // to grab nearly the WHOLE cache, the gather path should match dense to
+    // numerical precision. If it doesn't, the bug is in the dispatcher /
+    // index path, not the selector quality.
+    @Test func trainedQwen3DispatcherMassiveCoverageAt32K() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let seqLen = 32768
+        MLXRandom.seed(0xC0DE)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        let dn = model.newCache(parameters: nil)
+        _ = model(tokens, cache: dn)
+        let dnLog = model(nextTok, cache: dn)
+
+        // Massive coverage: 500 fine blocks * 64 = 32K. Sliding window
+        // 16K = half the cache. Effectively forces gather ≈ whole cache.
+        var raCfg = RetrievalAttentionConfig()
+        raCfg.fineTopK = 500
+        raCfg.slidingWindow = 16384
+        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: raCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: ra)
+        let raLog = model(nextTok, cache: ra)
+
+        let dFlat = dnLog.reshaped(dnLog.size).asType(.float32)
+        let rFlat = raLog.reshaped(raLog.size).asType(.float32)
+        let dot = (dFlat * rFlat).sum().asArray(Float.self)[0]
+        let dnN = sqrt((dFlat * dFlat).sum()).asArray(Float.self)[0]
+        let rnN = sqrt((rFlat * rFlat).sum()).asArray(Float.self)[0]
+        let cosine = dot / (dnN * rnN + 1e-12)
+        print(
+            "[F-30-massive-32K] seqLen=\(seqLen) "
+                + "fineTopK=\(raCfg.fineTopK) sliding=\(raCfg.slidingWindow) "
+                + "cosine=\(cosine) dn_norm=\(dnN) ra_norm=\(rnN)"
+        )
+        // If cosine ≥ 0.99, the cliff is selector-quality. If still low,
+        // the cliff is structural (dispatcher / index path).
+        #expect(cosine >= 0.0, "diagnostic only — checking sign for now")
+    }
+
+    // F-31: dense-vs-dense determinism check at 32K. F-30 showed massive
+    // gather coverage still produces cosine 0.155 at 32K, suggesting a
+    // structural problem unrelated to selector quality. First sanity:
+    // is the model itself deterministic at 32K? Run dense twice with the
+    // same inputs; cosine should be 1.0 — anything else means the test
+    // harness is poisoning the comparison.
+    @Test func trainedQwen3DenseDeterminismAt32K() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let seqLen = 32768
+        MLXRandom.seed(0xFEED)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        let dn1 = model.newCache(parameters: nil)
+        _ = model(tokens, cache: dn1)
+        let l1 = model(nextTok, cache: dn1)
+        let dn2 = model.newCache(parameters: nil)
+        _ = model(tokens, cache: dn2)
+        let l2 = model(nextTok, cache: dn2)
+
+        let f1 = l1.reshaped(l1.size).asType(.float32)
+        let f2 = l2.reshaped(l2.size).asType(.float32)
+        let diff = (f1 - f2).abs().max().asArray(Float.self)[0]
+        let dot = (f1 * f2).sum().asArray(Float.self)[0]
+        let n1 = sqrt((f1 * f1).sum()).asArray(Float.self)[0]
+        let n2 = sqrt((f2 * f2).sum()).asArray(Float.self)[0]
+        let cosine = dot / (n1 * n2 + 1e-12)
+        print(
+            "[F-31-dense-determinism-32K] max_abs_diff=\(diff) "
+                + "cosine=\(cosine) n1=\(n1) n2=\(n2)"
+        )
+        #expect(diff < 1e-3, "dense-vs-dense at 32K should match; diff=\(diff)")
+    }
+
+    // F-32: dense-vs-dense determinism sweep — find the context length
+    // where the model becomes non-deterministic. F-31 found 32K is broken;
+    // need to know if 28K, 24K, 16K are also affected.
+    @Test func trainedQwen3DenseDeterminismSweep() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        for seqLen in [8192, 16384, 24576, 28672, 32768] {
+            MLXRandom.seed(UInt64(0xBEEF + seqLen))
+            let tokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, seqLen]
+            ).asType(.int32)
+            let nextTok = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            let a = model.newCache(parameters: nil)
+            _ = model(tokens, cache: a)
+            let aLog = model(nextTok, cache: a)
+            let b = model.newCache(parameters: nil)
+            _ = model(tokens, cache: b)
+            let bLog = model(nextTok, cache: b)
+            let f1 = aLog.reshaped(aLog.size).asType(.float32)
+            let f2 = bLog.reshaped(bLog.size).asType(.float32)
+            let diff = (f1 - f2).abs().max().asArray(Float.self)[0]
+            let dot = (f1 * f2).sum().asArray(Float.self)[0]
+            let n1 = sqrt((f1 * f1).sum()).asArray(Float.self)[0]
+            let n2 = sqrt((f2 * f2).sum()).asArray(Float.self)[0]
+            let cosine = dot / (n1 * n2 + 1e-12)
+            print(
+                "[F-32-dense-determinism] seqLen=\(seqLen) "
+                    + "max_abs_diff=\(diff) cosine=\(cosine)"
+            )
+        }
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
