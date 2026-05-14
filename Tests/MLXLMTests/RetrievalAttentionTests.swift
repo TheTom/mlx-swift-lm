@@ -3201,6 +3201,60 @@ struct RetrievalAttentionTests {
         )
     }
 
+    // F-66: memory footprint RA vs dense on 14B-1M @ 24K.
+    @Test func trainedQwen25_14B_1M_MemoryProfile() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 24576
+        MLXRandom.seed(0x6666)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+
+        // Dense.
+        MLX.GPU.resetPeakMemory()
+        let dn = model.newCache(parameters: nil)
+        _ = model(prefillTokens, cache: dn)
+        eval(dn.flatMap { $0.state })
+        let densePeakMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+
+        // RA.
+        MLX.GPU.resetPeakMemory()
+        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        _ = model(prefillTokens, cache: ra)
+        eval(ra.flatMap { $0.state })
+        let raPeakMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+
+        let overheadMB = raPeakMB - densePeakMB
+        let overheadPct = (overheadMB / densePeakMB) * 100
+        print(
+            "[F-66-memory] prefill=\(prefillLen) "
+                + "dense_peak_MB=\(String(format: "%.1f", densePeakMB)) "
+                + "ra_peak_MB=\(String(format: "%.1f", raPeakMB)) "
+                + "overhead_MB=\(String(format: "%.1f", overheadMB)) "
+                + "overhead_pct=\(String(format: "%.1f", overheadPct))%"
+        )
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
