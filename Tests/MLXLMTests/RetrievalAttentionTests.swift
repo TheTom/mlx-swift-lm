@@ -3599,6 +3599,171 @@ struct RetrievalAttentionTests {
         print(line)
     }
 
+    // F-79 49K disambiguation — compare amort=1 vs amort=16 directly
+    // via force-feed at 49K (where the multi-ctx vs-dense test showed
+    // 0/8 argmax match). If amort=1 ≡ amort=16, the F-79 amortization
+    // is fine and the 49K-vs-dense divergence is RA's inherent
+    // approximation gap (MLX fallback path on nBlocks=768).
+    @Test func selectorAmortizationVsAmort1_49K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 49_151
+        let nSteps = 16
+        MLXRandom.seed(0x49DB)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+
+        // Reference: amort=1
+        var refConf = RetrievalAttentionConfig()
+        refConf.selectorAmortization = 1
+        let raRef: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: refConf, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(prefillTokens, cache: raRef)
+        eval(raRef.flatMap { $0.state })
+        var refLogits: [MLXArray] = []
+        for s in 0..<nSteps {
+            let logits = model(forceTokens[s], cache: raRef)
+            eval(logits)
+            refLogits.append(logits)
+        }
+
+        for amort in [16, 32, 64] {
+            var aConf = RetrievalAttentionConfig()
+            aConf.selectorAmortization = amort
+            let raA: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: aConf, ropeBase: cfg.ropeTheta)
+            }
+            _ = model(prefillTokens, cache: raA)
+            eval(raA.flatMap { $0.state })
+            var sumCos: Double = 0
+            var minCos: Float = 1.0
+            for s in 0..<nSteps {
+                let logits = model(forceTokens[s], cache: raA)
+                eval(logits)
+                let r = refLogits[s].reshaped(refLogits[s].size).asType(.float32)
+                let a = logits.reshaped(logits.size).asType(.float32)
+                let dot = (r * a).sum().asArray(Float.self)[0]
+                let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+                let an = sqrt((a * a).sum()).asArray(Float.self)[0]
+                let cos = dot / (rn * an + 1e-12)
+                sumCos += Double(cos)
+                if cos < minCos { minCos = cos }
+            }
+            print("[F-79-49K-vs-a1] amort=\(amort) "
+                + "mean_cosine=\(String(format: "%.5f", sumCos / Double(nSteps))) "
+                + "min_cosine=\(String(format: "%.5f", minCos))")
+        }
+    }
+
+    // F-79 multi-context regression — verify amort=16 default holds
+    // quality across PRD context targets (16K, 32K, 49K) against
+    // dense reference. Argmax-match and mean cosine.
+    @Test func selectorAmortizationMultiContext_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let nSteps = 8
+
+        for prefillLen in [16384, 32767, 49151] {
+            MLXRandom.seed(0x14B6)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            let startNext = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+
+            // Dense reference
+            let dn = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: dn)
+            eval(dn.flatMap { $0.state })
+            var dnNext = startNext
+            var dnTokens: [Int32] = []
+            var dnLogits: [MLXArray] = []
+            for _ in 0..<nSteps {
+                let logits = model(dnNext, cache: dn)
+                eval(logits)
+                dnLogits.append(logits)
+                let tok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                dnTokens.append(tok.asArray(Int32.self)[0])
+                dnNext = tok
+            }
+
+            // RA with default (amort=16)
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    ropeBase: cfg.ropeTheta)
+            }
+            _ = model(prefillTokens, cache: ra)
+            eval(ra.flatMap { $0.state })
+            var raNext = startNext
+            var matches = 0
+            var sumCos: Double = 0
+            for s in 0..<nSteps {
+                let logits = model(raNext, cache: ra)
+                eval(logits)
+                let d = dnLogits[s].reshaped(dnLogits[s].size).asType(.float32)
+                let r = logits.reshaped(logits.size).asType(.float32)
+                let dot = (d * r).sum().asArray(Float.self)[0]
+                let dn_ = sqrt((d * d).sum()).asArray(Float.self)[0]
+                let rn_ = sqrt((r * r).sum()).asArray(Float.self)[0]
+                sumCos += Double(dot / (dn_ * rn_ + 1e-12))
+                let rTok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                if rTok.asArray(Int32.self)[0] == dnTokens[s] { matches += 1 }
+                raNext = rTok
+            }
+            print("[F-79-multi-ctx] prefill=\(prefillLen) "
+                + "argmax_match=\(matches)/\(nSteps) "
+                + "mean_cosine=\(String(format: "%.5f", sumCos / Double(nSteps)))")
+        }
+    }
+
     // F-79 force-fed long-horizon quality — 32 decode steps at amort
     // values, force-feeding the SAME token sequence to all paths so
     // per-step logit cosine measures pure model divergence under
