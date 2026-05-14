@@ -162,10 +162,10 @@ public final class BatchedRetrievalAttentionIndex {
                 isFine: false, featureDim: featureDim, multiToken: L > 1
             )
         }
-        // Single eval at end of update — materializes the in-place writes
-        // (the buffer assignment is lazy under MLX).
-        eval(perTokenFeatures!, fineBlockBuffer!)
-        if let cb = coarseBlockBuffer { eval(cb) }
+        // No explicit eval — in-place writes into pre-allocated buffers
+        // don't accumulate a deep graph chain like the old concat-based
+        // path did. The next consumer (asArray in topKBlockStartsCombined)
+        // will materialize the dependent block-buffer reads naturally.
     }
 
     /// In-place block-pool update onto a pre-allocated buffer.
