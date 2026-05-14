@@ -635,11 +635,18 @@ struct RetrievalAttentionTests {
             let lambdaPos: Float
             let sentinel: Bool
         }
-        let setups: [Setup] = [
-            Setup(label: "λ=0, mean", lambdaPos: 0.0, sentinel: false),
-            Setup(label: "λ=0, sent", lambdaPos: 0.0, sentinel: true),
-            Setup(label: "λ=0.25,sent", lambdaPos: 0.25, sentinel: true),
-            Setup(label: "λ=0.5, sent", lambdaPos: 0.5, sentinel: true),
+        struct CoarseSetup {
+            let label: String
+            let lambdaPos: Float
+            let sentinel: Bool
+            let coarse: Bool
+            let coarseTopK: Int
+        }
+        let setups: [CoarseSetup] = [
+            CoarseSetup(label: "λ=0,sent", lambdaPos: 0.0, sentinel: true, coarse: false, coarseTopK: 0),
+            CoarseSetup(label: "λ=0,sent,coa1", lambdaPos: 0.0, sentinel: true, coarse: true, coarseTopK: 1),
+            CoarseSetup(label: "λ=0,sent,coa2", lambdaPos: 0.0, sentinel: true, coarse: true, coarseTopK: 2),
+            CoarseSetup(label: "λ=0,sent,coa4", lambdaPos: 0.0, sentinel: true, coarse: true, coarseTopK: 4),
         ]
 
         let topK = 8
@@ -674,7 +681,9 @@ struct RetrievalAttentionTests {
 
                 var raCfg = RetrievalAttentionConfig()
                 raCfg.fineTopK = topK
-                raCfg.coarseRescueEnabled = false
+                raCfg.coarseRescueEnabled = setup.coarse
+                raCfg.coarseTopK = setup.coarseTopK
+                raCfg.coarseBlockSize = 256  // tighter than 1024 for 2K context
                 raCfg.lambdaPos = setup.lambdaPos
                 raCfg.fineBlockSize = blockSize
                 raCfg.sentinelEnabled = setup.sentinel
@@ -684,8 +693,22 @@ struct RetrievalAttentionTests {
                 )
                 idx.update(newK: head0K)
                 let projQ = idx.projectQuery(qNorm)
-                let sparseTop = idx.topKFineBlockStarts(against: projQ)
-                let overlap = Set(sparseTop).intersection(Set(denseTop))
+                var sparseTop = Set(idx.topKFineBlockStarts(against: projQ))
+
+                // Coarse rescue: take top coarse blocks (size 256), then
+                // map each to the 64-token fine block at its start.
+                if setup.coarse {
+                    let coarseStarts = idx.topKCoarseBlockStarts(against: projQ)
+                    for cs in coarseStarts {
+                        // Add all fine block starts within this coarse block.
+                        for offset in stride(from: 0, to: raCfg.coarseBlockSize, by: blockSize) {
+                            let s = cs + offset
+                            if s < seqLen { sparseTop.insert(s) }
+                        }
+                    }
+                }
+
+                let overlap = sparseTop.intersection(Set(denseTop))
                 recalls.append(Float(overlap.count) / Float(topK))
                 let needleBlock = (needlePos / blockSize) * blockSize
                 if sparseTop.contains(needleBlock) { plantedRecovered += 1 }
@@ -700,10 +723,10 @@ struct RetrievalAttentionTests {
             let stdStr = String(format: "%.1f", stddev * 100)
             let plantedStr = String(format: "%.0f", plantedRate * 100)
             let labelStr = setup.label.padding(
-                toLength: 14, withPad: " ", startingAt: 0
+                toLength: 16, withPad: " ", startingAt: 0
             )
             print(
-                "[F-18-trained-qwen3-ablation] \(labelStr) recall=\(recallStr)% ± \(stdStr) planted=\(plantedStr)%"
+                "[F-18-trained-qwen3-coarse] \(labelStr) recall=\(recallStr)% ± \(stdStr) planted=\(plantedStr)%"
             )
         }
     }
