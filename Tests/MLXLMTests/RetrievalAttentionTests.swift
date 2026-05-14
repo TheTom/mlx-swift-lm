@@ -1977,6 +1977,45 @@ struct RetrievalAttentionTests {
         }
     }
 
+    // F-33: bisect the dense-non-determinism boundary precisely. Tests
+    // seqLen ∈ {30000, 31000, 32000, 32767, 32768, 32769, 33000} to find
+    // whether it's a hard boundary (exactly 32768) or a gradual onset.
+    @Test func trainedQwen3DenseNonDetBisect() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        for seqLen in [30000, 31000, 32000, 32500, 32767, 32768] {
+            MLXRandom.seed(UInt64(0xFADE + seqLen))
+            let tokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, seqLen]
+            ).asType(.int32)
+            // No decode-step. Compare ONLY the last position's logits to
+            // avoid materializing the full [1, seqLen, vocab] output.
+            let a = model.newCache(parameters: nil)
+            let aLog = model(tokens, cache: a)
+            let b = model.newCache(parameters: nil)
+            let bLog = model(tokens, cache: b)
+            let lastA = aLog[0, -1, 0...].asType(.float32)
+            let lastB = bLog[0, -1, 0...].asType(.float32)
+            let diff = (lastA - lastB).abs().max().asArray(Float.self)[0]
+            print("[F-33-dense-prefill-only] seqLen=\(seqLen) max_abs_diff=\(diff)")
+        }
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
