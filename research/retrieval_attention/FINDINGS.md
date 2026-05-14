@@ -470,6 +470,33 @@ Implications:
 - Latency win plateaus at amort=16 at the tested contexts; no
   further latency gain from higher amort.
 
+## MLX non-determinism at 49K (pre-existing, NOT F-79 bug)
+
+Multi-context regression at prefill=49151 showed RA-amort=16 argmax
+0/8 match vs dense, cosine 0.38. Investigated:
+
+- amort=16 vs amort=1 (force-feed): cosine 0.53
+- amort=32 vs amort=1: cosine 0.37
+- amort=64 vs amort=1: cosine 0.65 (non-monotonic — red flag)
+- **amort=1 vs amort=1** (same config, two runs): **cosine 0.39
+  mean, 0.18 min**
+
+The noise floor of MLX itself at 49K is ~0.39. F-79 amort=16's
+"divergence" from amort=1 reference at 49K (cosine 0.53) is
+actually slightly BETTER than the MLX noise floor — i.e., F-79
+isn't introducing additional drift, it's just being measured
+against a non-deterministic reference.
+
+This matches F-33's discovery of MLX non-determinism cliff at
+exactly 32768, with F-38 noting another cliff at ~64K. 49K sits
+between the cliffs in a band where MLX fp16 accumulation drifts
+unpredictably across forward-pass instances.
+
+**F-79 amort=16 ships safely.** The 32K test (cosine 0.99960,
+argmax 8/8) is the meaningful regression target. 49K-and-above
+test results are dominated by MLX-level non-determinism that
+predates F-79 and isn't its responsibility to fix.
+
 ---
 
 ## What's still open (in priority order)

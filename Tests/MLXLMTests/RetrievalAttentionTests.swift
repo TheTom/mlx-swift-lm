@@ -3599,6 +3599,82 @@ struct RetrievalAttentionTests {
         print(line)
     }
 
+    // MLX non-determinism floor test at 49K: run amort=1 TWICE and
+    // compare. If cosine is low, MLX itself is non-deterministic at
+    // 49K (F-33 cliff at 32K; probably another at ~64K), and the
+    // F-79 49K-vs-amort=1 cosine 0.53 result is noise, not a bug.
+    @Test func mlxNonDeterminismFloor_49K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 49_151
+        let nSteps = 16
+        MLXRandom.seed(0x4900)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+
+        func runAmort1() -> [MLXArray] {
+            var conf = RetrievalAttentionConfig()
+            conf.selectorAmortization = 1
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: conf, ropeBase: cfg.ropeTheta)
+            }
+            _ = model(prefillTokens, cache: ra)
+            eval(ra.flatMap { $0.state })
+            var out: [MLXArray] = []
+            for s in 0..<nSteps {
+                let logits = model(forceTokens[s], cache: ra)
+                eval(logits)
+                out.append(logits)
+            }
+            return out
+        }
+
+        let runA = runAmort1()
+        let runB = runAmort1()
+
+        var sumCos: Double = 0
+        var minCos: Float = 1.0
+        for s in 0..<nSteps {
+            let a = runA[s].reshaped(runA[s].size).asType(.float32)
+            let b = runB[s].reshaped(runB[s].size).asType(.float32)
+            let dot = (a * b).sum().asArray(Float.self)[0]
+            let an = sqrt((a * a).sum()).asArray(Float.self)[0]
+            let bn = sqrt((b * b).sum()).asArray(Float.self)[0]
+            let cos = dot / (an * bn + 1e-12)
+            sumCos += Double(cos)
+            if cos < minCos { minCos = cos }
+        }
+        print("[F-79-MLX-noise-floor] amort=1 vs amort=1 @ 49K "
+            + "mean_cosine=\(String(format: "%.5f", sumCos / Double(nSteps))) "
+            + "min_cosine=\(String(format: "%.5f", minCos))")
+    }
+
     // F-79 49K disambiguation — compare amort=1 vs amort=16 directly
     // via force-feed at 49K (where the multi-ctx vs-dense test showed
     // 0/8 argmax match). If amort=1 ≡ amort=16, the F-79 amortization
