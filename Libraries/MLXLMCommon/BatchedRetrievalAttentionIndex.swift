@@ -350,24 +350,27 @@ public final class BatchedRetrievalAttentionIndex {
 
     /// Combined fine + coarse topK in ONE asArray sync. Both topK MLX op
     /// chains stay queued, get concat'd into a single [nKVHeads, kFine +
-    /// kCoarse] tensor, and one CPU↔GPU sync pulls all the indices. Halves
-    /// the per-layer sync count vs separate fine/coarse calls.
+    /// kCoarse] tensor, and one CPU↔GPU sync pulls all the indices.
     ///
-    /// Returns fine and coarse block starts (in token coordinates) per head.
-    /// When coarseRescueEnabled is false or no coarse features exist, the
-    /// coarse arrays come back empty.
+    /// F-55: fused Metal kernel replaces the score+argPartition+slice+mul
+    /// op chain with a single dispatch when nBlocks ≤ 1024 (the kernel's
+    /// shared-memory cap). Otherwise falls back to the MLX-ops path
+    /// (topKBlockStartsMLX).
     public func topKBlockStartsAllHeadsCombined(
         projectedQ: MLXArray
     ) -> (fine: [[Int]], coarse: [[Int]]) {
         // Fine path.
-        let fineScores = scoreFineBlocksBatched(projectedQ: projectedQ)
-        let fineN = fineScores.dim(1)
+        guard let fineFeatures = fineBlockFeatures else {
+            return (Array(repeating: [], count: nKVHeads), Array(repeating: [], count: nKVHeads))
+        }
+        let fineN = fineFeatures.dim(1)
         let kFine = min(config.effectiveFineTopK(seqLen: seqLen), fineN)
         guard kFine > 0 else {
             return (Array(repeating: [], count: nKVHeads), Array(repeating: [], count: nKVHeads))
         }
-        let fineStarts = topKBlockStartsMLX(
-            scores: fineScores, k: kFine, blockSize: config.fineBlockSize
+        let fineStarts = computeTopKBlockStarts(
+            features: fineFeatures, projectedQ: projectedQ,
+            k: kFine, blockSize: config.fineBlockSize
         )
 
         // Coarse path (optional).
@@ -375,13 +378,12 @@ public final class BatchedRetrievalAttentionIndex {
         let combined: MLXArray
         var kCoarse = 0
         if hasCoarse {
-            let coarseScores = scoreBlocksBatched(
-                features: coarseBlockFeatures!, projectedQ: projectedQ
-            )
-            kCoarse = min(config.coarseTopK, coarseScores.dim(1))
+            let coarseFeatures = coarseBlockFeatures!
+            kCoarse = min(config.coarseTopK, coarseFeatures.dim(1))
             if kCoarse > 0 {
-                let coarseStarts = topKBlockStartsMLX(
-                    scores: coarseScores, k: kCoarse, blockSize: config.coarseBlockSize
+                let coarseStarts = computeTopKBlockStarts(
+                    features: coarseFeatures, projectedQ: projectedQ,
+                    k: kCoarse, blockSize: config.coarseBlockSize
                 )
                 combined = concatenated([fineStarts, coarseStarts], axis: -1)
             } else {
@@ -410,8 +412,35 @@ public final class BatchedRetrievalAttentionIndex {
         return (fine: fine, coarse: coarse)
     }
 
-    /// Build the `[nKVHeads, k]` topK block-starts MLXArray (in token
-    /// coords). Pure GPU op chain — no sync.
+    /// Compute the top-K block starts using the fused Metal kernel when
+    /// nBlocks fits within the kernel's threadgroup cap (1024), else fall
+    /// back to the score+argPartition+slice+multiply MLX op chain.
+    private func computeTopKBlockStarts(
+        features: MLXArray, projectedQ: MLXArray, k: Int, blockSize: Int
+    ) -> MLXArray {
+        let nBlocks = features.dim(1)
+        // Need a power-of-2 ≥ nBlocks for the tree reduction.
+        let nBlocksPow2 = Self.nextPowerOf2(nBlocks)
+        if nBlocksPow2 <= 1024 && nBlocks == nBlocksPow2 {
+            // Fused kernel — fits in one threadgroup.
+            return retrievalAttentionScoreTopKFused(
+                blockFeatures: features, projectedQ: projectedQ,
+                k: k, blockSize: blockSize, nBlocksRounded: nBlocksPow2
+            )
+        }
+        // Fallback: MLX ops (score + argPartition + slice + multiply).
+        let scores = scoreBlocksBatched(features: features, projectedQ: projectedQ)
+        return topKBlockStartsMLX(scores: scores, k: k, blockSize: blockSize)
+    }
+
+    private static func nextPowerOf2(_ x: Int) -> Int {
+        guard x > 1 else { return 1 }
+        var p = 1
+        while p < x { p <<= 1 }
+        return p
+    }
+
+    /// Fallback: build the `[nKVHeads, k]` topK block-starts via MLX ops.
     private func topKBlockStartsMLX(
         scores: MLXArray, k: Int, blockSize: Int
     ) -> MLXArray {
