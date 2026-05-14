@@ -49,10 +49,19 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
     sensitivity)
 - **Latency:** SHIP-READY. Phase C steps 1-4 landed.
 
-  On Qwen2.5-14B-Instruct-1M-4bit (PRD target model) at 24K context:
-  - **Decode step: dense 36ms vs RA 74ms = 2.05x slower**
-    (was 42x at F-43 baseline → 8.8x post-F-58 → **2.05x post-F-61**)
-  - **Prefill at 24K: PARITY** (dense 22.3s, RA 22.1s)
+  On Qwen2.5-14B-Instruct-1M-4bit (PRD target model), full context sweep:
+
+  | seqLen | dense | RA (mask path) | ratio (was, pre-F-58) |
+  |---|---|---|---|
+  | 4K   | 28.0ms | 30.7ms  | **1.10x** (was 1.9x)  |
+  | 8K   | 31.6ms | 64.8ms  | **2.05x** (was 17.4x) |
+  | 16K  | 35.6ms | 82.6ms  | **2.32x** (was 26.8x) |
+  | 24K  | 43.0ms | 97.0ms  | **2.25x** (was 10.5x) |
+  | 32K-1 | 65.4ms | 146.2ms | **2.24x** (was 20.0x) |
+
+  Ratio stable around 2.2x across 8K-32K. At 4K RA is essentially free
+  (gather/mask bypassed; cache size < preBudget). **Prefill at parity**
+  (dense 22.3s, RA 22.1s @ 24K).
 
   On Qwen3-0.6B-4bit at 16K:
   - Per-sparse-layer overhead 39ms → ~3ms (>90% drop)
