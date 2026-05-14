@@ -47,10 +47,16 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   - `coarseRescueEnabled = true`, top-2 (F-19)
   - `denseFirstN = denseLastN = 4` (F-25 proved this absorbs boundary
     sensitivity)
-- **Latency:** Major progress (Phase C steps 1–3). On Qwen3-0.6B-4bit
-  at 16K, per-sparse-layer overhead dropped **39ms → 5.45ms (86%)**.
-  On Qwen2.5-14B-1M at 24K, decode-step latency dropped **1559ms →
-  325ms (~80%)** — now only **8.8x slower than dense** (was 42x at F-43).
+- **Latency:** SHIP-READY. Phase C steps 1-4 landed.
+
+  On Qwen2.5-14B-Instruct-1M-4bit (PRD target model) at 24K context:
+  - **Decode step: dense 36ms vs RA 74ms = 2.05x slower**
+    (was 42x at F-43 baseline → 8.8x post-F-58 → **2.05x post-F-61**)
+  - **Prefill at 24K: PARITY** (dense 22.3s, RA 22.1s)
+
+  On Qwen3-0.6B-4bit at 16K:
+  - Per-sparse-layer overhead 39ms → ~3ms (>90% drop)
+  - F-60: gather path 126ms/step → mask path 27ms/step (4.7x speedup)
 
   Two biggest levers:
   - **F-56 (fused Metal kernel)**: replaced score+argPartition+slice+mul
@@ -73,12 +79,18 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   - **F-56: wired the fused kernel into the hot path** — 14.47 → 11.67ms
   - **F-58: bitmap CPU dedupe** — 11.67 → 5.45ms (the dark horse;
     Set<Int> at 6000+ inserts was much heavier than expected)
+  - **F-59/F-60/F-61: mask-not-gather SHIP DEFAULT** — biggest win.
+    Build [1,1,1,T] attention mask on GPU via scatter (idempotent for
+    "set to 0" → no dedupe needed) and run dense SDPA on full K.
+    Eliminates CPU dedupe + asArray sync + idx upload + take K/V chain.
+    BIT-EXACT correctness (max abs diff 0.0, cosine 1.0). 4.7x faster
+    at 16K on 0.6B; **8.8x → 2.05x** ratio vs dense on 14B-1M @ 24K.
   - + λ=0 trig-skip, single take() for head slicing, head-slice refactor
 
-  At 5.45ms/sparse-layer (0.6B) / 8ms/sparse-layer (14B) the next wins
-  live in fusing gather+SDPA into one kernel or building the attention
-  mask on GPU (eliminates the remaining asArray sync entirely). The
-  per-decode-step gap shrunk from 42x to 8.8x on 14B-1M @ 24K.
+  Phase B (correctness) + Phase C (perf) both ship-ready on the PRD
+  target. Prefill at parity; decode at 2x dense. Further wins would
+  come from per-KV-head separate gathers (rather than unioned) or
+  fusing the mask scatter into the SDPA kernel itself.
 - **Memory:** acceptable; per-layer selector index is `[nKVHeads, T, 32]`
   fp32 + small block-pooled views. At 14B-1M / 24K / 48 sparse layers:
   ~960MB selector overhead. Not great; future work could eliminate the
