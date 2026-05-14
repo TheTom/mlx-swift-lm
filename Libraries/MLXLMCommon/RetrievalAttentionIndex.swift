@@ -122,18 +122,61 @@ public final class RetrievalAttentionIndex {
             perTokenFeatures = selectorNew
         }
 
-        // Re-pool the fine + coarse indexes from scratch.
-        // v2 optimization: only re-pool the last block (the one whose
-        // tokens changed). v1 keeps it simple — full re-pool is O(T)
-        // per update step and dominated by the matmul above.
-        fineBlockFeatures = retrievalAttentionBlockMeanPool(
-            perTokenFeatures!, blockSize: config.fineBlockSize
-        )
-        if config.coarseRescueEnabled {
-            coarseBlockFeatures = retrievalAttentionBlockMeanPool(
-                perTokenFeatures!, blockSize: config.coarseBlockSize
+        // Update fine + coarse block-pooled features. Incremental for
+        // L=1 decode steps (only the tail block(s) can have changed);
+        // full re-pool only for prefill / multi-token chunks.
+        if newK.dim(0) == 1 && fineBlockFeatures != nil {
+            updateBlockTailIncremental(blockSize: config.fineBlockSize, oldSeqLen: oldSeqLen, isFine: true)
+            if config.coarseRescueEnabled && coarseBlockFeatures != nil {
+                updateBlockTailIncremental(blockSize: config.coarseBlockSize, oldSeqLen: oldSeqLen, isFine: false)
+            }
+        } else {
+            fineBlockFeatures = retrievalAttentionBlockMeanPool(
+                perTokenFeatures!, blockSize: config.fineBlockSize
             )
+            if config.coarseRescueEnabled {
+                coarseBlockFeatures = retrievalAttentionBlockMeanPool(
+                    perTokenFeatures!, blockSize: config.coarseBlockSize
+                )
+            }
         }
+    }
+
+    /// Incremental pooled-feature update for a single new token. Updates
+    /// only the last block (the one containing position `oldSeqLen`) —
+    /// previous blocks' means don't change when one token is appended.
+    /// F-43 motivated this: full re-pool at every decode step costs 40x
+    /// vs dense.
+    private func updateBlockTailIncremental(
+        blockSize: Int, oldSeqLen: Int, isFine: Bool
+    ) {
+        let pooled = isFine ? fineBlockFeatures! : coarseBlockFeatures!
+        let newSeqLen = seqLen  // == oldSeqLen + 1
+        let priorBlockCount = pooled.dim(0)
+        let lastBlockIdx = oldSeqLen / blockSize
+        let lastBlockStart = lastBlockIdx * blockSize
+        // Mean over the slice [lastBlockStart..<newSeqLen] of perTokenFeatures.
+        let tail = perTokenFeatures![lastBlockStart..., 0...]
+        let tailMean = tail.mean(axis: 0).reshaped(1, -1)
+        if priorBlockCount == lastBlockIdx + 1 {
+            // Same block as before — replace last row.
+            if priorBlockCount == 1 {
+                if isFine { fineBlockFeatures = tailMean } else { coarseBlockFeatures = tailMean }
+            } else {
+                let head = pooled[..<(priorBlockCount - 1), 0...]
+                let merged = concatenated([head, tailMean], axis: 0)
+                if isFine { fineBlockFeatures = merged } else { coarseBlockFeatures = merged }
+            }
+        } else if priorBlockCount == lastBlockIdx {
+            // New block started at lastBlockIdx — append.
+            let merged = concatenated([pooled, tailMean], axis: 0)
+            if isFine { fineBlockFeatures = merged } else { coarseBlockFeatures = merged }
+        } else {
+            // Unexpected (skipped blocks?). Fall back to full re-pool.
+            let full = retrievalAttentionBlockMeanPool(perTokenFeatures!, blockSize: blockSize)
+            if isFine { fineBlockFeatures = full } else { coarseBlockFeatures = full }
+        }
+        _ = newSeqLen
     }
 
     /// Build the projected query for selector scoring.

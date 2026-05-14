@@ -118,34 +118,41 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         }
     }
 
-    /// Update inner storage AND every per-head selector index.
+    /// Update inner storage AND (for sparse-eligible layers) every
+    /// per-head selector index.
     ///
     /// `keys` / `values` come in as `[B, nKVHeads, L, D]` (post-RoPE for K).
     /// v1 supports B == 1. Multi-B caches would need per-request indices.
+    ///
+    /// Dense-band layers (first-N / last-N) skip the index update entirely
+    /// — F-43 showed the selector update is the dominant per-step cost,
+    /// and dense layers never query the index. 8 of 48 layers on 14B-1M
+    /// → ~17% of the wasted overhead avoided "for free".
     public override func update(
         keys: MLXArray, values: MLXArray
     ) -> (MLXArray, MLXArray) {
         precondition(keys.dim(0) == 1, "RA cache supports B=1 only in v1")
         let nKVHeads = keys.dim(1)
-        let L = keys.dim(2)
         let dHead = keys.dim(3)
-
-        ensureIndices(nKVHeads: nKVHeads, dHead: dHead)
 
         // Update the inner cache first — returns the *full* cached K/V tensor.
         let (cachedK, cachedV) = inner.update(keys: keys, values: values)
+
+        // Dense-band layer? Skip the index entirely.
+        if !isSparseEligible {
+            return (cachedK, cachedV)
+        }
+
+        ensureIndices(nKVHeads: nKVHeads, dHead: dHead)
 
         // Update per-head indices with just the new rows (L tokens of K).
         // K is post-RoPE here (verified F-01).
         // Casting to float32 keeps the selector math stable; the index is fp32.
         let keysF32 = keys.asType(.float32)
         for h in 0..<nKVHeads {
-            // [1, 1, L, D] → [L, D]
             let newRows = keysF32[0, h, 0..., 0...]
             perHeadIndex[h].update(newK: newRows)
         }
-        _ = L  // keep for breakpoints / future logging
-
         return (cachedK, cachedV)
     }
 
