@@ -2153,6 +2153,61 @@ struct RetrievalAttentionTests {
         }
     }
 
+    // F-36: cross-arch validation. Phase B has only been tested on Qwen3
+    // (which has Q/K RMSNorm). Qwen2.5-7B has different attention internals
+    // (no Q/K norm, different GQA ratio 28:4). The dispatcher contract
+    // should NOT care — RA wires at the cache level, not the model level.
+    @Test func trainedQwen25_7B_DispatcherCosineAt8K() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-7B-Instruct-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        let quant = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        try loadWeights(modelDirectory: modelPath, model: model, quantization: quant)
+
+        let seqLen = 8192
+        MLXRandom.seed(0x7777)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        let dn = model.newCache(parameters: nil)
+        _ = model(tokens, cache: dn)
+        let dnLog = model(nextTok, cache: dn)
+
+        let totalLayers = cfg.hiddenLayers
+        let ra: [KVCache] = (0..<totalLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: totalLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: ra)
+        let raLog = model(nextTok, cache: ra)
+
+        let dFlat = dnLog.reshaped(dnLog.size).asType(.float32)
+        let rFlat = raLog.reshaped(raLog.size).asType(.float32)
+        let dot = (dFlat * rFlat).sum().asArray(Float.self)[0]
+        let dnN = sqrt((dFlat * dFlat).sum()).asArray(Float.self)[0]
+        let rnN = sqrt((rFlat * rFlat).sum()).asArray(Float.self)[0]
+        let cosine = dot / (dnN * rnN + 1e-12)
+        print("[F-36-qwen25-7B-8K] cosine=\(cosine) dn_norm=\(dnN) ra_norm=\(rnN)")
+        #expect(cosine >= 0.95, "Qwen2.5-7B 8K dispatcher cosine \(cosine) < 0.95")
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
