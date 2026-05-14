@@ -3599,6 +3599,187 @@ struct RetrievalAttentionTests {
         print(line)
     }
 
+    // F-79 force-fed long-horizon quality — 32 decode steps at amort
+    // values, force-feeding the SAME token sequence to all paths so
+    // per-step logit cosine measures pure model divergence under
+    // amortization, not cascading argmax-driven sequence divergence.
+    @Test func selectorAmortizationLongHorizonForceFeed_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 24_576
+        let nSteps = 32
+
+        // Build a fixed sequence of force-feed tokens once.
+        MLXRandom.seed(0x79FA)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+
+        // Reference: amort=1
+        var refConf = RetrievalAttentionConfig()
+        refConf.selectorAmortization = 1
+        let raRef: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: refConf, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(prefillTokens, cache: raRef)
+        eval(raRef.flatMap { $0.state })
+        var refLogits: [MLXArray] = []
+        for s in 0..<nSteps {
+            let logits = model(forceTokens[s], cache: raRef)
+            eval(logits)
+            refLogits.append(logits)
+        }
+
+        for amort in [16, 32, 64, 128, 256] {
+            var aConf = RetrievalAttentionConfig()
+            aConf.selectorAmortization = amort
+            let raA: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: aConf, ropeBase: cfg.ropeTheta)
+            }
+            _ = model(prefillTokens, cache: raA)
+            eval(raA.flatMap { $0.state })
+            var sumCos: Double = 0
+            var minCos: Float = 1.0
+            for s in 0..<nSteps {
+                let logits = model(forceTokens[s], cache: raA)
+                eval(logits)
+                let r = refLogits[s].reshaped(refLogits[s].size).asType(.float32)
+                let a = logits.reshaped(logits.size).asType(.float32)
+                let dot = (r * a).sum().asArray(Float.self)[0]
+                let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+                let an = sqrt((a * a).sum()).asArray(Float.self)[0]
+                let cos = dot / (rn * an + 1e-12)
+                sumCos += Double(cos)
+                if cos < minCos { minCos = cos }
+            }
+            print("[F-79-forcefeed] amort=\(amort) steps=\(nSteps) "
+                + "mean_cosine=\(String(format: "%.5f", sumCos / Double(nSteps))) "
+                + "min_cosine=\(String(format: "%.5f", minCos))")
+        }
+    }
+
+    // F-79 longer-horizon quality — 32 decode steps at amort=16,24,32
+    // to validate stability past the 16-step window.
+    @Test func selectorAmortizationLongHorizon_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 24_576
+        let nSteps = 32
+
+        // Reference: amort=1
+        var refConf = RetrievalAttentionConfig()
+        refConf.selectorAmortization = 1
+        let raRef: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: refConf, ropeBase: cfg.ropeTheta)
+        }
+        MLXRandom.seed(0x79AA)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        _ = model(prefillTokens, cache: raRef)
+        eval(raRef.flatMap { $0.state })
+        var refNext = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+        var refLogits: [MLXArray] = []
+        var refTokens: [Int32] = []
+        for _ in 0..<nSteps {
+            let logits = model(refNext, cache: raRef)
+            eval(logits)
+            refLogits.append(logits)
+            let tok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            refTokens.append(tok.asArray(Int32.self)[0])
+            refNext = tok
+        }
+
+        for amort in [16, 24, 32, 48, 64] {
+            var aConf = RetrievalAttentionConfig()
+            aConf.selectorAmortization = amort
+            let raA: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: aConf, ropeBase: cfg.ropeTheta)
+            }
+            MLXRandom.seed(0x79AA)
+            let prefillTokens2 = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens2, cache: raA)
+            eval(raA.flatMap { $0.state })
+            var aNext = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            var sumCos: Double = 0
+            var matches = 0
+            for s in 0..<nSteps {
+                let logits = model(aNext, cache: raA)
+                eval(logits)
+                let r = refLogits[s].reshaped(refLogits[s].size).asType(.float32)
+                let a = logits.reshaped(logits.size).asType(.float32)
+                let dot = (r * a).sum().asArray(Float.self)[0]
+                let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+                let an = sqrt((a * a).sum()).asArray(Float.self)[0]
+                sumCos += Double(dot / (rn * an + 1e-12))
+                let aTok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                if aTok.asArray(Int32.self)[0] == refTokens[s] { matches += 1 }
+                aNext = aTok
+            }
+            print("[F-79-longhorizon] amort=\(amort) steps=\(nSteps) "
+                + "mean_cosine=\(String(format: "%.5f", sumCos / Double(nSteps))) "
+                + "argmax_match=\(matches)/\(nSteps)")
+        }
+    }
+
     // F-79 fine-grained quality sweep — find the largest amort where
     // cosine vs amort=1 reference still stays ≥0.999.
     @Test func selectorAmortizationQualitySweep_14B1M() throws {

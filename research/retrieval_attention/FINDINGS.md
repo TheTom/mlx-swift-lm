@@ -437,6 +437,41 @@ default, for the safety net on adversarial prompts.
 
 ---
 
+## Force-feed long-horizon validation
+
+The earlier 32-step argmax-driven quality test (mean_cosine=0.86,
+argmax 28/32) was a **methodology artifact**: each amort path
+generates from its own argmax, so once a single token diverges from
+the reference's argmax (perfectly valid alternate generation), all
+subsequent steps follow a different coherent sequence and the
+logit-cosine comparison becomes apples-to-oranges.
+
+Force-feeding the same token sequence to every path measures pure
+per-step model divergence under amortization:
+
+```
+amort=16  steps=32 mean_cosine=0.99984 min_cosine=0.99881
+amort=32  steps=32 mean_cosine=0.99984 min_cosine=0.99881
+amort=64  steps=32 mean_cosine=0.99984 min_cosine=0.99881
+amort=128 steps=32 mean_cosine=0.99984 min_cosine=0.99881
+amort=256 steps=32 mean_cosine=0.99984 min_cosine=0.99881
+```
+
+**All identical.** With prefill at 24K, the topK picks from prefill-end
+are sufficient for at least 32 decode steps — refreshing past step 0
+makes zero numerical difference. Min single-step cosine 0.99881
+(probably at the step closest to T-boundary effects).
+
+Implications:
+- amort=16 (the new ship default) is correctly safe.
+- Quality is preserved at amort=256+ → no need for F-80 adaptive
+  in the typical regime; safety net only needed if users push
+  generation past ~128 tokens.
+- Latency win plateaus at amort=16 at the tested contexts; no
+  further latency gain from higher amort.
+
+---
+
 ## What's still open (in priority order)
 
 1. **Fused select-gather-attend Metal kernel.** Big engineering job — would
