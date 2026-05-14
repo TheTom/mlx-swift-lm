@@ -573,6 +573,141 @@ struct RetrievalAttentionTests {
 
     // MARK: - Real Qwen3 attention K capture (Week 1 diagnostic)
 
+    /// PRD A/B sweep on TRAINED Qwen3-0.6B-4bit attention K, if the
+    /// model is present on disk. Auto-skips if not.
+    ///
+    /// This is the gold-standard real-K diagnostic: actual trained
+    /// weights + actual model + actual RoPE + actual quantization,
+    /// driven through the Swift Qwen3 pipeline. Output is the same
+    /// recall@k grid as [F-17] but with trained K, which is the
+    /// number Tom needs for the PRD decisions.
+    @Test func trainedQwen3KAblationGrid() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present at \(modelPath.path); skipping")
+            return
+        }
+
+        // Load config from disk.
+        let configData = try Data(contentsOf: configPath)
+        let config = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: configData
+        )
+
+        // Build model + apply 4-bit quantization (matching the on-disk
+        // weights), then load weights from safetensors.
+        let model = Qwen3Model(config)
+        // 4-bit quant with group_size 64 matches the on-disk format.
+        let quant = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        try loadWeights(
+            modelDirectory: modelPath, model: model, quantization: quant
+        )
+
+        // Prefill: 2048-token random IDs (no real tokenizer here — we
+        // just need the K distribution from a trained-weight forward;
+        // the exact prompt doesn't have to be meaningful for the
+        // selector-recall diagnostic).
+        let seqLen = 2048
+        MLXRandom.seed(303)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(config.vocabularySize)),
+            [1, seqLen],
+        ).asType(.int32)
+        let caches = model.newCache(parameters: nil)
+        _ = model(tokens, cache: caches)
+        eval(caches.flatMap { $0.state })
+
+        let middleLayer = config.hiddenLayers / 2
+        guard let std = caches[middleLayer] as? StandardKVCache,
+            let cachedKeys = std.keys
+        else {
+            Issue.record("trained-model cache had no keys at layer \(middleLayer)")
+            return
+        }
+        let head0K = cachedKeys[0, 0, 0..., 0...]  // [T, head_dim]
+
+        struct Setup {
+            let label: String
+            let lambdaPos: Float
+            let sentinel: Bool
+        }
+        let setups: [Setup] = [
+            Setup(label: "λ=0, mean", lambdaPos: 0.0, sentinel: false),
+            Setup(label: "λ=0, sent", lambdaPos: 0.0, sentinel: true),
+            Setup(label: "λ=0.25,sent", lambdaPos: 0.25, sentinel: true),
+            Setup(label: "λ=0.5, sent", lambdaPos: 0.5, sentinel: true),
+        ]
+
+        let topK = 8
+        let blockSize = 64
+        let nBlocks = seqLen / blockSize
+        let nQueries = 20
+
+        for setup in setups {
+            var recalls: [Float] = []
+            var plantedRecovered = 0
+            for qSeed in 1000..<(1000 + nQueries) {
+                MLXRandom.seed(UInt64(qSeed))
+                let needlePos = Int.random(in: 200..<(seqLen - 200))
+                let qDir = head0K[needlePos]
+                let noise =
+                    MLXRandom.normal([config.headDim]).asType(qDir.dtype) * 0.3
+                let mixed = qDir * 0.7 + noise
+                let qNorm = mixed / sqrt((mixed * mixed).sum())
+
+                let rawArr = matmul(head0K, qNorm.reshaped(config.headDim, 1))
+                    .reshaped(seqLen).asArray(Float.self)
+                var denseMax = [Float](repeating: -.infinity, count: nBlocks)
+                for b in 0..<nBlocks {
+                    for t in (b * blockSize)..<((b + 1) * blockSize) {
+                        if rawArr[t] > denseMax[b] { denseMax[b] = rawArr[t] }
+                    }
+                }
+                let denseTop = denseMax.enumerated()
+                    .sorted { $0.element > $1.element }
+                    .prefix(topK)
+                    .map { $0.offset * blockSize }
+
+                var raCfg = RetrievalAttentionConfig()
+                raCfg.fineTopK = topK
+                raCfg.coarseRescueEnabled = false
+                raCfg.lambdaPos = setup.lambdaPos
+                raCfg.fineBlockSize = blockSize
+                raCfg.sentinelEnabled = setup.sentinel
+                let idx = RetrievalAttentionIndex(
+                    config: raCfg, dHead: config.headDim,
+                    ropeBase: config.ropeTheta, layerIdx: middleLayer,
+                )
+                idx.update(newK: head0K)
+                let projQ = idx.projectQuery(qNorm)
+                let sparseTop = idx.topKFineBlockStarts(against: projQ)
+                let overlap = Set(sparseTop).intersection(Set(denseTop))
+                recalls.append(Float(overlap.count) / Float(topK))
+                let needleBlock = (needlePos / blockSize) * blockSize
+                if sparseTop.contains(needleBlock) { plantedRecovered += 1 }
+            }
+            let mean = recalls.reduce(0, +) / Float(recalls.count)
+            let stddev = sqrt(
+                recalls.map { ($0 - mean) * ($0 - mean) }
+                    .reduce(0, +) / Float(recalls.count)
+            )
+            let plantedRate = Float(plantedRecovered) / Float(nQueries)
+            let recallStr = String(format: "%.1f", mean * 100)
+            let stdStr = String(format: "%.1f", stddev * 100)
+            let plantedStr = String(format: "%.0f", plantedRate * 100)
+            let labelStr = setup.label.padding(
+                toLength: 14, withPad: " ", startingAt: 0
+            )
+            print(
+                "[F-18-trained-qwen3-ablation] \(labelStr) recall=\(recallStr)% ± \(stdStr) planted=\(plantedStr)%"
+            )
+        }
+    }
+
     /// PRD A/B sweep on real Qwen3 attention K (random weights).
     /// Runs 20 queries × {lambda, sentinel} settings and reports the
     /// recall@8 grid. Random weights, but the K vectors come out of
