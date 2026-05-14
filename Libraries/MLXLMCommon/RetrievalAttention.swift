@@ -199,6 +199,28 @@ public struct RetrievalAttentionConfig: Sendable {
     /// benches confirm a measurable win over the F-59 mask path.
     public var usePerKVHeadGather: Bool = false
 
+    /// F-79 — amortize the selector top-K computation across decode
+    /// steps. Q drifts slowly between adjacent decode tokens, so the
+    /// top-K picks at step T+1 are usually nearly identical to those
+    /// at step T. Reuse the cached topK arrays for `selectorAmortization`
+    /// consecutive steps; refresh on the boundary. Only the mask build
+    /// runs every step (so the sliding window stays current).
+    ///
+    /// Default 1 = no amortization (refresh every step, current
+    /// behavior). 2 = halve projectQ + F-48 work. 4 = save 75%.
+    /// Quality trade-off: 4 steps of mild drift in topK picks; bound
+    /// the cosine degradation in tests before raising defaults.
+    public var selectorAmortization: Int = 1
+
+    /// F-78 — dispatch the entire selector pipeline (projectQ + F-48
+    /// fine + F-48 coarse + F-73 mask) on a separate MLX Stream so
+    /// it can execute concurrently with the model's default-stream
+    /// work (prior layers' MLP, current layer's Q/K/V projections).
+    /// SDPA still runs on the default stream and consumes the mask via
+    /// cross-stream dependency tracking. Targets the ~14ms residual
+    /// gap by hiding selector latency behind already-running compute.
+    public var useSelectorStream: Bool = false
+
     /// F-77 — projectQ + parallel fine+coarse score+topK in ONE Metal
     /// kernel (F-74's matmul fold + F-75's parallel layout), followed
     /// by F-73 mask kernel. 2 kernel dispatches per layer + 1 cache

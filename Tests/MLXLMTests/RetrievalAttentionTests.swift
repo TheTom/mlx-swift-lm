@@ -3444,6 +3444,324 @@ struct RetrievalAttentionTests {
         #expect(diff < 1e-3, "F-71 kernel max_abs_diff \(diff)")
     }
 
+    // F-79 latency + cosine: selector amortization across N=2,4,8
+    // decode steps. Measure both speed gain and quality drop vs F-73
+    // (amort=1).
+    @Test func selectorAmortizationLatency_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32767
+        let warmupSteps = 2
+        let timedSteps = 16  // longer to exercise amortization fully
+
+        func runOne(amort: Int) -> Double {
+            let caches: [KVCache]
+            if amort == 0 {
+                caches = (0..<cfg.hiddenLayers).map { _ in StandardKVCache() }
+            } else {
+                var raConf = RetrievalAttentionConfig()
+                raConf.selectorAmortization = amort
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            }
+            MLXRandom.seed(0x7900)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        let denseMs = runOne(amort: 0)
+        var results: [(Int, Double)] = []
+        for a in [1, 2, 4, 8] {
+            let ms = runOne(amort: a)
+            results.append((a, ms))
+        }
+        var line = "[F-79-latency] T=32K dense=\(String(format: "%.1f", denseMs))ms"
+        for (a, ms) in results {
+            line += " amort=\(a):\(String(format: "%.1f", ms))ms"
+        }
+        print(line)
+    }
+
+    // F-79 quality: cosine drift over 32 decode steps for amort=1/2/4/8
+    @Test func selectorAmortizationQuality_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 24_576
+        let nSteps = 16
+
+        func runRefAndAmort(amort: Int) -> Double {
+            // Build reference (amort=1) sequence
+            var refConf = RetrievalAttentionConfig()
+            refConf.selectorAmortization = 1
+            let raRef: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: refConf, ropeBase: cfg.ropeTheta)
+            }
+            MLXRandom.seed(0x79CC)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: raRef)
+            eval(raRef.flatMap { $0.state })
+            var refNext = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            var refLogits: [MLXArray] = []
+            for _ in 0..<nSteps {
+                let logits = model(refNext, cache: raRef)
+                refLogits.append(logits)
+                refNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(refNext)
+            }
+
+            // Build amort sequence (same seed for same starting state)
+            var amortConf = RetrievalAttentionConfig()
+            amortConf.selectorAmortization = amort
+            let raAmort: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: amortConf, ropeBase: cfg.ropeTheta)
+            }
+            MLXRandom.seed(0x79CC)
+            let prefillTokens2 = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens2, cache: raAmort)
+            eval(raAmort.flatMap { $0.state })
+            var amortNext = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+
+            var sumCos: Double = 0
+            for s in 0..<nSteps {
+                let logits = model(amortNext, cache: raAmort)
+                eval(logits)
+                let r = refLogits[s].reshaped(refLogits[s].size).asType(.float32)
+                let a = logits.reshaped(logits.size).asType(.float32)
+                let dot = (r * a).sum().asArray(Float.self)[0]
+                let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+                let an = sqrt((a * a).sum()).asArray(Float.self)[0]
+                sumCos += Double(dot / (rn * an + 1e-12))
+                amortNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(amortNext)
+            }
+            return sumCos / Double(nSteps)
+        }
+
+        for a in [2, 4, 8] {
+            let cos = runRefAndAmort(amort: a)
+            print("[F-79-quality] amort=\(a) mean_cosine_vs_amort1=\(String(format: "%.5f", cos))")
+        }
+    }
+
+    // F-78 correctness: selector dispatched on a separate MLX stream
+    // (concurrent with default-stream model work). Same selector logic
+    // as F-73 — just on a different stream. Should be bit-exact.
+    @Test func selectorStreamMatchesReference() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let seqLen = 17_000
+        MLXRandom.seed(0xF78A)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        let refCfg = RetrievalAttentionConfig()  // default = F-73
+        let raRef: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: refCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raRef)
+        let refLog = model(nextTok, cache: raRef)
+        eval(refLog)
+
+        var f78Cfg = RetrievalAttentionConfig()
+        f78Cfg.useSelectorStream = true
+        let raF78: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: f78Cfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raF78)
+        let f78Log = model(nextTok, cache: raF78)
+        eval(f78Log)
+
+        let r = refLog.reshaped(refLog.size).asType(.float32)
+        let f = f78Log.reshaped(f78Log.size).asType(.float32)
+        let dot = (r * f).sum().asArray(Float.self)[0]
+        let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+        let fn = sqrt((f * f).sum()).asArray(Float.self)[0]
+        let cosine = dot / (rn * fn + 1e-12)
+        let diff = (r - f).abs().max().asArray(Float.self)[0]
+        print("[F-78-stream-vs-default] seqLen=\(seqLen) cosine=\(cosine) max_abs_diff=\(diff)")
+        #expect(cosine >= 0.9999, "F-78 stream diverges from F-73; cosine=\(cosine)")
+    }
+
+    // F-78 latency: selector on separate stream vs F-73 default stream.
+    @Test func selectorStreamLatency_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32767
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runOne(mode: String) -> Double {
+            let caches: [KVCache]
+            switch mode {
+            case "dense":
+                caches = (0..<cfg.hiddenLayers).map { _ in StandardKVCache() }
+            case "F-73":
+                let raConf = RetrievalAttentionConfig()
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            case "F-78":
+                var raConf = RetrievalAttentionConfig()
+                raConf.useSelectorStream = true
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            default: fatalError("bad mode")
+            }
+            MLXRandom.seed(0x7800)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        let denseMs = runOne(mode: "dense")
+        let f73Ms = runOne(mode: "F-73")
+        let f78Ms = runOne(mode: "F-78")
+        let savedVsF73 = f73Ms - f78Ms
+        print(
+            "[F-78-latency] T=32K "
+                + "dense=\(String(format: "%.1f", denseMs)) "
+                + "F-73=\(String(format: "%.1f", f73Ms)) "
+                + "F-78=\(String(format: "%.1f", f78Ms)) | "
+                + "F-78-overhead=\(String(format: "%.1f", f78Ms - denseMs))ms "
+                + "saved-vs-F-73=\(String(format: "%.1f", savedVsF73))ms"
+        )
+    }
+
     // F-77 correctness: parallel bundle (projectQ + score+topK) +
     // F-73 mask vs F-59 reference. Bit-exact (projQ matmul inlined in
     // Metal kernel).

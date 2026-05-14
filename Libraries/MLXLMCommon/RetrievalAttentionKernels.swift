@@ -15,6 +15,13 @@
 import Foundation
 import MLX
 
+/// Get the F-78 selector stream — a separate MLX `Stream` on the GPU
+/// used to dispatch the selector pipeline (projectQ + scoreTopK +
+/// buildMask) concurrently with the main forward pass.
+public func retrievalAttentionSelectorStream() -> MLX.Stream {
+    return _RAKernelCache.shared.selectorStream
+}
+
 /// Cached one-time-constructed kernel handle. Built lazily on first call.
 private final class _RAKernelCache: @unchecked Sendable {
     static let shared = _RAKernelCache()
@@ -27,6 +34,22 @@ private final class _RAKernelCache: @unchecked Sendable {
     private var parallelScoreKernel: MLXFast.MLXFastKernel?
     private var implicitSparseSDPAKernel: MLXFast.MLXFastKernel?
     private var parallelBundleKernel: MLXFast.MLXFastKernel?
+
+    /// F-78 — separate Metal stream for the entire selector pipeline.
+    /// Lazy singleton. Dispatching selector ops on this stream lets
+    /// MLX schedule them concurrently with the model's default-stream
+    /// work (Q/K/V projections + MLP from prior layers), hiding the
+    /// per-decode-step selector latency behind compute that's already
+    /// running.
+    private var _selectorStream: MLX.Stream?
+    var selectorStream: MLX.Stream {
+        lock.lock()
+        defer { lock.unlock() }
+        if let s = _selectorStream { return s }
+        let s = MLX.Stream(MLX.Device.gpu)
+        _selectorStream = s
+        return s
+    }
 
     /// F-77 — projectQ folded into the F-75 parallel score+topK layout.
     /// Each of `2 × NKVH` threadgroups does projectQ + score + topK for

@@ -60,6 +60,15 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
     /// Allocated lazily on first use.
     private var cachedHeadIdx: MLXArray?
 
+    /// F-79 cached top-K outputs from the previous full selector
+    /// refresh. Reused across `selectorAmortization` consecutive
+    /// decode steps so we skip projectQ + F-48 fine + F-48 coarse on
+    /// most steps. Refreshed when the offset advances past the
+    /// amortization window.
+    private var cachedFineStarts: MLXArray?
+    private var cachedCoarseStarts: MLXArray?
+    private var lastRefreshOffset: Int = -1
+
     /// Returns `true` when this layer is in the sparse band (not in the
     /// first-N or last-N dense layers).
     public var isSparseEligible: Bool {
@@ -679,15 +688,33 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
             )
             eval(cachedHeadIdx!)
         }
-        let qStacked = q.take(cachedHeadIdx!, axis: 0).asType(.float32)
-        let projQ = index.projectQueriesBatched(qStacked)
 
-        let (fineStartsPerHead, coarseStartsPerHead) =
-            index.topKBlockStartsAllHeadsCombinedGPU(projectedQ: projQ)
+        // F-79: reuse cached topK arrays for `selectorAmortization`
+        // consecutive decode steps. Refresh only when offset has
+        // advanced past the window. Mask build still runs every step
+        // (so the sliding window stays current).
+        let amort = max(1, raConfig.selectorAmortization)
+        let needRefresh = (cachedFineStarts == nil)
+            || (offset - lastRefreshOffset) >= amort
+        let fineStarts: MLXArray
+        let coarseStarts: MLXArray
+        if needRefresh {
+            let qStacked = q.take(cachedHeadIdx!, axis: 0).asType(.float32)
+            let projQ = index.projectQueriesBatched(qStacked)
+            let (f, c) = index.topKBlockStartsAllHeadsCombinedGPU(projectedQ: projQ)
+            cachedFineStarts = f
+            cachedCoarseStarts = c
+            lastRefreshOffset = offset
+            fineStarts = f
+            coarseStarts = c
+        } else {
+            fineStarts = cachedFineStarts!
+            coarseStarts = cachedCoarseStarts!
+        }
 
         return retrievalAttentionBuildMaskFused(
-            fineStarts: fineStartsPerHead,
-            coarseStarts: coarseStartsPerHead,
+            fineStarts: fineStarts,
+            coarseStarts: coarseStarts,
             T: T,
             staticInit: raConfig.staticInit,
             slidingWindow: raConfig.slidingWindow,

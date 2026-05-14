@@ -206,6 +206,25 @@ public func attentionWithCacheUpdate(
                     )
                 }
             }
+            if raCache.raConfig.useSelectorStream {
+                // F-78 — dispatch the F-73 selector pipeline on a
+                // separate MLX stream so it overlaps with the model's
+                // default-stream work. MLX tracks the cross-stream
+                // dependency: the SDPA call below waits on the mask.
+                let T = cachedKeys.dim(2)
+                let raMask = MLX.Stream.withStream(
+                    retrievalAttentionSelectorStream()
+                ) {
+                    raCache.buildAttentionMaskFusedKernel(
+                        q: qFlat, dtype: cachedKeys.dtype, T: T)
+                }
+                return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                    MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: cachedKeys, values: cachedValues,
+                        scale: scale, mask: .array(raMask), sinks: sinks
+                    )
+                }
+            }
             if raCache.raConfig.useParallelBundleSelector {
                 // F-77 — projectQ folded into parallel fine+coarse score
                 // kernel, then F-73 mask. 2 dispatches per sparse layer.
