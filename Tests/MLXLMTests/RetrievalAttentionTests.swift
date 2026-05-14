@@ -401,6 +401,84 @@ struct RetrievalAttentionTests {
         #expect(diff > 1e-4, "different index sets must produce different output")
     }
 
+    // MARK: - SelectorIndex (stateful per-layer block-pooled f(K))
+
+    @Test func selectorIndexUpdatesAndScoresWithoutCrash() {
+        let dHead = 128
+        let idx = RetrievalAttentionIndex(dHead: dHead, layerIdx: 0)
+
+        MLXRandom.seed(11)
+        // Push 8 blocks worth of K (8 * 64 = 512 tokens) in 2 chunks
+        // to verify incremental update behavior.
+        let first = MLXRandom.normal([256, dHead])
+        idx.update(newK: first)
+        #expect(idx.seqLen == 256)
+        #expect(idx.fineBlockFeatures != nil)
+        #expect(idx.fineBlockFeatures!.dim(0) == 4)  // 256 / 64
+
+        let second = MLXRandom.normal([256, dHead])
+        idx.update(newK: second)
+        #expect(idx.seqLen == 512)
+        #expect(idx.fineBlockFeatures!.dim(0) == 8)  // 512 / 64
+
+        // Score against a random query — must produce nBlocks-shaped output.
+        let q = MLXRandom.normal([dHead])
+        let projectedQ = idx.projectQuery(q)
+        #expect(projectedQ.shape == [32])  // contentDim + trigDim
+
+        let scores = idx.scoreFineBlocks(against: projectedQ)
+        #expect(scores.shape == [8])
+        let topK = idx.topKFineBlockStarts(against: projectedQ)
+        // Default config picks 32 fine blocks; we only have 8 → returns all 8.
+        #expect(topK.count == 8)
+        // All starts must be block-aligned multiples of 64.
+        for s in topK {
+            #expect(s % 64 == 0)
+            #expect(s >= 0 && s < 512)
+        }
+    }
+
+    @Test func selectorIndexPlantedNeedleEndToEnd() {
+        // Plant a key vector at position 320 that's aligned with the
+        // query direction. After block-pool, fine block 5 (320/64=5)
+        // should rank in the top-k for a content-aligned q.
+        let dHead = 64
+        var cfg = RetrievalAttentionConfig()
+        cfg.lambdaPos = 0.0  // pure content (no positional dilution)
+        cfg.fineTopK = 4
+        let idx = RetrievalAttentionIndex(
+            config: cfg, dHead: dHead, layerIdx: 0
+        )
+
+        MLXRandom.seed(13)
+        // Random base keys, [512, 64].
+        let baseKeys = MLXRandom.normal([512, dHead])
+        // Build q first (unit-norm).
+        let qRaw = MLXRandom.normal([dHead])
+        let qNorm = qRaw / sqrt((qRaw * qRaw).sum())
+        // Plant a needle at position 320: high-magnitude copy of q
+        // direction so the block-mean tilts toward q.
+        let typicalMag = Float(dHead).squareRoot()
+        let needle = qNorm * MLXArray(8.0 * typicalMag)  // 8× boost
+        // Mutate-via-concat: split [0..319], needle, [321..511]
+        let prefix = baseKeys[0..<320]
+        let suffix = baseKeys[321..<512]
+        let needled = concatenated(
+            [prefix, needle.reshaped(1, dHead), suffix], axis: 0
+        )
+
+        idx.update(newK: needled)
+        let projQ = idx.projectQuery(qNorm)
+        let topStarts = idx.topKFineBlockStarts(against: projQ)
+        // Block 5 (positions 320..383) should be in the top-4 — its
+        // mean is dragged toward q by the 8× boosted needle.
+        let blockStartsAsInt = Set(topStarts)
+        #expect(
+            blockStartsAsInt.contains(5 * cfg.fineBlockSize),
+            "expected planted block 5 to make top-\(cfg.fineTopK), got \(topStarts)"
+        )
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
