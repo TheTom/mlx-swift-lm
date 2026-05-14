@@ -3820,6 +3820,83 @@ struct RetrievalAttentionTests {
             + "min_at_step=\(minAtStep)")
     }
 
+    // F-79 noise-reduction hypothesis: does selector amortization
+    // smooth out the MLX cliff non-determinism at 49K by caching
+    // topK between steps?
+    @Test func amortReducesNoise_49K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 49_151
+        let nSteps = 8
+        MLXRandom.seed(0x4920)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+        eval(prefillTokens)
+
+        func runAmort(_ amort: Int) -> [MLXArray] {
+            var conf = RetrievalAttentionConfig()
+            conf.selectorAmortization = amort
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: conf, ropeBase: cfg.ropeTheta)
+            }
+            _ = model(prefillTokens, cache: ra)
+            eval(ra.flatMap { $0.state })
+            var out: [MLXArray] = []
+            for s in 0..<nSteps {
+                let logits = model(forceTokens[s], cache: ra)
+                eval(logits)
+                out.append(logits)
+            }
+            return out
+        }
+
+        for amort in [1, 16, 32, 64] {
+            let a = runAmort(amort)
+            let b = runAmort(amort)
+            var sumCos: Double = 0
+            var minCos: Float = 1.0
+            for s in 0..<nSteps {
+                let aF = a[s].reshaped(a[s].size).asType(.float32)
+                let bF = b[s].reshaped(b[s].size).asType(.float32)
+                let dot = (aF * bF).sum().asArray(Float.self)[0]
+                let an = sqrt((aF * aF).sum()).asArray(Float.self)[0]
+                let bn = sqrt((bF * bF).sum()).asArray(Float.self)[0]
+                let cos = dot / (an * bn + 1e-12)
+                sumCos += Double(cos)
+                if cos < minCos { minCos = cos }
+            }
+            print("[F-79-noise-reduce] amort=\(amort) self-consistency "
+                + "mean_cosine=\(String(format: "%.5f", sumCos / Double(nSteps))) "
+                + "min_cosine=\(String(format: "%.5f", minCos))")
+        }
+    }
+
     // F-79 49K hypothesis test: is the "non-determinism" actually a
     // first-run-after-model-load artifact? Add a warmup run, then
     // compare two subsequent runs.
