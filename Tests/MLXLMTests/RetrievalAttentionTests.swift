@@ -2604,10 +2604,12 @@ struct RetrievalAttentionTests {
             [1, prefillLen]
         ).asType(.int32)
 
-        // Run dense path: prefill + 32 decode steps, total time.
+        // Run dense path: time prefill + 32 decode steps separately.
         let dn = model.newCache(parameters: nil)
+        let dnPrefillStart = Date()
         _ = model(prefillTokens, cache: dn)
         eval(dn.flatMap { $0.state })
+        let dnPrefillTime = Date().timeIntervalSince(dnPrefillStart)
         var dnNext = MLXRandom.randInt(
             low: MLXArray(Int32(0)),
             high: MLXArray(Int32(cfg.vocabularySize)),
@@ -2621,14 +2623,16 @@ struct RetrievalAttentionTests {
         }
         let dnTotal = Date().timeIntervalSince(dnStart)
 
-        // Run RA path: prefill + 32 decode steps.
+        // Run RA path: time prefill + 32 decode steps separately.
         let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
             RetrievalAttentionKVCache(
                 layerIdx: i, totalLayers: cfg.hiddenLayers,
                 ropeBase: cfg.ropeTheta)
         }
+        let raPrefillStart = Date()
         _ = model(prefillTokens, cache: ra)
         eval(ra.flatMap { $0.state })
+        let raPrefillTime = Date().timeIntervalSince(raPrefillStart)
         var raNext = MLXRandom.randInt(
             low: MLXArray(Int32(0)),
             high: MLXArray(Int32(cfg.vocabularySize)),
@@ -2641,6 +2645,10 @@ struct RetrievalAttentionTests {
             eval(raNext)
         }
         let raTotal = Date().timeIntervalSince(raStart)
+        print(
+            "[F-43-prefill] dn=\(String(format: "%.3f", dnPrefillTime))s "
+                + "ra=\(String(format: "%.3f", raPrefillTime))s"
+        )
 
         let dnPerStep = dnTotal / Double(decodeSteps)
         let raPerStep = raTotal / Double(decodeSteps)
