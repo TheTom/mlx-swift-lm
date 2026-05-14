@@ -2741,6 +2741,96 @@ struct RetrievalAttentionTests {
         }
     }
 
+    // F-48: small-model latency on Qwen3-0.6B-4bit (28 layers vs 48,
+    // hidden 1024 vs 5120). If dense per-step time is much smaller but
+    // RA per-step time is similar, the gap is dispatch-fixed, not
+    // compute-bound. Tests with warmup for cleaner numbers.
+    @Test func smallModelLatencyDispatchAttribution() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let warmupSteps = 4
+        let timedSteps = 16
+        let prefillLen = 16384
+        MLXRandom.seed(0x42)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+
+        // Dense path.
+        let dn = model.newCache(parameters: nil)
+        _ = model(prefillTokens, cache: dn)
+        eval(dn.flatMap { $0.state })
+        var dnNext = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+        for _ in 0..<warmupSteps {
+            let logits = model(dnNext, cache: dn)
+            dnNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            eval(dnNext)
+        }
+        let dnStart = Date()
+        for _ in 0..<timedSteps {
+            let logits = model(dnNext, cache: dn)
+            dnNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            eval(dnNext)
+        }
+        let dnPerStepMs = Date().timeIntervalSince(dnStart) / Double(timedSteps) * 1000
+
+        // RA path.
+        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        _ = model(prefillTokens, cache: ra)
+        eval(ra.flatMap { $0.state })
+        var raNext = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+        for _ in 0..<warmupSteps {
+            let logits = model(raNext, cache: ra)
+            raNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            eval(raNext)
+        }
+        let raStart = Date()
+        for _ in 0..<timedSteps {
+            let logits = model(raNext, cache: ra)
+            raNext = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            eval(raNext)
+        }
+        let raPerStepMs = Date().timeIntervalSince(raStart) / Double(timedSteps) * 1000
+
+        let nSparseLayers = cfg.hiddenLayers - 8  // first-4 + last-4 dense
+        let overheadMs = raPerStepMs - dnPerStepMs
+        let overheadPerLayerMs = overheadMs / Double(nSparseLayers)
+        print(
+            "[F-48-small-model-16K] hiddenLayers=\(cfg.hiddenLayers) "
+                + "dense=\(String(format: "%.2f", dnPerStepMs))ms "
+                + "ra=\(String(format: "%.2f", raPerStepMs))ms "
+                + "overhead=\(String(format: "%.2f", overheadMs))ms "
+                + "overhead_per_sparse_layer=\(String(format: "%.2f", overheadPerLayerMs))ms"
+        )
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
