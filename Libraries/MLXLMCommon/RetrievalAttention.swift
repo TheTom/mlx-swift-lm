@@ -182,45 +182,54 @@ public func retrievalAttentionGatherIndices(
     config: RetrievalAttentionConfig
 ) -> [Int] {
     precondition(seqLen >= 0, "seqLen must be non-negative")
+    if seqLen == 0 { return [] }
 
-    var indices = Set<Int>()
-    indices.reserveCapacity(
+    // F-58: bitmap-based dedupe. Was a Set<Int> with ~6000 inserts at 16K
+    // context (F-57 measured 3.95ms/call). Bitmap mark-then-scan is much
+    // tighter for dense token-space dedupe — measured ~10x faster.
+    var marks = [Bool](repeating: false, count: seqLen)
+
+    // Static initial window: positions 0 ..< min(staticInit, seqLen).
+    let staticEnd = min(config.staticInit, seqLen)
+    marks.withUnsafeMutableBufferPointer { buf in
+        for p in 0..<staticEnd { buf[p] = true }
+
+        // Sliding window: trailing `slidingWindow` tokens, floored at 0.
+        let slidingStart = max(0, seqLen - config.slidingWindow)
+        for p in slidingStart..<seqLen { buf[p] = true }
+
+        // Fine retrieved blocks.
+        for s in fineBlockStarts {
+            precondition(s >= 0 && s < seqLen,
+                "fine block start \(s) out of [0, \(seqLen))")
+            let end = min(s + config.fineBlockSize, seqLen)
+            for p in s..<end { buf[p] = true }
+        }
+
+        // Coarse rescue blocks.
+        if config.coarseRescueEnabled {
+            for s in coarseBlockStarts {
+                precondition(s >= 0 && s < seqLen,
+                    "coarse block start \(s) out of [0, \(seqLen))")
+                let end = min(s + config.coarseBlockSize, seqLen)
+                for p in s..<end { buf[p] = true }
+            }
+        }
+    }
+
+    // Compact bitmap into the sorted [Int] result.
+    var result: [Int] = []
+    result.reserveCapacity(
         config.staticInit + config.slidingWindow
             + config.fineTopK * config.fineBlockSize
             + (config.coarseRescueEnabled
                 ? config.coarseTopK * config.coarseBlockSize : 0))
-
-    // Static initial window: positions 0 ..< min(staticInit, seqLen).
-    let staticEnd = min(config.staticInit, seqLen)
-    for p in 0..<staticEnd { indices.insert(p) }
-
-    // Sliding window: trailing `slidingWindow` tokens, floored at 0.
-    let slidingStart = max(0, seqLen - config.slidingWindow)
-    if slidingStart < seqLen {
-        for p in slidingStart..<seqLen { indices.insert(p) }
-    }
-
-    // Fine retrieved blocks.
-    for s in fineBlockStarts {
-        precondition(
-            s >= 0 && s < seqLen,
-            "fine block start \(s) out of [0, \(seqLen))")
-        let end = min(s + config.fineBlockSize, seqLen)
-        for p in s..<end { indices.insert(p) }
-    }
-
-    // Coarse rescue blocks.
-    if config.coarseRescueEnabled {
-        for s in coarseBlockStarts {
-            precondition(
-                s >= 0 && s < seqLen,
-                "coarse block start \(s) out of [0, \(seqLen))")
-            let end = min(s + config.coarseBlockSize, seqLen)
-            for p in s..<end { indices.insert(p) }
+    marks.withUnsafeBufferPointer { buf in
+        for p in 0..<seqLen {
+            if buf[p] { result.append(p) }
         }
     }
-
-    return indices.sorted()
+    return result
 }
 
 /// Pre-dedupe budget exposed for memory math + diagnostics. Does NOT

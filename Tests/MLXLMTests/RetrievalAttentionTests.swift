@@ -2911,6 +2911,37 @@ struct RetrievalAttentionTests {
         #expect(allMatch, "fused kernel top-K does not match baseline")
     }
 
+    // F-57: how much CPU time does the gather index dedupe take?
+    @Test func gatherIndicesCPUTiming() throws {
+        let cfg = RetrievalAttentionConfig()
+        let seqLen = 16384
+        // Realistic fine block starts: 32 random blocks (default top_k).
+        var rng = SystemRandomNumberGenerator()
+        let nFineBlocks = seqLen / cfg.fineBlockSize
+        let fineStarts: [Int] = (0..<cfg.fineTopK).map { _ in
+            Int.random(in: 0..<nFineBlocks, using: &rng) * cfg.fineBlockSize
+        }
+        let nCoarseBlocks = seqLen / cfg.coarseBlockSize
+        let coarseStarts: [Int] = (0..<cfg.coarseTopK).map { _ in
+            Int.random(in: 0..<nCoarseBlocks, using: &rng) * cfg.coarseBlockSize
+        }
+        let runs = 1000
+        let t0 = Date()
+        for _ in 0..<runs {
+            _ = retrievalAttentionGatherIndices(
+                seqLen: seqLen,
+                fineBlockStarts: fineStarts,
+                coarseBlockStarts: coarseStarts,
+                config: cfg
+            )
+        }
+        let perRunUs = Date().timeIntervalSince(t0) / Double(runs) * 1e6
+        print(
+            "[F-57-cpu-dedupe] seqLen=\(seqLen) "
+                + "per_call=\(String(format: "%.1f", perRunUs))µs"
+        )
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
