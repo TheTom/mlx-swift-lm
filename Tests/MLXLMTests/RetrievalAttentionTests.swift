@@ -1669,6 +1669,68 @@ struct RetrievalAttentionTests {
         #expect(cosine >= 0.90, "32K adaptive top_k cosine \(cosine) < 0.90")
     }
 
+    // F-28: bisect the cliff between 16K and 32K — find where end-to-end
+    // cosine first falls off. Also try multiple seeds at the cliff edge to
+    // separate "seed-fragile" from "deterministic cliff".
+    @Test func trainedQwen3DispatcherCliffBisect() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        for (seqLen, seed) in [
+            (20480, UInt64(0x101)),
+            (24576, UInt64(0x102)),
+            (28672, UInt64(0x103)),
+            (32768, UInt64(0x104)),
+            (32768, UInt64(0x105)),  // 2nd seed at 32K
+        ] {
+            MLXRandom.seed(seed)
+            let tokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, seqLen]
+            ).asType(.int32)
+            let nextTok = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            let dn = model.newCache(parameters: nil)
+            _ = model(tokens, cache: dn)
+            let dnLog = model(nextTok, cache: dn)
+
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    ropeBase: cfg.ropeTheta)
+            }
+            _ = model(tokens, cache: ra)
+            let raLog = model(nextTok, cache: ra)
+
+            let dFlat = dnLog.reshaped(dnLog.size).asType(.float32)
+            let rFlat = raLog.reshaped(raLog.size).asType(.float32)
+            let dot = (dFlat * rFlat).sum().asArray(Float.self)[0]
+            let dnN = sqrt((dFlat * dFlat).sum()).asArray(Float.self)[0]
+            let rnN = sqrt((rFlat * rFlat).sum()).asArray(Float.self)[0]
+            let cosine = dot / (dnN * rnN + 1e-12)
+            print(
+                "[F-28-bisect] seqLen=\(seqLen) seed=\(seed) "
+                    + "cosine=\(cosine) dn_norm=\(dnN) ra_norm=\(rnN)"
+            )
+        }
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
