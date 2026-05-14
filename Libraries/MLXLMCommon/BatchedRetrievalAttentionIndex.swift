@@ -28,7 +28,14 @@ public final class BatchedRetrievalAttentionIndex {
 
     private var jlMatrix: MLXArray?
 
+    /// Pre-allocated per-token features buffer. Grown in `featureChunkSize`
+    /// chunks to avoid per-step concat reallocation. Only positions
+    /// `[0..<populated]` are valid; positions `[populated..<buffer.dim(1)]`
+    /// are uninitialised reservation.
     private(set) public var perTokenFeatures: MLXArray?
+    private var populated: Int = 0
+    private static let featureChunkSize: Int = 1024
+
     private(set) public var fineBlockFeatures: MLXArray?
     private(set) public var coarseBlockFeatures: MLXArray?
 
@@ -46,7 +53,9 @@ public final class BatchedRetrievalAttentionIndex {
         self.layerIdx = layerIdx
     }
 
-    public var seqLen: Int { perTokenFeatures?.dim(1) ?? 0 }
+    /// Current populated sequence length (number of valid rows in
+    /// `perTokenFeatures`).
+    public var seqLen: Int { populated }
 
     /// Update with new K rows for all heads in one call.
     ///
@@ -88,25 +97,52 @@ public final class BatchedRetrievalAttentionIndex {
             selectorNew = contentNew
         }
 
-        if let existing = perTokenFeatures {
-            perTokenFeatures = concatenated([existing, selectorNew], axis: 1)
-        } else {
-            perTokenFeatures = selectorNew
+        // Append into the pre-allocated buffer. Reallocate only when the
+        // current buffer can't hold the new rows. F-51 perf win — replaces
+        // the per-update concatenated([existing, selectorNew]) with an
+        // in-place slice assignment when the buffer has room.
+        let featureDim = selectorNew.dim(2)
+        if perTokenFeatures == nil {
+            let initialCap = max(
+                Self.featureChunkSize,
+                ((newSeqLen + Self.featureChunkSize - 1) / Self.featureChunkSize)
+                    * Self.featureChunkSize
+            )
+            perTokenFeatures = MLXArray.zeros(
+                [nKVHeads, initialCap, featureDim], dtype: selectorNew.dtype
+            )
+        } else if perTokenFeatures!.dim(1) < newSeqLen {
+            // Grow buffer in chunkSize-multiples.
+            let neededTotal = ((newSeqLen + Self.featureChunkSize - 1)
+                / Self.featureChunkSize) * Self.featureChunkSize
+            let additional = neededTotal - perTokenFeatures!.dim(1)
+            let pad = MLXArray.zeros(
+                [nKVHeads, additional, featureDim], dtype: perTokenFeatures!.dtype
+            )
+            perTokenFeatures = concatenated([perTokenFeatures!, pad], axis: 1)
+            // Materialize after grow to break graph chain.
+            eval(perTokenFeatures!)
         }
+        // In-place write the new rows.
+        perTokenFeatures![0..., oldSeqLen ..< newSeqLen, 0...] = selectorNew
+        populated = newSeqLen
 
         // Block-pooled features. Incremental for L=1, full re-pool otherwise.
+        // Always operate on the valid populated slice, not the
+        // pre-allocated reservation.
         if L == 1 && fineBlockFeatures != nil {
             updateBlockTailIncremental(blockSize: config.fineBlockSize, oldSeqLen: oldSeqLen, isFine: true)
             if config.coarseRescueEnabled && coarseBlockFeatures != nil {
                 updateBlockTailIncremental(blockSize: config.coarseBlockSize, oldSeqLen: oldSeqLen, isFine: false)
             }
         } else {
+            let validView = perTokenFeatures![0..., ..<populated, 0...]
             fineBlockFeatures = batchedBlockMeanPool(
-                perTokenFeatures!, blockSize: config.fineBlockSize
+                validView, blockSize: config.fineBlockSize
             )
             if config.coarseRescueEnabled {
                 coarseBlockFeatures = batchedBlockMeanPool(
-                    perTokenFeatures!, blockSize: config.coarseBlockSize
+                    validView, blockSize: config.coarseBlockSize
                 )
             }
         }
@@ -155,12 +191,11 @@ public final class BatchedRetrievalAttentionIndex {
         let priorBlockCount = pooled.dim(1)
         let lastBlockIdx = oldSeqLen / blockSize
         let lastBlockStart = lastBlockIdx * blockSize
-        // [nh, tailLen, D]
-        let tail = perTokenFeatures![0..., lastBlockStart..., 0...]
-        // mean over axis 1 (token axis) → [nh, D] then reshape → [nh, 1, D]
+        // Slice only the valid populated range — perTokenFeatures is now a
+        // pre-allocated buffer with reservation slots beyond `populated`.
+        let tail = perTokenFeatures![0..., lastBlockStart ..< populated, 0...]
         let tailMean = tail.mean(axis: 1).reshaped(nKVHeads, 1, pooled.dim(2))
         if priorBlockCount == lastBlockIdx + 1 {
-            // Same block — replace last row along axis 1.
             if priorBlockCount == 1 {
                 if isFine { fineBlockFeatures = tailMean } else { coarseBlockFeatures = tailMean }
             } else {
@@ -172,7 +207,8 @@ public final class BatchedRetrievalAttentionIndex {
             let merged = concatenated([pooled, tailMean], axis: 1)
             if isFine { fineBlockFeatures = merged } else { coarseBlockFeatures = merged }
         } else {
-            let full = batchedBlockMeanPool(perTokenFeatures!, blockSize: blockSize)
+            let validView = perTokenFeatures![0..., ..<populated, 0...]
+            let full = batchedBlockMeanPool(validView, blockSize: blockSize)
             if isFine { fineBlockFeatures = full } else { coarseBlockFeatures = full }
         }
     }
