@@ -47,12 +47,19 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   - `coarseRescueEnabled = true`, top-2 (F-19)
   - `denseFirstN = denseLastN = 4` (F-25 proved this absorbs boundary
     sensitivity)
-- **Latency:** Significantly improved (Phase C steps 1–2). On Qwen3-0.6B-4bit
-  at 16K, per-sparse-layer overhead dropped **39ms → 11.67ms (70%)**.
-  On Qwen2.5-14B-1M at 24K, decode-step latency dropped **1559ms → 1061ms
-  (32%)**. The big lever was **F-56**: a custom Metal kernel
-  (`ra_score_topk` in `RetrievalAttentionKernels.swift`) that fuses the
-  score + argPartition + slice + multiply chain into one dispatch.
+- **Latency:** Major progress (Phase C steps 1–3). On Qwen3-0.6B-4bit
+  at 16K, per-sparse-layer overhead dropped **39ms → 5.45ms (86%)**.
+  On Qwen2.5-14B-1M at 24K, decode-step latency dropped **1559ms →
+  325ms (~80%)** — now only **8.8x slower than dense** (was 42x at F-43).
+
+  Two biggest levers:
+  - **F-56 (fused Metal kernel)**: replaced score+argPartition+slice+mul
+    op chain with one custom kernel (`ra_score_topk` in
+    `RetrievalAttentionKernels.swift`).
+  - **F-58 (bitmap dedupe)**: the CPU-side Set<Int> gather-index dedupe
+    was silently eating ~34% of per-layer cost (3.95ms/call at 16K).
+    Replaced with a Bool-bitmap mark-then-scan (1.42ms/call); the
+    result is naturally sorted, no separate sort needed.
 
   Path so far:
   - F-44: BatchedRetrievalAttentionIndex (batched per-head matmul)
@@ -64,12 +71,14 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   - F-54: cached pre-transposed JL matrix W.T
   - F-55: implemented fused score+top-K Metal kernel (POC + tests)
   - **F-56: wired the fused kernel into the hot path** — 14.47 → 11.67ms
+  - **F-58: bitmap CPU dedupe** — 11.67 → 5.45ms (the dark horse;
+    Set<Int> at 6000+ inserts was much heavier than expected)
   - + λ=0 trig-skip, single take() for head slicing, head-slice refactor
 
-  At 11.67ms/sparse-layer the next wins live in fusing the remaining ops
-  (gather + SDPA) into the same kernel, or eliminating the asArray sync
-  for the combined fine+coarse top-K via GPU-side dedupe. Still ~17x slower
-  than dense per-step but down from the 39ms baseline.
+  At 5.45ms/sparse-layer (0.6B) / 8ms/sparse-layer (14B) the next wins
+  live in fusing gather+SDPA into one kernel or building the attention
+  mask on GPU (eliminates the remaining asArray sync entirely). The
+  per-decode-step gap shrunk from 42x to 8.8x on 14B-1M @ 24K.
 - **Memory:** acceptable; per-layer selector index is `[nKVHeads, T, 32]`
   fp32 + small block-pooled views. At 14B-1M / 24K / 48 sparse layers:
   ~960MB selector overhead. Not great; future work could eliminate the
