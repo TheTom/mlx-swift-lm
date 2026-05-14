@@ -137,6 +137,46 @@ public func attentionWithCacheUpdate(
             )
         }
 
+    case .retrievalSparse:
+        guard let raCache = cache as? RetrievalAttentionKVCache else {
+            fatalError(
+                "storageKind .retrievalSparse but cache is not RetrievalAttentionKVCache: \(type(of: cache))"
+            )
+        }
+        let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
+        let (cachedKeys, cachedValues) = raCache.update(keys: keys, values: values)
+        BenchmarkSignpost.end(updH)
+        let L = queries.dim(2)
+        // Gather path: decode-step (L==1), sparse-eligible layer, and the
+        // cache has enough tokens that a gather is materially smaller than
+        // the full K/V. Below the budget threshold, sparse and dense agree
+        // exactly (the union of static + sliding == [0, T)), so fall through
+        // to dense and skip the selector overhead.
+        let preBudget = retrievalAttentionPreDedupeBudget(config: raCache.raConfig)
+        let canGather = L == 1 && raCache.isSparseEligible && cachedKeys.dim(2) > preBudget
+        if canGather {
+            // queries: [B, nHeads, 1, D] → [nHeads, D] for the selector.
+            let qFlat = queries[0, 0..., 0, 0...]
+            let gather = raCache.gatherIndicesForDecode(q: qFlat)
+            return retrievalAttentionGatherAndAttend(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                gatherIndices: gather,
+                scale: scale,
+                sinks: sinks
+            )
+        }
+        // Dense fallback — prefill / first-N or last-N dense layers /
+        // pre-budget contexts. Index still got updated above so the
+        // selector is warm by the time we transition into the gather band.
+        return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+            MLXFast.scaledDotProductAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                scale: scale, mask: mask, sinks: sinks
+            )
+        }
+
     case .raw, .ssm, .composite:
         // Standard path — raw FP16/BF16 K/V (StandardKVCache), SSM caches
         // (SSMStateCache — not actually K/V but routed through the same

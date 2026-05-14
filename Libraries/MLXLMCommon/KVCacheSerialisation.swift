@@ -315,7 +315,7 @@ public func prefixKey(forCache cache: [KVCache], modelID: String, kvBits: Int? =
         switch cache[0].storageKind {
         case .affineQuantized(let bits, _): inferredBits = bits
         case .turboCompressed(let kb, let vb): inferredBits = max(kb, vb)
-        case .raw, .ssm, .composite: inferredBits = nil
+        case .raw, .ssm, .composite, .retrievalSparse: inferredBits = nil
         }
     }
     // KV head dim is not directly exposed by the cache; we use a

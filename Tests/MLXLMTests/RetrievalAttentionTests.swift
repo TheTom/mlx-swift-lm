@@ -1405,6 +1405,138 @@ struct RetrievalAttentionTests {
         #expect(recall >= 0.0)  // smoke test
     }
 
+    // MARK: - Phase B: dispatcher integration on trained Qwen3-0.6B-4bit
+    //
+    // Runs the model TWICE on the same prompt:
+    //   1. With a normal dense cache (StandardKVCache per layer).
+    //   2. With RetrievalAttentionKVCache per layer (dispatch on .retrievalSparse).
+    //
+    // Prefill (L > 1) routes through the dense fallback in both cases, so the
+    // final prefill logits should be identical. Then we run ONE decode step
+    // and compare next-token logits cosine. The decode step is where the
+    // gather path activates: cachedKeys.dim(2) == seqLen > preBudget=6272.
+    //
+    // PRD criterion (revised): cosine ≥ 0.95.
+    @Test func trainedQwen3DispatcherCosineAt8K() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present at \(modelPath.path); skipping")
+            return
+        }
+        let configData = try Data(contentsOf: configPath)
+        let cfg = try JSONDecoder().decode(Qwen3Configuration.self, from: configData)
+
+        let model = Qwen3Model(cfg)
+        let quant = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        try loadWeights(modelDirectory: modelPath, model: model, quantization: quant)
+
+        // Prefill seq_len 8192 — above 6272 preBudget so decode-step gather
+        // activates on every sparse-eligible layer.
+        let seqLen = 8192
+        MLXRandom.seed(909)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+
+        // Dense reference: prefill + decode using StandardKVCache.
+        let denseCaches = model.newCache(parameters: nil)
+        let dnsPrefill = model(tokens, cache: denseCaches)
+        eval(denseCaches.flatMap { $0.state })
+        eval(dnsPrefill)
+        let denseNextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+        let denseLogits = model(denseNextTok, cache: denseCaches)
+        eval(denseLogits)
+
+        // RA path: prefill + decode using RetrievalAttentionKVCache.
+        let raConfig = RetrievalAttentionConfig()
+        let raCaches: [KVCache] = (0..<cfg.hiddenLayers).map { layerIdx in
+            RetrievalAttentionKVCache(
+                layerIdx: layerIdx,
+                totalLayers: cfg.hiddenLayers,
+                raConfig: raConfig,
+                ropeBase: cfg.ropeTheta
+            )
+        }
+        let raPrefill = model(tokens, cache: raCaches)
+        eval(raCaches.flatMap { $0.state })
+        eval(raPrefill)
+        let raLogits = model(denseNextTok, cache: raCaches)
+        eval(raLogits)
+
+        // Prefill logits should be IDENTICAL (dense fallback for L>1).
+        let prefillDiff = (dnsPrefill - raPrefill).abs().max().asArray(Float.self)[0]
+        print("[F-23-dispatcher-prefill] max_abs_diff=\(prefillDiff)")
+        #expect(prefillDiff < 1e-3, "prefill divergence \(prefillDiff) — dispatcher routed L>1 to gather?")
+
+        // Decode logits: gather activated on sparse layers (skipping first-4
+        // and last-4). Cosine ≥ 0.95 per PRD-revised criterion.
+        let dFlat = denseLogits.reshaped(denseLogits.size).asType(.float32)
+        let rFlat = raLogits.reshaped(raLogits.size).asType(.float32)
+        let dot = (dFlat * rFlat).sum().asArray(Float.self)[0]
+        let dn = sqrt((dFlat * dFlat).sum()).asArray(Float.self)[0]
+        let rn = sqrt((rFlat * rFlat).sum()).asArray(Float.self)[0]
+        let cosine = dot / (dn * rn + 1e-12)
+        print("[F-23-dispatcher-decode] seqLen=\(seqLen) cosine=\(cosine)")
+        #expect(cosine >= 0.95, "RA dispatcher decode cosine \(cosine) < 0.95")
+    }
+
+    // Phase B sanity: short context (below preBudget) must produce IDENTICAL
+    // logits because the dispatcher falls through to dense SDPA.
+    @Test func trainedQwen3DispatcherBelowBudgetIdentical() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let seqLen = 1024  // < preBudget (6272) → gather skipped
+        MLXRandom.seed(910)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        let dn = model.newCache(parameters: nil)
+        _ = model(tokens, cache: dn)
+        let dnLog = model(nextTok, cache: dn)
+
+        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: ra)
+        let raLog = model(nextTok, cache: ra)
+
+        let diff = (dnLog - raLog).abs().max().asArray(Float.self)[0]
+        print("[F-24-below-budget-decode] seqLen=\(seqLen) max_abs_diff=\(diff)")
+        #expect(diff < 1e-3, "below-budget RA decode must == dense; got max abs diff \(diff)")
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.

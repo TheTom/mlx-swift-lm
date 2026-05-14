@@ -57,6 +57,10 @@ public enum KVStorageKind: Sendable, Equatable {
     case ssm
     /// Composite of heterogeneous sub-caches (`CacheList`).
     case composite
+    /// RetrievalAttention block-sparse decode (spec 034). Storage is raw
+    /// K/V under the hood; the cache also maintains a per-KV-head selector
+    /// index used to gather a sparse subset at decode.
+    case retrievalSparse
 }
 
 // MARK: - Default storageKind for direct protocol conformers
