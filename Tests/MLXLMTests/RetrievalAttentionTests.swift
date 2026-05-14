@@ -2386,6 +2386,66 @@ struct RetrievalAttentionTests {
         )
     }
 
+    // F-40: adaptive top_k on the 14B-1M at 32767. F-38 hit 0.9941
+    // cosine with default fineTopK=32 at 32K-1. F-22 predicted
+    // fineTopK = max(32, seqLen/128). At 32767 that's 255. Does it lift
+    // cosine on the PRD target model?
+    @Test func trainedQwen25_14B_1M_AdaptiveTopKAt32K() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let seqLen = 32767
+        MLXRandom.seed(0x14B7)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        let dn = model.newCache(parameters: nil)
+        _ = model(tokens, cache: dn)
+        let dnLog = model(nextTok, cache: dn)
+
+        for topK in [32, 64, 128, 256] {
+            var raCfg = RetrievalAttentionConfig()
+            raCfg.fineTopK = topK
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raCfg, ropeBase: cfg.ropeTheta)
+            }
+            _ = model(tokens, cache: ra)
+            let raLog = model(nextTok, cache: ra)
+            let dFlat = dnLog.reshaped(dnLog.size).asType(.float32)
+            let rFlat = raLog.reshaped(raLog.size).asType(.float32)
+            let dot = (dFlat * rFlat).sum().asArray(Float.self)[0]
+            let dnN = sqrt((dFlat * dFlat).sum()).asArray(Float.self)[0]
+            let rnN = sqrt((rFlat * rFlat).sum()).asArray(Float.self)[0]
+            let cosine = dot / (dnN * rnN + 1e-12)
+            print(
+                "[F-40-qwen25-14B-1M-adaptive-32K] fineTopK=\(topK) "
+                    + "cosine=\(cosine)"
+            )
+        }
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
