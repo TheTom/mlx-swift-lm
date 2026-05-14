@@ -79,6 +79,19 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   cosines 0.947 / 0.9998 (random-token variance). Dense still
   bit-deterministic in this band; beyond 57K hits the MLX 64K cliff.
 
+  **F-65 long-generation drift**: 64 greedy decode steps on 14B-1M @
+  24K → **64/64 token match** with dense, mean cosine 0.9997. Zero
+  drift across realistic generation length.
+
+  **F-66 memory profile**: at 14B-1M @ 24K prefill, dense peak 17.2 GB
+  vs RA peak 21.8 GB. **+27% memory overhead (~4.6 GB)**. Fits on 32 GB
+  Mac mini with headroom. Selector index (perTokenFeatures pre-alloc +
+  block buffers) is ~600 MB; remaining ~4 GB is MLX intermediate
+  tensors during forward pass. Future optimizations:
+  - fp16 perTokenFeatures (saves ~300 MB)
+  - More aggressive intermediate-tensor freeing
+  - Reuse mask buffer across layers
+
   On Qwen3-0.6B-4bit at 16K:
   - Per-sparse-layer overhead 39ms → ~3ms (>90% drop)
   - F-60: gather path 126ms/step → mask path 27ms/step (4.7x speedup)
