@@ -36,10 +36,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        // Local-path dependency for native GDN tape kernel development.
-        // Will switch back to `url:, exact: "0.32.2-alpha"` once the
-        // tape-replay primitives are tagged on mlx-swift.
-        .package(path: "../mlx-swift"),
+        .package(url: "https://github.com/TheTom/mlx-swift.git", branch: "vllm-swift-stable"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],
