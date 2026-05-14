@@ -3599,6 +3599,87 @@ struct RetrievalAttentionTests {
         print(line)
     }
 
+    // F-79 sustained-decode quality — 128 steps at amort=16 vs amort=1
+    // force-feed. Stresses drift accumulation across ~8 refresh cycles.
+    @Test func selectorAmortizationSustained_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 16_384  // below the 32K cliff
+        let nSteps = 128
+        MLXRandom.seed(0x7901)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+
+        // Reference: amort=1
+        var refConf = RetrievalAttentionConfig()
+        refConf.selectorAmortization = 1
+        let raRef: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: refConf, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(prefillTokens, cache: raRef)
+        eval(raRef.flatMap { $0.state })
+        var refLogits: [MLXArray] = []
+        for s in 0..<nSteps {
+            let logits = model(forceTokens[s], cache: raRef)
+            eval(logits)
+            refLogits.append(logits)
+        }
+
+        // amort=16 (default)
+        let raA: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        _ = model(prefillTokens, cache: raA)
+        eval(raA.flatMap { $0.state })
+        var sumCos: Double = 0
+        var minCos: Float = 1.0
+        var minAtStep = -1
+        for s in 0..<nSteps {
+            let logits = model(forceTokens[s], cache: raA)
+            eval(logits)
+            let r = refLogits[s].reshaped(refLogits[s].size).asType(.float32)
+            let a = logits.reshaped(logits.size).asType(.float32)
+            let dot = (r * a).sum().asArray(Float.self)[0]
+            let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+            let an = sqrt((a * a).sum()).asArray(Float.self)[0]
+            let cos = dot / (rn * an + 1e-12)
+            sumCos += Double(cos)
+            if cos < minCos { minCos = cos; minAtStep = s }
+        }
+        print("[F-79-sustained-128] amort=16 vs amort=1 prefill=16K steps=\(nSteps) "
+            + "mean_cosine=\(String(format: "%.5f", sumCos / Double(nSteps))) "
+            + "min_cosine=\(String(format: "%.5f", minCos)) "
+            + "min_at_step=\(minAtStep)")
+    }
+
     // MLX non-determinism floor test at 49K: run amort=1 TWICE and
     // compare. If cosine is low, MLX itself is non-deterministic at
     // 49K (F-33 cliff at 32K; probably another at ~64K), and the
