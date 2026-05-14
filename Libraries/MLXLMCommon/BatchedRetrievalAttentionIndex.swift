@@ -240,42 +240,55 @@ public final class BatchedRetrievalAttentionIndex {
         }
     }
 
-    /// Top-k fine block starts per head. One asArray sync; CPU partial sort.
-    public func topKFineBlockStartsAllHeads(projectedQ: MLXArray) -> [[Int]] {
-        let scores = scoreFineBlocksBatched(projectedQ: projectedQ)  // [nh, nBlocks]
-        let k = config.effectiveFineTopK(seqLen: seqLen)
-        let arr = scores.asArray(Float.self)  // contiguous [nh*nBlocks]
+    /// Top-k block starts (fine or coarse) per head. Uses MLX argPartition
+    /// on GPU instead of CPU partial sort. asArray pulls only the K winning
+    /// block indices per head (was nBlocks per head — typically 5-50x less
+    /// data transfer per layer per step).
+    ///
+    /// Phase C step 1 toward fused kernel: removes the CPU partial sort
+    /// hot path; sort stays on GPU.
+    private func topKBlockStartsAllHeads(
+        scores: MLXArray, k: Int, blockSize: Int
+    ) -> [[Int]] {
         let nBlocks = scores.dim(1)
+        let take = min(k, nBlocks)
+        guard take > 0 else { return Array(repeating: [], count: nKVHeads) }
+        // argPartition partitions ascending; the largest `take` values'
+        // indices land at positions [nBlocks - take .. nBlocks).
+        let pivotKth = nBlocks - take
+        let partitioned: MLXArray
+        if pivotKth <= 0 {
+            // Every block fits; just emit block-order indices.
+            let rangeArr = MLXArray(0..<Int32(nBlocks))
+                .reshaped(1, nBlocks)
+            partitioned = broadcast(rangeArr, to: [nKVHeads, nBlocks])
+        } else {
+            partitioned = argPartition(scores, kth: pivotKth, axis: -1)
+        }
+        let topKIdx = partitioned[0..., (nBlocks - take)...]  // [nKVH, take]
+        let blockStarts = topKIdx * Int32(blockSize)
+        let cpu = blockStarts.asArray(Int32.self)
         var result: [[Int]] = []
         result.reserveCapacity(nKVHeads)
         for h in 0..<nKVHeads {
-            let base = h * nBlocks
-            let take = min(k, nBlocks)
-            var indexed = (0..<nBlocks).map { ($0, arr[base + $0]) }
-            indexed.sort { $0.1 > $1.1 }
-            let starts = indexed.prefix(take).map { $0.0 * config.fineBlockSize }
-            result.append(starts)
+            let base = h * take
+            result.append((0..<take).map { Int(cpu[base + $0]) })
         }
         return result
+    }
+
+    public func topKFineBlockStartsAllHeads(projectedQ: MLXArray) -> [[Int]] {
+        let scores = scoreFineBlocksBatched(projectedQ: projectedQ)
+        let k = config.effectiveFineTopK(seqLen: seqLen)
+        return topKBlockStartsAllHeads(scores: scores, k: k, blockSize: config.fineBlockSize)
     }
 
     public func topKCoarseBlockStartsAllHeads(projectedQ: MLXArray) -> [[Int]] {
         guard let scores = scoreCoarseBlocksBatched(projectedQ: projectedQ) else {
             return Array(repeating: [], count: nKVHeads)
         }
-        let nBlocks = scores.dim(1)
-        let arr = scores.asArray(Float.self)
-        let k = config.coarseTopK
-        var result: [[Int]] = []
-        result.reserveCapacity(nKVHeads)
-        for h in 0..<nKVHeads {
-            let base = h * nBlocks
-            let take = min(k, nBlocks)
-            var indexed = (0..<nBlocks).map { ($0, arr[base + $0]) }
-            indexed.sort { $0.1 > $1.1 }
-            let starts = indexed.prefix(take).map { $0.0 * config.coarseBlockSize }
-            result.append(starts)
-        }
-        return result
+        return topKBlockStartsAllHeads(
+            scores: scores, k: config.coarseTopK, blockSize: config.coarseBlockSize
+        )
     }
 }
