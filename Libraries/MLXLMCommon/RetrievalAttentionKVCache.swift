@@ -204,6 +204,44 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         )
     }
 
+    /// F-69 fused sparse SDPA path: produce SORTED gather indices entirely
+    /// on GPU (may contain duplicates across heads; the fused kernel
+    /// adjacent-diff-skips them). No asArray sync.
+    public func gatherIndicesGPU(q: MLXArray) -> MLXArray {
+        precondition(q.shape.count == 2, "expected [nHeads, dHead]")
+        guard let index = batchedIndex else {
+            fatalError("indices not initialized; call update first")
+        }
+        let nQHeads = q.dim(0)
+        let groupSize = nQHeads / index.nKVHeads
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray(
+                (0..<index.nKVHeads).map { Int32($0 * groupSize) }
+            )
+            eval(cachedHeadIdx!)
+        }
+        let qStacked = q.take(cachedHeadIdx!, axis: 0).asType(.float32)
+        let projQ = index.projectQueriesBatched(qStacked)
+        let topKPositions = index.expandedTopKPositionsGPU(projectedQ: projQ)
+
+        let T = self.offset
+        let staticEnd = min(raConfig.staticInit, T)
+        let staticPositions = staticEnd > 0
+            ? MLXArray(Int32(0) ..< Int32(staticEnd))
+            : MLXArray.zeros([0], dtype: .int32)
+        let slidingStart = max(0, T - raConfig.slidingWindow)
+        let slidingPositions = slidingStart < T
+            ? MLXArray(Int32(slidingStart) ..< Int32(T))
+            : MLXArray.zeros([0], dtype: .int32)
+
+        let allPositions = concatenated(
+            [staticPositions, slidingPositions, topKPositions], axis: 0
+        )
+        let clipped = clip(allPositions, min: Int32(0), max: Int32(T - 1))
+        // Sort so kernel can adjacent-diff-skip duplicates.
+        return sorted(clipped)
+    }
+
     /// F-59 mask-not-gather path: build a [1, 1, 1, T] additive attention
     /// mask on GPU with 0 at gathered positions and -inf elsewhere.
     /// Scatter is idempotent for setting to 0, so duplicate positions

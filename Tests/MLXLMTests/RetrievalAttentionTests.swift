@@ -3338,6 +3338,49 @@ struct RetrievalAttentionTests {
         )
     }
 
+    // F-69: validate fused sparse SDPA kernel produces same output as
+    // MLX gather + dense SDPA reference.
+    @Test func fusedSparseSDPAMatchesReference() throws {
+        let B = 1
+        let nQH = 4
+        let nKVH = 2
+        let T = 32
+        let D = 128
+        let gatherList: [Int32] = [0, 3, 7, 11, 18, 25, 29, 31]
+        let scale: Float = 1.0 / sqrtf(Float(D))
+
+        MLXRandom.seed(0x69)
+        let q = MLXRandom.normal([B, nQH, 1, D]).asType(.float32)
+        let k = MLXRandom.normal([B, nKVH, T, D]).asType(.float32)
+        let v = MLXRandom.normal([B, nKVH, T, D]).asType(.float32)
+        let gather = MLXArray(gatherList)
+
+        // Reference: gather K, V then dense SDPA.
+        let gatheredK = k.take(gather, axis: 2)
+        let gatheredV = v.take(gather, axis: 2)
+        let refOut = MLXFast.scaledDotProductAttention(
+            queries: q, keys: gatheredK, values: gatheredV,
+            scale: scale, mask: .none
+        )
+
+        // Fused kernel.
+        let fusedOut = retrievalAttentionFusedSparseSDPA(
+            queries: q, keys: k, values: v,
+            gatherIndices: gather, scale: scale
+        )
+
+        let r = refOut.reshaped(refOut.size).asType(.float32)
+        let f = fusedOut.reshaped(fusedOut.size).asType(.float32)
+        let diff = (r - f).abs().max().asArray(Float.self)[0]
+        let dot = (r * f).sum().asArray(Float.self)[0]
+        let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+        let fn = sqrt((f * f).sum()).asArray(Float.self)[0]
+        let cosine = dot / (rn * fn + 1e-12)
+        print("[F-69-sparse-sdpa] max_abs_diff=\(diff) cosine=\(cosine)")
+        #expect(cosine >= 0.9999, "sparse SDPA kernel cosine \(cosine)")
+        #expect(diff < 1e-3, "sparse SDPA kernel max_abs_diff \(diff)")
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.

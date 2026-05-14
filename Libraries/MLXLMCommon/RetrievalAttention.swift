@@ -167,6 +167,16 @@ public struct RetrievalAttentionConfig: Sendable {
     /// dense-SDPA-over-T compute would dominate gather overhead).
     public var useMaskedDense: Bool = true
 
+    /// F-69 experimental: fused sparse SDPA Metal kernel. Correct (F-69
+    /// max_abs_diff=3.6e-7 vs MLX gather+SDPA reference) but with the
+    /// current adaptive top_k + union-across-KV-heads gather, the
+    /// pre-dedupe budget saturates T at most contexts, so the sparse
+    /// kernel's compute savings vanish and the simpler sequential loop
+    /// loses to MLX's tiled SDPA. **Disabled by default**; opt-in for
+    /// experimentation. Real win requires per-Q-head separate gathers
+    /// and a parallelized kernel.
+    public var useFusedSparseSDPA: Bool = false
+
     /// F-63: minimum cache size before RA mask/gather even kicks in.
     /// Below this threshold the dispatcher falls through to standard
     /// dense SDPA — at small caches RA's selector + mask construction
