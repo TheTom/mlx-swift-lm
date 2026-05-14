@@ -4162,6 +4162,219 @@ struct RetrievalAttentionTests {
         #expect(minCos >= 0.99999, "F-80 cliff regressed: min_cosine=\(minCos)")
     }
 
+    // F-82: sentinel-on validation on real K. F-05 (synthetic Gaussian)
+    // said HURTS, F-18 said slightly HELPS on real K microbench. PRD
+    // wanted a third measurement on real text at decode. Now with the
+    // F-80 allocator fix, we get bit-clean comparisons.
+    @Test func sentinelOnValidation_32K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32_767
+        let nSteps = 8
+        MLXRandom.seed(0xF820)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+
+        func runDense() -> [MLXArray] {
+            let cache = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: cache)
+            eval(cache.flatMap { $0.state })
+            return (0..<nSteps).map { s in
+                let l = model(forceTokens[s], cache: cache)
+                eval(l)
+                return l
+            }
+        }
+        func runRA(sentinel: Bool) -> [MLXArray] {
+            var raConfig = RetrievalAttentionConfig()
+            raConfig.sentinelEnabled = sentinel
+            let caches: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raConfig, ropeBase: cfg.ropeTheta
+                )
+            }
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            return (0..<nSteps).map { s in
+                let l = model(forceTokens[s], cache: caches)
+                eval(l)
+                return l
+            }
+        }
+        func meanCosine(_ a: [MLXArray], _ b: [MLXArray]) -> Double {
+            var sum: Double = 0
+            for s in 0..<a.count {
+                let aF = a[s].reshaped(a[s].size).asType(.float32)
+                let bF = b[s].reshaped(b[s].size).asType(.float32)
+                let dot = (aF * bF).sum().asArray(Float.self)[0]
+                let an = sqrt((aF * aF).sum()).asArray(Float.self)[0]
+                let bn = sqrt((bF * bF).sum()).asArray(Float.self)[0]
+                sum += Double(dot / (an * bn + 1e-12))
+            }
+            return sum / Double(a.count)
+        }
+        func argmaxMatches(_ a: [MLXArray], _ b: [MLXArray]) -> Int {
+            var m = 0
+            for s in 0..<a.count {
+                let ai = a[s].argMax(axis: -1).asArray(Int32.self)[0]
+                let bi = b[s].argMax(axis: -1).asArray(Int32.self)[0]
+                if ai == bi { m += 1 }
+            }
+            return m
+        }
+
+        let dense = runDense()
+        let raOff = runRA(sentinel: false)
+        let raOn = runRA(sentinel: true)
+
+        let cosOff = meanCosine(dense, raOff)
+        let cosOn = meanCosine(dense, raOn)
+        let cosOnVsOff = meanCosine(raOff, raOn)
+        let matchOff = argmaxMatches(dense, raOff)
+        let matchOn = argmaxMatches(dense, raOn)
+        print("[F-82-sentinel] sentinel=off cosine_vs_dense=\(String(format: "%.5f", cosOff)) argmax=\(matchOff)/\(nSteps)")
+        print("[F-82-sentinel] sentinel=on  cosine_vs_dense=\(String(format: "%.5f", cosOn))  argmax=\(matchOn)/\(nSteps)")
+        print("[F-82-sentinel] sentinel-on-vs-off cosine=\(String(format: "%.5f", cosOnVsOff))")
+        // Verdict: if cosOn > cosOff by >0.001, sentinel helps. If <, hurts.
+        // Within noise (~±0.0005) — neutral.
+        let delta = cosOn - cosOff
+        let verdict = delta > 0.001 ? "HELPS"
+                    : delta < -0.001 ? "HURTS"
+                    : "NEUTRAL"
+        print("[F-82-sentinel] verdict=\(verdict) delta=\(String(format: "%+.5f", delta))")
+    }
+
+    // F-79 quality demo at 256K. Headline target for matching SubQ
+    // long-context claims. F-80 cliff fix unblocked this band. Runs
+    // 4 decode steps (kept short — at 256K each step is slow), asserts
+    // cosine >= 0.99 and argmax_match >= 3/4.
+    @Test func f79Quality_256K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 262_143  // 256K - 1
+        let nSteps = 4
+        MLXRandom.seed(0xF256)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+
+        func runDense() -> (logits: [MLXArray], ms: [Double]) {
+            let cache = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: cache)
+            eval(cache.flatMap { $0.state })
+            var logits: [MLXArray] = []
+            var ms: [Double] = []
+            for s in 0..<nSteps {
+                let t0 = Date()
+                let l = model(forceTokens[s], cache: cache)
+                eval(l)
+                ms.append(Date().timeIntervalSince(t0) * 1000)
+                logits.append(l)
+            }
+            return (logits, ms)
+        }
+        func runRA() -> (logits: [MLXArray], ms: [Double]) {
+            let raConfig = RetrievalAttentionConfig()  // F-79 amort=16
+            let caches: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raConfig, ropeBase: cfg.ropeTheta
+                )
+            }
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var logits: [MLXArray] = []
+            var ms: [Double] = []
+            for s in 0..<nSteps {
+                let t0 = Date()
+                let l = model(forceTokens[s], cache: caches)
+                eval(l)
+                ms.append(Date().timeIntervalSince(t0) * 1000)
+                logits.append(l)
+            }
+            return (logits, ms)
+        }
+
+        let denseRes = runDense()
+        let raRes = runRA()
+        var sumCos: Double = 0
+        var matches = 0
+        for s in 0..<nSteps {
+            let dF = denseRes.logits[s].reshaped(denseRes.logits[s].size).asType(.float32)
+            let rF = raRes.logits[s].reshaped(raRes.logits[s].size).asType(.float32)
+            let dot = (dF * rF).sum().asArray(Float.self)[0]
+            let dn = sqrt((dF * dF).sum()).asArray(Float.self)[0]
+            let rn = sqrt((rF * rF).sum()).asArray(Float.self)[0]
+            sumCos += Double(dot / (dn * rn + 1e-12))
+            let dArg = denseRes.logits[s].argMax(axis: -1).asArray(Int32.self)[0]
+            let rArg = raRes.logits[s].argMax(axis: -1).asArray(Int32.self)[0]
+            if dArg == rArg { matches += 1 }
+        }
+        let meanCos = sumCos / Double(nSteps)
+        func median(_ arr: [Double]) -> Double {
+            let s = arr.sorted()
+            return s.count % 2 == 1 ? s[s.count/2] : (s[s.count/2 - 1] + s[s.count/2]) / 2
+        }
+        let denseMs = median(Array(denseRes.ms.dropFirst()))
+        let raMs = median(Array(raRes.ms.dropFirst()))
+        print("[F-79-256K] T=\(prefillLen) "
+            + "mean_cosine=\(String(format: "%.5f", meanCos)) "
+            + "argmax=\(matches)/\(nSteps) "
+            + "dense=\(String(format: "%.1f", denseMs))ms "
+            + "ra=\(String(format: "%.1f", raMs))ms "
+            + "gap=\(String(format: "%+.1f", raMs - denseMs))ms")
+        #expect(meanCos >= 0.99, "F-79 quality regressed at 256K: \(meanCos)")
+        #expect(matches >= 3, "F-79 argmax regressed at 256K: \(matches)/4")
+    }
+
     // F-80 follow-up: validate "safe configs" of asymmetric TurboQuant
     // still work end-to-end on a real model. Each safe config: prefill +
     // 4 decode steps, assert non-NaN, cosine vs dense above degenerate
