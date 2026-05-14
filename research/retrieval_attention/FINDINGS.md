@@ -63,6 +63,22 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   (gather/mask bypassed; cache size < preBudget). **Prefill at parity**
   (dense 22.3s, RA 22.1s @ 24K).
 
+  **F-63 sparseMinContext threshold**: dispatcher falls through to
+  dense SDPA when cache size ≤ 16K. Short-prompt workloads run at
+  native dense speed:
+
+  | seqLen | dense | RA | ratio |
+  |---|---|---|---|
+  | 4K  | 30.8ms | 34.7ms | 1.13x (gather skipped) |
+  | 8K  | 33.2ms | 35.6ms | **1.07x** (threshold skipped) |
+  | 16K | 36.1ms | 80.7ms | 2.24x (RA active) |
+  | 24K | 41.5ms | 97.8ms | 2.36x |
+  | 32K-1 | 61.0ms | 144.3ms | 2.36x |
+
+  **F-64 long-context validation**: 14B-1M @ 48K-57K with mask path:
+  cosines 0.947 / 0.9998 (random-token variance). Dense still
+  bit-deterministic in this band; beyond 57K hits the MLX 64K cliff.
+
   On Qwen3-0.6B-4bit at 16K:
   - Per-sparse-layer overhead 39ms → ~3ms (>90% drop)
   - F-60: gather path 126ms/step → mask path 27ms/step (4.7x speedup)
