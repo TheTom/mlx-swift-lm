@@ -55,6 +55,11 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
     /// the model's positional encoding.
     public let ropeBase: Float
 
+    /// Cached [nKVHeads] int32 array of representative Q-head indices per
+    /// KV group (used for the strided gather of q in gatherIndicesForDecode).
+    /// Allocated lazily on first use.
+    private var cachedHeadIdx: MLXArray?
+
     /// Returns `true` when this layer is in the sparse band (not in the
     /// first-N or last-N dense layers).
     public var isSparseEligible: Bool {
@@ -167,13 +172,15 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         let groupSize = nQHeads / index.nKVHeads
 
         // Pick the representative Q head per KV group (head index = h * groupSize).
-        // Single strided gather → [nKVHeads, dHead]. Replaces an N-iter
-        // Swift loop with N MLX slice ops + a concat (was ~9 ops at
-        // nKVHeads=8; now 1 op).
-        let headIdx = MLXArray(
-            (0..<index.nKVHeads).map { Int32($0 * groupSize) }
-        )
-        let qStacked = q.take(headIdx, axis: 0).asType(.float32)
+        // Single strided gather → [nKVHeads, dHead]. headIdx is cached on
+        // the cache instance since it never changes for a given model.
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray(
+                (0..<index.nKVHeads).map { Int32($0 * groupSize) }
+            )
+            eval(cachedHeadIdx!)
+        }
+        let qStacked = q.take(cachedHeadIdx!, axis: 0).asType(.float32)
         let projQ = index.projectQueriesBatched(qStacked)
 
         // Fine + coarse topK in a single GPU op chain with ONE asArray.
