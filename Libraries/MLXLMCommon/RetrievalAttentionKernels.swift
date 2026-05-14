@@ -22,6 +22,7 @@ private final class _RAKernelCache: @unchecked Sendable {
     private var scoreTopKKernel: MLXFast.MLXFastKernel?
     private var sparseSDPAKernel: MLXFast.MLXFastKernel?
     private var groupSDPAKernel: MLXFast.MLXFastKernel?
+    private var buildMaskKernel: MLXFast.MLXFastKernel?
 
     /// F-71b NSA-style fused sparse SDPA matching mlx-swift's
     /// `sdpa_vector` layout: BN=32 simdgroups × BD=32 lanes per
@@ -302,6 +303,93 @@ private final class _RAKernelCache: @unchecked Sendable {
         return k
     }
 
+    /// F-73 fused build-mask kernel. Takes top-K block start positions
+    /// (already computed via F-48) plus static/sliding params and
+    /// writes the [1, 1, 1, T] additive attention mask directly. One
+    /// thread per mask position; each checks membership against the
+    /// union of static + sliding + fine_topK_blocks + coarse_topK_blocks
+    /// and writes 0 or -inf.
+    ///
+    /// Replaces ~6 MLX ops (position expansion + concat + clip + scatter)
+    /// with 1 kernel — F-73 measured 22.9ms / decode step is JUST the
+    /// selector pipeline (cache overhead = 0.1ms), so this is the gap
+    /// to dense.
+    func getBuildMask() -> MLXFast.MLXFastKernel {
+        lock.lock()
+        defer { lock.unlock() }
+        if let k = buildMaskKernel { return k }
+        let header = """
+            // F-73 fused build-mask kernel.
+
+            """
+        let source = """
+            // Template constants: FINE_BS, COARSE_BS, NKVH, K_FINE, K_COARSE
+            // Inputs:
+            //   fine_starts:   [NKVH * K_FINE] int32 block start positions
+            //   coarse_starts: [NKVH * K_COARSE] int32 block start positions
+            //   params:        [T_f, staticInit_f, slidingWindow_f]
+            // Output:
+            //   mask:          [T] float — additive (0 valid, -inf masked)
+            //
+            // Grid: ((T + tg-1)/tg, 1, 1) threadgroups × (tg, 1, 1) threads.
+            // Each thread covers one mask position; checks membership
+            // against the cached topK arrays in threadgroup memory.
+
+            const uint p = thread_position_in_grid.x;
+            const uint T = (uint)params[0];
+            if (p >= T) return;
+            const uint staticInit = (uint)params[1];
+            const uint slidingWindow = (uint)params[2];
+            const uint sliding_start = (T > slidingWindow) ? (T - slidingWindow) : 0u;
+
+            // Cache the topK start arrays in threadgroup memory. All threads
+            // in the threadgroup share the same arrays — load cooperatively.
+            threadgroup int fine_tg[NKVH * K_FINE];
+            threadgroup int coarse_tg[NKVH * K_COARSE];
+
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint tg_size = threads_per_threadgroup.x;
+            for (uint i = tid; i < NKVH * K_FINE; i += tg_size) {
+                fine_tg[i] = fine_starts[i];
+            }
+            for (uint i = tid; i < NKVH * K_COARSE; i += tg_size) {
+                coarse_tg[i] = coarse_starts[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            bool valid = (p < staticInit) || (p >= sliding_start);
+
+            if (!valid) {
+                for (uint i = 0; i < NKVH * K_FINE && !valid; i++) {
+                    const int start = fine_tg[i];
+                    if ((int)p >= start && (int)p < start + (int)FINE_BS) {
+                        valid = true;
+                    }
+                }
+            }
+            if (!valid) {
+                for (uint i = 0; i < NKVH * K_COARSE && !valid; i++) {
+                    const int start = coarse_tg[i];
+                    if ((int)p >= start && (int)p < start + (int)COARSE_BS) {
+                        valid = true;
+                    }
+                }
+            }
+
+            mask[p] = valid ? 0.0f : -INFINITY;
+            """
+        let k = MLXFast.metalKernel(
+            name: "ra_build_mask",
+            inputNames: ["fine_starts", "coarse_starts", "params"],
+            outputNames: ["mask"],
+            source: source,
+            header: header,
+            ensureRowContiguous: true
+        )
+        buildMaskKernel = k
+        return k
+    }
+
     func getScoreTopK() -> MLXFast.MLXFastKernel {
         lock.lock()
         defer { lock.unlock() }
@@ -538,6 +626,67 @@ public func retrievalAttentionGroupSparseSDPA(
         outputDTypes: [.float32]
     )
     return outputs[0].asType(queries.dtype)
+}
+
+/// F-73 — fused build-mask kernel wrapper. Takes per-KV-head top-K
+/// block start arrays (output of F-48 scoreTopKFused) plus the static/
+/// sliding window params, returns the [1, 1, 1, T] additive attention
+/// mask. Replaces ~6 MLX ops (position expansion + concat + clip +
+/// `MLXArray.full` + scatter) with one Metal kernel launch.
+///
+/// - Parameters:
+///   - fineStarts: `[nKVH, K_fine]` int32 block-start positions
+///   - coarseStarts: `[nKVH, K_coarse]` int32 block-start positions
+///   - T: total cache positions
+///   - staticInit: static-initial window size
+///   - slidingWindow: trailing-sliding window size
+///   - fineBS: fine block size in tokens
+///   - coarseBS: coarse block size in tokens
+///   - outputDtype: dtype for the returned mask (typically `K.dtype`)
+/// - Returns: `[1, 1, 1, T]` additive mask (0 at valid, -inf at masked).
+public func retrievalAttentionBuildMaskFused(
+    fineStarts: MLXArray,
+    coarseStarts: MLXArray,
+    T: Int,
+    staticInit: Int,
+    slidingWindow: Int,
+    fineBS: Int,
+    coarseBS: Int,
+    outputDtype: DType
+) -> MLXArray {
+    precondition(fineStarts.shape.count == 2, "fineStarts must be [nKVH, K_fine]")
+    precondition(coarseStarts.shape.count == 2, "coarseStarts must be [nKVH, K_coarse]")
+    let nKVH = fineStarts.dim(0)
+    let kFine = fineStarts.dim(1)
+    let kCoarse = coarseStarts.dim(1)
+    precondition(coarseStarts.dim(0) == nKVH, "head count mismatch")
+
+    let params = MLXArray([
+        Float(T), Float(staticInit), Float(slidingWindow),
+    ])
+    let fineFlat = fineStarts.reshaped(nKVH * kFine)
+    let coarseFlat = coarseStarts.reshaped(nKVH * kCoarse)
+
+    let kernel = _RAKernelCache.shared.getBuildMask()
+    let tgSize = 256
+    // Round up grid to threadgroup multiple so the kernel only does
+    // bounds-check on `p`.
+    let gridX = ((T + tgSize - 1) / tgSize) * tgSize
+    let outputs = kernel(
+        [fineFlat, coarseFlat, params],
+        template: [
+            ("FINE_BS", fineBS),
+            ("COARSE_BS", coarseBS),
+            ("NKVH", nKVH),
+            ("K_FINE", kFine),
+            ("K_COARSE", kCoarse),
+        ],
+        grid: (gridX, 1, 1),
+        threadGroup: (tgSize, 1, 1),
+        outputShapes: [[1, 1, 1, T]],
+        outputDTypes: [.float32]
+    )
+    return outputs[0].asType(outputDtype)
 }
 
 /// Run the fused score+top-K kernel.

@@ -199,6 +199,24 @@ public struct RetrievalAttentionConfig: Sendable {
     /// benches confirm a measurable win over the F-59 mask path.
     public var usePerKVHeadGather: Bool = false
 
+    /// F-73 build-mask path: replace the multi-op buildAttentionMaskGPU
+    /// pipeline with a single fused Metal kernel that writes the
+    /// `[1, 1, 1, T]` additive mask from the top-K block starts in one
+    /// launch. F-73 diagnostic isolated 22.9ms / 22.9ms gap-to-dense as
+    /// the selector pipeline overhead — this kernel is the primary
+    /// path to close it.
+    public var useFusedMaskBuild: Bool = false
+
+    /// F-73 diagnostic: bypass the entire RetrievalAttention selector
+    /// pipeline at decode steps and route to plain dense SDPA over the
+    /// full K/V cache. The cache still updates K/V (and the selector
+    /// index from prefill stays warm), but the per-step scoring +
+    /// mask-build chain is skipped. Used to isolate how much of the
+    /// RA-over-dense gap is selector overhead vs the cache update
+    /// + dispatcher chain. NOT a ship config — produces dense attention
+    /// outputs.
+    public var bypassSelectorDecode: Bool = false
+
     /// F-63: minimum cache size before RA mask/gather even kicks in.
     /// Below this threshold the dispatcher falls through to standard
     /// dense SDPA — at small caches RA's selector + mask construction

@@ -476,6 +476,44 @@ public final class BatchedRetrievalAttentionIndex {
     /// op chain with a single dispatch when nBlocks ≤ 1024 (the kernel's
     /// shared-memory cap). Otherwise falls back to the MLX-ops path
     /// (topKBlockStartsMLX).
+    /// F-73 GPU-tensor variant of `topKBlockStartsAllHeadsCombined`.
+    /// Returns the per-KV-head top-K block starts as MLXArrays
+    /// (`[nKVH, K_fine]` and `[nKVH, K_coarse]`) — no asArray sync.
+    /// Feeds the fused build-mask kernel.
+    public func topKBlockStartsAllHeadsCombinedGPU(
+        projectedQ: MLXArray
+    ) -> (fine: MLXArray, coarse: MLXArray) {
+        guard let fineFeatures = fineBlockFeatures else {
+            return (MLXArray.zeros([nKVHeads, 1], dtype: .int32),
+                    MLXArray.zeros([nKVHeads, 1], dtype: .int32))
+        }
+        let fineN = fineFeatures.dim(1)
+        let kFine = min(config.effectiveFineTopK(seqLen: seqLen), fineN)
+        guard kFine > 0 else {
+            return (MLXArray.zeros([nKVHeads, 1], dtype: .int32),
+                    MLXArray.zeros([nKVHeads, 1], dtype: .int32))
+        }
+        let fineStarts = computeTopKBlockStarts(
+            features: fineFeatures, projectedQ: projectedQ,
+            k: kFine, blockSize: config.fineBlockSize
+        )
+        let coarse: MLXArray
+        if config.coarseRescueEnabled, let coarseFeatures = coarseBlockFeatures {
+            let kCoarse = min(config.coarseTopK, coarseFeatures.dim(1))
+            if kCoarse > 0 {
+                coarse = computeTopKBlockStarts(
+                    features: coarseFeatures, projectedQ: projectedQ,
+                    k: kCoarse, blockSize: config.coarseBlockSize
+                )
+            } else {
+                coarse = MLXArray.zeros([nKVHeads, 1], dtype: .int32)
+            }
+        } else {
+            coarse = MLXArray.zeros([nKVHeads, 1], dtype: .int32)
+        }
+        return (fine: fineStarts, coarse: coarse)
+    }
+
     public func topKBlockStartsAllHeadsCombined(
         projectedQ: MLXArray
     ) -> (fine: [[Int]], coarse: [[Int]]) {

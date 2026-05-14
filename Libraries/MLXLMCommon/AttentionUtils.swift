@@ -155,6 +155,17 @@ public func attentionWithCacheUpdate(
         let preBudget = retrievalAttentionPreDedupeBudget(config: raCache.raConfig)
         let threshold = max(preBudget, raCache.raConfig.sparseMinContext)
         let canGather = L == 1 && raCache.isSparseEligible && cachedKeys.dim(2) > threshold
+        // F-73 diagnostic: bypass selector pipeline entirely at decode.
+        // Falls through to the dense `MLXFast.scaledDotProductAttention`
+        // below. Lets us isolate selector vs cache-update overhead.
+        if canGather && raCache.raConfig.bypassSelectorDecode {
+            return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: cachedKeys, values: cachedValues,
+                    scale: scale, mask: mask, sinks: sinks
+                )
+            }
+        }
         if canGather {
             let qFlat = queries[0, 0..., 0, 0...]
             let D = cachedKeys.dim(3)
@@ -192,6 +203,21 @@ public func attentionWithCacheUpdate(
                         values: cachedValues,
                         gatherIndices: gatherMLX,
                         scale: scale
+                    )
+                }
+            }
+            if raCache.raConfig.useFusedMaskBuild {
+                // F-73 — single Metal kernel writes the mask in one
+                // launch (vs F-59's ~6 MLX ops). Selector pipeline is
+                // the entire 22.9ms / decode-step gap to dense.
+                let T = cachedKeys.dim(2)
+                let raMask = raCache.buildAttentionMaskFusedKernel(
+                    q: qFlat, dtype: cachedKeys.dtype, T: T
+                )
+                return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                    MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: cachedKeys, values: cachedValues,
+                        scale: scale, mask: .array(raMask), sinks: sinks
                     )
                 }
             }

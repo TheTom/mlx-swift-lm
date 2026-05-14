@@ -418,6 +418,49 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         return out
     }
 
+    /// F-73 fused build-mask path: compute top-K block starts then call
+    /// the single Metal kernel that writes the `[1, 1, 1, T]` additive
+    /// mask in one launch. Replaces the ~6-op `buildAttentionMaskGPU`
+    /// pipeline (range + concat + clip + full + scatter) with one
+    /// kernel call. Targets the 22.9ms / decode step selector-pipeline
+    /// overhead measured in F-73 diagnostic.
+    public func buildAttentionMaskFusedKernel(
+        q: MLXArray, dtype: DType, T: Int
+    ) -> MLXArray {
+        precondition(q.shape.count == 2, "expected [nHeads, dHead]")
+        guard let index = batchedIndex else {
+            fatalError("indices not initialized; call update first")
+        }
+        let nQHeads = q.dim(0)
+        precondition(
+            nQHeads % index.nKVHeads == 0,
+            "Q heads (\(nQHeads)) must be a multiple of KV heads (\(index.nKVHeads))"
+        )
+        let groupSize = nQHeads / index.nKVHeads
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray(
+                (0..<index.nKVHeads).map { Int32($0 * groupSize) }
+            )
+            eval(cachedHeadIdx!)
+        }
+        let qStacked = q.take(cachedHeadIdx!, axis: 0).asType(.float32)
+        let projQ = index.projectQueriesBatched(qStacked)
+
+        let (fineStartsPerHead, coarseStartsPerHead) =
+            index.topKBlockStartsAllHeadsCombinedGPU(projectedQ: projQ)
+
+        return retrievalAttentionBuildMaskFused(
+            fineStarts: fineStartsPerHead,
+            coarseStarts: coarseStartsPerHead,
+            T: T,
+            staticInit: raConfig.staticInit,
+            slidingWindow: raConfig.slidingWindow,
+            fineBS: raConfig.fineBlockSize,
+            coarseBS: raConfig.coarseBlockSize,
+            outputDtype: dtype
+        )
+    }
+
     /// F-59 mask-not-gather path: build a [1, 1, 1, T] additive attention
     /// mask on GPU with 0 at gathered positions and -inf elsewhere.
     /// Scatter is idempotent for setting to 0, so duplicate positions

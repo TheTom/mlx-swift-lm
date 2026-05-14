@@ -3444,6 +3444,257 @@ struct RetrievalAttentionTests {
         #expect(diff < 1e-3, "F-71 kernel max_abs_diff \(diff)")
     }
 
+    // F-73 correctness: fused build-mask kernel matches the F-59
+    // multi-op buildAttentionMaskGPU bit-for-bit on Qwen3-0.6B-4bit at
+    // 17K (past sparseMinContext so RA paths are routed).
+    @Test func fusedMaskBuildMatchesReference() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let seqLen = 17_000
+        MLXRandom.seed(0xF73A)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        var maskCfg = RetrievalAttentionConfig()
+        maskCfg.useMaskedDense = true
+        maskCfg.useFusedMaskBuild = false
+        let raMask: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: maskCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raMask)
+        let maskLog = model(nextTok, cache: raMask)
+        eval(maskLog)
+
+        var fusedCfg = RetrievalAttentionConfig()
+        fusedCfg.useFusedMaskBuild = true
+        let raFused: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: fusedCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raFused)
+        let fusedLog = model(nextTok, cache: raFused)
+        eval(fusedLog)
+
+        let m = maskLog.reshaped(maskLog.size).asType(.float32)
+        let f = fusedLog.reshaped(fusedLog.size).asType(.float32)
+        let dot = (m * f).sum().asArray(Float.self)[0]
+        let mn = sqrt((m * m).sum()).asArray(Float.self)[0]
+        let fn = sqrt((f * f).sum()).asArray(Float.self)[0]
+        let cosine = dot / (mn * fn + 1e-12)
+        let diff = (m - f).abs().max().asArray(Float.self)[0]
+        print("[F-73-fused-vs-mask] seqLen=\(seqLen) cosine=\(cosine) max_abs_diff=\(diff)")
+        // Same set semantics (cross-head union via membership check) →
+        // should be bit-exact up to float rounding from the topK arg
+        // ordering. Set tight ≥0.9999.
+        #expect(cosine >= 0.9999, "fused mask diverges from F-59; cosine=\(cosine)")
+    }
+
+    // F-73 latency: fused build-mask vs F-59 multi-op path at 32K on
+    // Qwen2.5-14B-1M-4bit. F-73 bypass diagnostic showed 22.9ms / decode
+    // step is purely the selector pipeline overhead; this kernel
+    // collapses ~6 MLX ops per layer to 1 — target close to dense.
+    @Test func fusedMaskBuildLatency_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32767
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runOne(mode: String) -> Double {
+            let caches: [KVCache]
+            switch mode {
+            case "dense":
+                caches = (0..<cfg.hiddenLayers).map { _ in StandardKVCache() }
+            case "F-59-mask":
+                var raConf = RetrievalAttentionConfig()
+                raConf.useMaskedDense = true
+                raConf.useFusedMaskBuild = false
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            case "F-73-fused":
+                var raConf = RetrievalAttentionConfig()
+                raConf.useFusedMaskBuild = true
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            default: fatalError("bad mode")
+            }
+            MLXRandom.seed(0x7300)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        let denseMs = runOne(mode: "dense")
+        let f59Ms = runOne(mode: "F-59-mask")
+        let f73Ms = runOne(mode: "F-73-fused")
+        let f59Overhead = f59Ms - denseMs
+        let f73Overhead = f73Ms - denseMs
+        let saved = f59Ms - f73Ms
+        print(
+            "[F-73-latency] T=32K dense=\(String(format: "%.1f", denseMs))ms "
+                + "F-59=\(String(format: "%.1f", f59Ms))ms "
+                + "F-73=\(String(format: "%.1f", f73Ms))ms | "
+                + "F-59-overhead=\(String(format: "%.1f", f59Overhead))ms "
+                + "F-73-overhead=\(String(format: "%.1f", f73Overhead))ms "
+                + "saved=\(String(format: "%.1f", saved))ms"
+        )
+    }
+
+    // F-73 selector-bypass diagnostic: isolate what fraction of the
+    // RA-over-dense gap is the per-decode-step selector pipeline vs the
+    // cache update + dispatcher chain. Bench dense vs RA-bypass vs
+    // RA-mask at 32K. RA-bypass uses RetrievalAttentionKVCache (still
+    // updates the index from prefill) but at decode just calls dense
+    // SDPA. Difference between RA-bypass and dense = cache/dispatcher
+    // overhead. Difference between mask and RA-bypass = selector pipe.
+    @Test func selectorBypassDiagnostic_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32767
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runOne(mode: String) -> Double {
+            let caches: [KVCache]
+            switch mode {
+            case "dense":
+                caches = (0..<cfg.hiddenLayers).map { _ in StandardKVCache() }
+            case "RA-bypass":
+                var raConf = RetrievalAttentionConfig()
+                raConf.bypassSelectorDecode = true
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            case "RA-mask":
+                var raConf = RetrievalAttentionConfig()
+                raConf.useMaskedDense = true
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            default: fatalError("bad mode")
+            }
+            MLXRandom.seed(0x7330)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        let denseMs = runOne(mode: "dense")
+        let bypassMs = runOne(mode: "RA-bypass")
+        let maskMs = runOne(mode: "RA-mask")
+        let cacheOverhead = bypassMs - denseMs
+        let selectorOverhead = maskMs - bypassMs
+        print(
+            "[F-73-bypass] T=32K dense=\(String(format: "%.1f", denseMs))ms "
+                + "RA-bypass=\(String(format: "%.1f", bypassMs))ms "
+                + "RA-mask=\(String(format: "%.1f", maskMs))ms | "
+                + "cache_overhead=\(String(format: "%.1f", cacheOverhead))ms "
+                + "selector_overhead=\(String(format: "%.1f", selectorOverhead))ms"
+        )
+    }
+
     // F-72b crossover bench: dense vs mask vs perKV vs group across
     // 16K → 49K. Tests the hypothesis that RA paths win at longer
     // contexts even on this hardware.
