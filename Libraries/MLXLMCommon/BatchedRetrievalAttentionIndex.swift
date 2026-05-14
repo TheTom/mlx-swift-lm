@@ -102,7 +102,10 @@ public final class BatchedRetrievalAttentionIndex {
         let newSeqLen = oldSeqLen + L
 
         // Project: [nKVHeads, L, dHead] @ [dHead, contentDim] = [nKVHeads, L, contentDim]
-        let contentNew = matmul(newKeys, WT).asType(.float32)
+        // F-67: store features as fp16 to halve perTokenFeatures memory.
+        // Score path upcasts on read; quality preserved (16-element dot
+        // products fit fp16 dynamic range cleanly).
+        let contentNew = matmul(newKeys, WT).asType(.float16)
 
         // Trig features only when lambdaPos > 0 — pure content (default
         // λ=0 ship config per F-46) ignores the trig half of the selector.
@@ -168,10 +171,12 @@ public final class BatchedRetrievalAttentionIndex {
                 isFine: false, featureDim: featureDim, multiToken: L > 1
             )
         }
-        // No explicit eval — in-place writes into pre-allocated buffers
-        // don't accumulate a deep graph chain like the old concat-based
-        // path did. The next consumer (asArray in topKBlockStartsCombined)
-        // will materialize the dependent block-buffer reads naturally.
+        // No explicit eval — in-place writes don't accumulate a deep
+        // graph chain. The next consumer materializes dependent reads
+        // naturally. (F-66 found 4.6 GB prefill overhead; adding eval
+        // here didn't reduce it — the bulk of the overhead is elsewhere
+        // in the forward-pass intermediate buffers, not in the index
+        // update path.)
     }
 
     /// In-place block-pool update onto a pre-allocated buffer.

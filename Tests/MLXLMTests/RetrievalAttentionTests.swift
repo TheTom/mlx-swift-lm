@@ -3226,12 +3226,22 @@ struct RetrievalAttentionTests {
             [1, prefillLen]
         ).asType(.int32)
 
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
         // Dense.
         MLX.GPU.resetPeakMemory()
         let dn = model.newCache(parameters: nil)
         _ = model(prefillTokens, cache: dn)
         eval(dn.flatMap { $0.state })
-        let densePeakMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+        let densePrefMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+        MLX.GPU.resetPeakMemory()
+        let dnLog = model(nextTok, cache: dn)
+        eval(dnLog)
+        let denseDecMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
 
         // RA.
         MLX.GPU.resetPeakMemory()
@@ -3242,16 +3252,20 @@ struct RetrievalAttentionTests {
         }
         _ = model(prefillTokens, cache: ra)
         eval(ra.flatMap { $0.state })
-        let raPeakMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+        let raPrefMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+        MLX.GPU.resetPeakMemory()
+        let raLog = model(nextTok, cache: ra)
+        eval(raLog)
+        let raDecMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
 
-        let overheadMB = raPeakMB - densePeakMB
-        let overheadPct = (overheadMB / densePeakMB) * 100
         print(
             "[F-66-memory] prefill=\(prefillLen) "
-                + "dense_peak_MB=\(String(format: "%.1f", densePeakMB)) "
-                + "ra_peak_MB=\(String(format: "%.1f", raPeakMB)) "
-                + "overhead_MB=\(String(format: "%.1f", overheadMB)) "
-                + "overhead_pct=\(String(format: "%.1f", overheadPct))%"
+                + "dense_pref=\(String(format: "%.1f", densePrefMB))MB "
+                + "ra_pref=\(String(format: "%.1f", raPrefMB))MB "
+                + "(+\(String(format: "%.1f", raPrefMB - densePrefMB))MB) "
+                + "dense_dec=\(String(format: "%.1f", denseDecMB))MB "
+                + "ra_dec=\(String(format: "%.1f", raDecMB))MB "
+                + "(+\(String(format: "%.1f", raDecMB - denseDecMB))MB)"
         )
     }
 
