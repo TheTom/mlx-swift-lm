@@ -253,3 +253,83 @@ public func retrievalAttentionGatherAndAttend(
         )
     }
 }
+
+// MARK: - End-to-end forward (selector + dedupe + gather + SDPA)
+
+/// One-shot RetrievalAttention forward pass for a single query (decode
+/// step, L=1) on a single (layer, KV head).
+///
+/// Caller responsibilities:
+///   - Maintain the `RetrievalAttentionIndex` across update calls (one
+///     per (layer, KV head); see `RetrievalAttentionIndex.update(newK:)`).
+///   - Pass `keys`/`values` as the FULL per-(layer, KV-head) cache
+///     `[T, dHead]`. v1 doesn't yet batch over heads.
+///   - Provide the query as `[dHead]` (single head dim, decode-step).
+///
+/// What this function does:
+///   1. Project q via the selector basis.
+///   2. Score fine + (optionally) coarse blocks against the projected q.
+///   3. Get top-k fine + top-k coarse block STARTS (in token coords).
+///   4. Build deduplicated gather indices using static + sliding +
+///      retrieved + coarse-rescue.
+///   5. Gather K/V at those indices.
+///   6. Run dense SDPA on the contiguous gathered tensors.
+///
+/// - Parameters:
+///   - q: `[dHead]` decode-step query vector for this head.
+///   - keys: `[T, dHead]` cached post-RoPE keys for this (layer, KV head).
+///   - values: `[T, dHead_v]` cached values.
+///   - index: stateful per-(layer, KV head) selector index, already
+///     populated via `update(newK:)` calls during prefill.
+///   - scale: SDPA scale (typically `1/√dHead`).
+///   - config: RA backend config.
+/// - Returns: `[dHead_v]` attention output for this query.
+public func retrievalAttentionForwardSingleHead(
+    q: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    index: RetrievalAttentionIndex,
+    scale: Float,
+    config: RetrievalAttentionConfig = RetrievalAttentionConfig()
+) -> MLXArray {
+    precondition(
+        keys.shape.count == 2 && values.shape.count == 2,
+        "expected [T, D] keys/values for single-head path"
+    )
+    let T = keys.dim(0)
+    precondition(
+        T == index.seqLen,
+        "cache length \(T) doesn't match selector index seqLen \(index.seqLen)"
+    )
+
+    // 1-3: selector
+    let projQ = index.projectQuery(q)
+    let fineStarts = index.topKFineBlockStarts(against: projQ)
+    let coarseStarts = config.coarseRescueEnabled
+        ? index.topKCoarseBlockStarts(against: projQ) : []
+
+    // 4: dedupe
+    let gatherIdx = retrievalAttentionGatherIndices(
+        seqLen: T,
+        fineBlockStarts: fineStarts,
+        coarseBlockStarts: coarseStarts,
+        config: config
+    )
+
+    // Reshape keys/values to [B=1, nHeads=1, T, D] for the SDPA API.
+    let dK = keys.dim(1)
+    let dV = values.dim(1)
+    let keys4 = keys.reshaped(1, 1, T, dK)
+    let values4 = values.reshaped(1, 1, T, dV)
+    let q4 = q.reshaped(1, 1, 1, dK)
+
+    let out4 = retrievalAttentionGatherAndAttend(
+        queries: q4,
+        keys: keys4,
+        values: values4,
+        gatherIndices: gatherIdx,
+        scale: scale
+    )
+    // Strip the dummy axes → [dV]
+    return out4.reshaped(dV)
+}

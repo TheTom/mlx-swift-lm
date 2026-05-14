@@ -479,6 +479,97 @@ struct RetrievalAttentionTests {
         )
     }
 
+    // MARK: - End-to-end forward (selector + dedupe + gather + SDPA)
+
+    @Test func endToEndForwardProducesSensibleOutput() {
+        // Build a small synthetic cache, populate the index, run a
+        // forward pass. Verify the output is finite, correctly-shaped,
+        // and not all zeros / not equal to dense SDPA (different
+        // attention region).
+        let dHead = 64
+        let dValue = 64
+        let seqLen = 1024
+        var cfg = RetrievalAttentionConfig()
+        cfg.fineTopK = 4  // small enough that we can actually gather
+        cfg.coarseRescueEnabled = false  // not needed at 1K context
+        cfg.staticInit = 16
+        cfg.slidingWindow = 64
+
+        MLXRandom.seed(19)
+        let keys = MLXRandom.normal([seqLen, dHead])
+        let values = MLXRandom.normal([seqLen, dValue])
+
+        // Build a fresh index, push the entire cache through.
+        let idx = RetrievalAttentionIndex(
+            config: cfg, dHead: dHead, layerIdx: 0
+        )
+        idx.update(newK: keys)
+
+        let q = MLXRandom.normal([dHead])
+        let scale = Float(1.0 / Float(dHead).squareRoot())
+
+        let out = retrievalAttentionForwardSingleHead(
+            q: q,
+            keys: keys,
+            values: values,
+            index: idx,
+            scale: scale,
+            config: cfg
+        )
+
+        // Shape: [dValue]
+        #expect(out.shape == [dValue])
+        // Output not NaN / not inf.
+        let arr = out.asArray(Float.self)
+        for v in arr {
+            #expect(v.isFinite, "output contains non-finite value: \(v)")
+        }
+        // Not all zeros.
+        let mag = (out * out).sum().item(Float.self)
+        #expect(mag > 0.0)
+    }
+
+    @Test func endToEndForwardSparseDiffersFromDense() {
+        // The RA forward must differ from full-context dense SDPA
+        // unless every position is in the gather set. At seqLen=1024
+        // with fineTopK=2 + static=16 + sliding=32, we cover ~176 out
+        // of 1024 → output differs.
+        let dHead = 32
+        let seqLen = 1024
+        var cfg = RetrievalAttentionConfig()
+        cfg.fineTopK = 2
+        cfg.coarseRescueEnabled = false
+        cfg.staticInit = 16
+        cfg.slidingWindow = 32
+
+        MLXRandom.seed(23)
+        let keys = MLXRandom.normal([seqLen, dHead])
+        let values = MLXRandom.normal([seqLen, dHead])
+        let q = MLXRandom.normal([dHead])
+        let scale = Float(1.0 / Float(dHead).squareRoot())
+
+        let idx = RetrievalAttentionIndex(
+            config: cfg, dHead: dHead, layerIdx: 0
+        )
+        idx.update(newK: keys)
+
+        let sparse = retrievalAttentionForwardSingleHead(
+            q: q, keys: keys, values: values,
+            index: idx, scale: scale, config: cfg
+        )
+        // Dense reference: full SDPA over all 1024 positions.
+        let dense = MLXFast.scaledDotProductAttention(
+            queries: q.reshaped(1, 1, 1, dHead),
+            keys: keys.reshaped(1, 1, seqLen, dHead),
+            values: values.reshaped(1, 1, seqLen, dHead),
+            scale: scale,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode.none
+        ).reshaped(dHead)
+
+        let diff = (sparse - dense).abs().max().item(Float.self)
+        #expect(diff > 1e-3, "sparse forward should differ from dense (got \(diff))")
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
