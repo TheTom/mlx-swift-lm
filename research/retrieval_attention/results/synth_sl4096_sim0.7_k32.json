@@ -1,0 +1,58 @@
+{
+  "config": {
+    "seq_len": 4096,
+    "d_head": 128,
+    "block_size": 64,
+    "n_needles": 8,
+    "needle_similarity": 0.7,
+    "n_queries": 30,
+    "seed": 42
+  },
+  "top_k_blocks": 32,
+  "dense_top_k_block_planted_needle_recall": 1.0,
+  "recall_at_k": {
+    "content": {
+      "mean": 0.5291666666666667,
+      "std": 0.06551743830631827,
+      "min": 0.40625,
+      "max": 0.6875
+    },
+    "trig": {
+      "mean": 0.47291666666666665,
+      "std": 0.06130807903984234,
+      "min": 0.34375,
+      "max": 0.625
+    },
+    "mixture": {
+      "mean": 0.4864583333333333,
+      "std": 0.05966668121508203,
+      "min": 0.34375,
+      "max": 0.59375
+    },
+    "content_max": {
+      "mean": 0.5072916666666667,
+      "std": 0.07247634911166231,
+      "min": 0.3125,
+      "max": 0.6875
+    },
+    "mixture_max": {
+      "mean": 0.503125,
+      "std": 0.07050321357924048,
+      "min": 0.3125,
+      "max": 0.625
+    },
+    "content+sentinel": {
+      "mean": 0.5270833333333333,
+      "std": 0.06288078446994404,
+      "min": 0.375,
+      "max": 0.6875
+    },
+    "mixture+sentinel": {
+      "mean": 0.5041666666666667,
+      "std": 0.07728015412913086,
+      "min": 0.28125,
+      "max": 0.65625
+    }
+  },
+  "wall_time_s": 0.15
+}
