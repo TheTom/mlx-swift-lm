@@ -573,6 +573,116 @@ struct RetrievalAttentionTests {
 
     // MARK: - Real Qwen3 attention K capture (Week 1 diagnostic)
 
+    /// Adaptive top_k at 32K: does scaling fineTopK restore cosine?
+    /// PRD says "constant cost across context length" but [F-21] shows
+    /// cosine drops to 0.96 at 32K. Question: at fineTopK=128 (~4× bigger),
+    /// does it climb back to 0.99+?
+    @Test func trainedQwen3AdaptiveTopKAt32K() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        if !FileManager.default.fileExists(atPath: modelPath.path) {
+            Issue.record("skipping; model not on disk")
+            return
+        }
+        let config = try JSONDecoder().decode(
+            Qwen3Configuration.self,
+            from: Data(contentsOf: modelPath.appendingPathComponent("config.json"))
+        )
+        let model = Qwen3Model(config)
+        let quant = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        try loadWeights(modelDirectory: modelPath, model: model, quantization: quant)
+
+        let dHead = config.headDim
+        let scale = Float(1.0 / Float(dHead).squareRoot())
+        let middleLayer = config.hiddenLayers / 2
+        let seqLen = 32_768
+
+        MLXRandom.seed(606)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(config.vocabularySize)),
+            [1, seqLen],
+        ).asType(.int32)
+        let caches = model.newCache(parameters: nil)
+        _ = model(tokens, cache: caches)
+        eval(caches.flatMap { $0.state })
+        guard let std = caches[middleLayer] as? StandardKVCache,
+            let K = std.keys, let V = std.values
+        else {
+            Issue.record("no K/V at 32K"); return
+        }
+        let K0 = K[0, 0, 0..., 0...]
+        let V0 = V[0, 0, 0..., 0...]
+
+        for fineTopK in [32, 64, 128, 256] {
+            var raCfg = RetrievalAttentionConfig()
+            raCfg.fineTopK = fineTopK
+            raCfg.coarseRescueEnabled = true
+            raCfg.coarseTopK = 2
+            raCfg.fineBlockSize = 64
+            raCfg.coarseBlockSize = 1024
+            raCfg.lambdaPos = 0.0
+            raCfg.sentinelEnabled = true
+            raCfg.staticInit = 128
+            raCfg.slidingWindow = 2048
+
+            var cosines: [Float] = []
+            var gathers: [Int] = []
+            for qSeed in 1000..<1010 {
+                MLXRandom.seed(UInt64(qSeed))
+                let needlePos = Int.random(in: 500..<(seqLen - 500))
+                let qDir = K0[needlePos]
+                let noise = MLXRandom.normal([dHead]).asType(qDir.dtype) * 0.3
+                let mixed = qDir * 0.7 + noise
+                let qNorm = mixed / sqrt((mixed * mixed).sum())
+
+                let dScores = matmul(K0, qNorm.reshaped(dHead, 1))
+                    .reshaped(seqLen) * scale
+                let dW = softmax(dScores, axis: 0)
+                let dOut = matmul(dW.reshaped(1, seqLen), V0).reshaped(dHead)
+
+                let idx = RetrievalAttentionIndex(
+                    config: raCfg, dHead: dHead, ropeBase: config.ropeTheta,
+                    layerIdx: middleLayer,
+                )
+                idx.update(newK: K0)
+                let projQ = idx.projectQuery(qNorm)
+                let fineStarts = idx.topKFineBlockStarts(against: projQ)
+                let coarseStarts = idx.topKCoarseBlockStarts(against: projQ)
+                let gather = retrievalAttentionGatherIndices(
+                    seqLen: seqLen,
+                    fineBlockStarts: fineStarts,
+                    coarseBlockStarts: coarseStarts,
+                    config: raCfg,
+                )
+                let idxArr = MLXArray(gather.map { Int32($0) })
+                let sK = K0.take(idxArr, axis: 0)
+                let sV = V0.take(idxArr, axis: 0)
+                let sScores = matmul(sK, qNorm.reshaped(dHead, 1))
+                    .reshaped(gather.count) * scale
+                let sW = softmax(sScores, axis: 0)
+                let sOut = matmul(sW.reshaped(1, gather.count), sV).reshaped(dHead)
+
+                let dot = (dOut * sOut).sum().item(Float.self)
+                let dn = sqrt((dOut * dOut).sum().item(Float.self))
+                let sn = sqrt((sOut * sOut).sum().item(Float.self))
+                cosines.append(dot / max(dn * sn, 1e-9))
+                gathers.append(gather.count)
+            }
+            let m = cosines.reduce(0, +) / Float(cosines.count)
+            let stdv = sqrt(
+                cosines.map { ($0 - m) * ($0 - m) }
+                    .reduce(0, +) / Float(cosines.count)
+            )
+            let avgGather = gathers.reduce(0, +) / gathers.count
+            let cov = Float(avgGather) / Float(seqLen) * 100
+            print(
+                "[F-22-adaptive-topk] fineTopK=\(fineTopK) gather=\(avgGather) (\(String(format: "%.1f", cov))%) cos=\(String(format: "%.4f", m)) ± \(String(format: "%.4f", stdv))"
+            )
+        }
+    }
+
     /// Cosine vs dense at SCALING context lengths. THE PRD-load-bearing
     /// question: does cosine hold when gather coverage shrinks to a
     /// few percent (where real long-context inference lives)?
