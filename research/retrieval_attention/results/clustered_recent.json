@@ -1,0 +1,40 @@
+{
+  "config": {
+    "seq_len": 16384,
+    "d_head": 128,
+    "block_size": 64,
+    "n_topics": 32,
+    "topic_persistence": 0.95,
+    "noise_scale": 0.3,
+    "needle_similarity": 0.8,
+    "n_needles": 8,
+    "n_queries": 30,
+    "seed": 42,
+    "needle_band": "recent"
+  },
+  "top_k_blocks": 32,
+  "dense_top_k_block_planted_needle_recall": 1.0,
+  "recall_at_k": {
+    "content": {
+      "mean": 0.18645833333333334,
+      "std": 0.12922125862471529
+    },
+    "trig": {
+      "mean": 0.209375,
+      "std": 0.038822177403300476
+    },
+    "mixture": {
+      "mean": 0.21354166666666666,
+      "std": 0.1024070123602654
+    },
+    "content+sentinel": {
+      "mean": 0.26458333333333334,
+      "std": 0.16192472959852536
+    },
+    "mixture+sentinel": {
+      "mean": 0.28854166666666664,
+      "std": 0.1225497702182895
+    }
+  },
+  "wall_time_s": 1.141
+}
