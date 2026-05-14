@@ -2208,6 +2208,62 @@ struct RetrievalAttentionTests {
         #expect(cosine >= 0.95, "Qwen2.5-7B 8K dispatcher cosine \(cosine) < 0.95")
     }
 
+    // F-37: PRD target model — Qwen2.5-14B-Instruct-1M-4bit. 48 layers,
+    // 8 KV heads, rope_theta 10M (designed for 1M context). Same Qwen2
+    // arch as 7B but ~2x bigger, with the long-context RoPE.
+    @Test func trainedQwen25_14B_1M_DispatcherCosine() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        let quant = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        try loadWeights(modelDirectory: modelPath, model: model, quantization: quant)
+
+        for seqLen in [8192, 16384] {
+            MLXRandom.seed(UInt64(0x14B0 + seqLen))
+            let tokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, seqLen]
+            ).asType(.int32)
+            let nextTok = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+
+            let dn = model.newCache(parameters: nil)
+            _ = model(tokens, cache: dn)
+            let dnLog = model(nextTok, cache: dn)
+
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    ropeBase: cfg.ropeTheta)
+            }
+            _ = model(tokens, cache: ra)
+            let raLog = model(nextTok, cache: ra)
+
+            let dFlat = dnLog.reshaped(dnLog.size).asType(.float32)
+            let rFlat = raLog.reshaped(raLog.size).asType(.float32)
+            let dot = (dFlat * rFlat).sum().asArray(Float.self)[0]
+            let dnN = sqrt((dFlat * dFlat).sum()).asArray(Float.self)[0]
+            let rnN = sqrt((rFlat * rFlat).sum()).asArray(Float.self)[0]
+            let cosine = dot / (dnN * rnN + 1e-12)
+            print("[F-37-qwen25-14B-1M] seqLen=\(seqLen) cosine=\(cosine) dn_norm=\(dnN) ra_norm=\(rnN)")
+            if seqLen <= 16384 {
+                #expect(cosine >= 0.95, "14B-1M \(seqLen) cosine \(cosine) < 0.95")
+            }
+        }
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
