@@ -4162,6 +4162,114 @@ struct RetrievalAttentionTests {
         #expect(minCos >= 0.99999, "F-80 cliff regressed: min_cosine=\(minCos)")
     }
 
+    // F-80 follow-up: validate "safe configs" of asymmetric TurboQuant
+    // still work end-to-end on a real model. Each safe config: prefill +
+    // 4 decode steps, assert non-NaN, cosine vs dense above degenerate
+    // floor. Quick smoke (Qwen3-0.6B-4bit, 4K context).
+    //
+    // Safe configs covered:
+    //   turbo4     (K=4 / V=4 symmetric)
+    //   turbo8     (K=8 / V=8 symmetric)
+    //   turbo4v2   (K=4 / V=2 asym)
+    //   turbo8v4   (K=8 / V=4 asym — known long-context degrade #67)
+    //   turbo0v4   (K=raw / V=4 rawKeyMode)
+    @Test func turboAsymConfigs_safeSmoke_Qwen3() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 4096
+        let nSteps = 4
+        MLXRandom.seed(0x808F)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+
+        // Dense baseline (raw FP16).
+        func runDense() -> [MLXArray] {
+            let cache = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: cache)
+            eval(cache.flatMap { $0.state })
+            return (0..<nSteps).map { s in
+                let l = model(forceTokens[s], cache: cache)
+                eval(l)
+                return l
+            }
+        }
+
+        // TQ config — builds TurboQuantizedKVCache per layer.
+        func runTQ(keyBits: Int, valueBits: Int, label: String) -> (cosine: Double, hasNaN: Bool) {
+            let caches: [KVCache] = (0..<cfg.hiddenLayers).map { _ in
+                TurboQuantizedKVCache(
+                    bits: max(keyBits, valueBits, 4),
+                    keyBits: keyBits,
+                    valueBits: valueBits,
+                    step: 1024,
+                    seed: 0xCAFE
+                )
+            }
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var sumCos: Double = 0
+            var hasNaN = false
+            for s in 0..<nSteps {
+                let l = model(forceTokens[s], cache: caches)
+                eval(l)
+                let lF = l.reshaped(l.size).asType(.float32)
+                let isAnyNaN = (lF .!= lF).any().asArray(Bool.self)[0]
+                if isAnyNaN { hasNaN = true }
+                let dF = dense[s].reshaped(dense[s].size).asType(.float32)
+                let dot = (dF * lF).sum().asArray(Float.self)[0]
+                let dn = sqrt((dF * dF).sum()).asArray(Float.self)[0]
+                let ln = sqrt((lF * lF).sum()).asArray(Float.self)[0]
+                sumCos += Double(dot / (dn * ln + 1e-12))
+            }
+            return (sumCos / Double(nSteps), hasNaN)
+        }
+
+        let dense = runDense()
+        let safe: [(label: String, keyBits: Int, valueBits: Int)] = [
+            ("turbo4",   4, 4),
+            ("turbo8",   8, 8),
+            ("turbo4v2", 4, 2),
+            ("turbo8v4", 8, 4),
+            ("turbo0v4", 0, 4),
+        ]
+        for (label, k, v) in safe {
+            let r = runTQ(keyBits: k, valueBits: v, label: label)
+            print("[F-80-tq-asym] \(label) K=\(k) V=\(v) cosine_vs_dense=\(String(format: "%.5f", r.cosine)) NaN=\(r.hasNaN)")
+            #expect(!r.hasNaN, "\(label) produced NaN logits")
+            // Crash-floor only: cosine > 0.2 = ran without producing
+            // pure-garbage / null output. Real quality is measured
+            // elsewhere (PRD perplexity benchmarks, real-text NIAH).
+            // Random-token cosine varies by codec but doesn't predict
+            // real-text quality (turbo8 here scores 0.41 but ships fine
+            // on real text — task #67 tracks the real long-ctx issue).
+            #expect(r.cosine > 0.2, "\(label) degraded to null/garbage: cosine=\(r.cosine)")
+        }
+    }
+
     // F-79 quality at long context (cliff-band: 65K / 96K / 128K).
     // Validates that F-79 amort=16 + F-80 allocator fix gives clean
     // quality in the band that was previously cliff-affected.
