@@ -83,14 +83,19 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   24K → **64/64 token match** with dense, mean cosine 0.9997. Zero
   drift across realistic generation length.
 
-  **F-66 memory profile**: at 14B-1M @ 24K prefill, dense peak 17.2 GB
-  vs RA peak 21.8 GB. **+27% memory overhead (~4.6 GB)**. Fits on 32 GB
-  Mac mini with headroom. Selector index (perTokenFeatures pre-alloc +
-  block buffers) is ~600 MB; remaining ~4 GB is MLX intermediate
-  tensors during forward pass. Future optimizations:
-  - fp16 perTokenFeatures (saves ~300 MB)
-  - More aggressive intermediate-tensor freeing
-  - Reuse mask buffer across layers
+  **F-66 memory profile (corrected)**: original 4.6 GB number was a
+  measurement bug — dense `KVCache` stayed in scope during the RA
+  run. Once dense and RA are scoped separately:
+
+  | Phase | Dense | RA | Overhead |
+  |---|---|---|---|
+  | Prefill | 17188 MB | 17189 MB | **0.3 MB** (parity) |
+  | Decode | 12677 MB | 13224 MB | **546 MB** |
+
+  Prefill is at memory parity. Decode adds 546 MB (the selector index
+  + mask buffer state — matches hand-calculated estimate). Combined
+  with F-62/F-63 latency: ship-ready on the PRD target across BOTH
+  time and memory.
 
   On Qwen3-0.6B-4bit at 16K:
   - Per-sparse-layer overhead 39ms → ~3ms (>90% drop)
