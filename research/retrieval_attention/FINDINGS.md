@@ -47,9 +47,14 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   - `coarseRescueEnabled = true`, top-2 (F-19)
   - `denseFirstN = denseLastN = 4` (F-25 proved this absorbs boundary
     sensitivity)
-- **Latency:** Improved (Phase C step 1). On Qwen3-0.6B-4bit at 16K,
-  per-sparse-layer overhead dropped **39ms → 14.47ms (63%)** through a
-  sequence of small wins:
+- **Latency:** Significantly improved (Phase C steps 1–2). On Qwen3-0.6B-4bit
+  at 16K, per-sparse-layer overhead dropped **39ms → 11.67ms (70%)**.
+  On Qwen2.5-14B-1M at 24K, decode-step latency dropped **1559ms → 1061ms
+  (32%)**. The big lever was **F-56**: a custom Metal kernel
+  (`ra_score_topk` in `RetrievalAttentionKernels.swift`) that fuses the
+  score + argPartition + slice + multiply chain into one dispatch.
+
+  Path so far:
   - F-44: BatchedRetrievalAttentionIndex (batched per-head matmul)
   - F-49: GPU argPartition replaces CPU sort
   - F-50: combined fine+coarse asArray (1 sync instead of 2)
@@ -57,13 +62,14 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   - F-52: pre-allocated block-feature buffers + in-place writes
   - F-53: dropped explicit eval() barrier (no longer needed with in-place writes)
   - F-54: cached pre-transposed JL matrix W.T
+  - F-55: implemented fused score+top-K Metal kernel (POC + tests)
+  - **F-56: wired the fused kernel into the hot path** — 14.47 → 11.67ms
   - + λ=0 trig-skip, single take() for head slicing, head-slice refactor
 
-  On Qwen2.5-14B-1M at 24K: 1559ms/decode → 1210ms/decode (22%). Per-sparse-layer
-  ~30ms on 14B (compute bigger; per-op dispatch shared with 0.6B but
-  K/V tensors larger so take + SDPA take longer). Still 17-23x slower than
-  dense; further wins require a single fused Metal kernel that does the
-  whole select-gather-attend in one launch.
+  At 11.67ms/sparse-layer the next wins live in fusing the remaining ops
+  (gather + SDPA) into the same kernel, or eliminating the asArray sync
+  for the combined fine+coarse top-K via GPU-side dedupe. Still ~17x slower
+  than dense per-step but down from the 39ms baseline.
 - **Memory:** acceptable; per-layer selector index is `[nKVHeads, T, 32]`
   fp32 + small block-pooled views. At 14B-1M / 24K / 48 sparse layers:
   ~960MB selector overhead. Not great; future work could eliminate the
