@@ -4275,8 +4275,16 @@ struct RetrievalAttentionTests {
         print("[F-81-compose] T=32K dense-vs-RA mean_cosine=\(String(format: "%.5f", meanRA))")
         print("[F-81-compose] T=32K dense-vs-RA+TQ4 mean_cosine=\(String(format: "%.5f", meanRATQ))")
         print("[F-81-compose] T=32K RA-vs-RA+TQ4 mean_cosine=\(String(format: "%.5f", meanRAvsRATQ))")
-        // PRD target.
+        // PRD target: RA+TQ within 0.99 of dense.
         #expect(meanRATQ >= 0.99, "RA+TQ4 quality regressed: \(meanRATQ)")
+        // SCAFFOLD STATE: TQ.updateAndDequant is the A path (raw FP16
+        // round-trip, no compression). RA-vs-TQ should be 1.0 today —
+        // this assert flags when real compression starts diverging,
+        // which is what Phase D V2 will deliver.
+        #expect(
+            meanRAvsRATQ >= 0.99999,
+            "scaffold sanity: A path should round-trip bit-exact, got \(meanRAvsRATQ)"
+        )
     }
 
     // F-80 long-context regression. Cliff fix should hold at 65K, 96K, 128K.
