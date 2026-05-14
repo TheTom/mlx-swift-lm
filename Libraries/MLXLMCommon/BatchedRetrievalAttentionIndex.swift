@@ -68,19 +68,25 @@ public final class BatchedRetrievalAttentionIndex {
         // Project: [nKVHeads, L, dHead] @ [dHead, contentDim] = [nKVHeads, L, contentDim]
         let contentNew = matmul(newKeys, W.transposed(1, 0)).asType(.float32)
 
-        // Trig features for the new positions — same across heads.
-        let positions = MLXArray((Int32(oldSeqLen)..<Int32(newSeqLen))).asType(.int32)
-        let trigNew = retrievalAttentionTrigFeatures(
-            relativePositions: positions, base: ropeBase, config: config
-        )  // [L, trigDim]
-        // Broadcast trig to [nKVHeads, L, trigDim]
-        let trigBroadcast = broadcast(
-            trigNew.reshaped(1, L, config.trigDim),
-            to: [nKVHeads, L, config.trigDim]
-        )
-
-        // Concat content + trig along feature dim → [nKVHeads, L, selectorDim]
-        let selectorNew = concatenated([contentNew, trigBroadcast], axis: -1)
+        // Trig features only when lambdaPos > 0 — pure content (default
+        // λ=0 ship config per F-46) ignores the trig half of the selector.
+        // Skipping trig avoids ~5-6 MLX ops per update: trig features,
+        // broadcast, and the concat. perTokenFeatures becomes
+        // [nKVHeads, T, contentDim] instead of [nKVHeads, T, selectorDim].
+        let selectorNew: MLXArray
+        if config.usesTrigFeatures {
+            let positions = MLXArray((Int32(oldSeqLen)..<Int32(newSeqLen))).asType(.int32)
+            let trigNew = retrievalAttentionTrigFeatures(
+                relativePositions: positions, base: ropeBase, config: config
+            )
+            let trigBroadcast = broadcast(
+                trigNew.reshaped(1, L, config.trigDim),
+                to: [nKVHeads, L, config.trigDim]
+            )
+            selectorNew = concatenated([contentNew, trigBroadcast], axis: -1)
+        } else {
+            selectorNew = contentNew
+        }
 
         if let existing = perTokenFeatures {
             perTokenFeatures = concatenated([existing, selectorNew], axis: 1)
@@ -173,7 +179,8 @@ public final class BatchedRetrievalAttentionIndex {
 
     /// Project the query for all heads in one go.
     /// - Parameter q: `[nKVHeads, dHead]`
-    /// - Returns: `[nKVHeads, selectorDim]`
+    /// - Returns: `[nKVHeads, effectiveSelectorDim]` (`contentDim` when
+    ///   trig is skipped, `selectorDim` otherwise).
     public func projectQueriesBatched(_ q: MLXArray) -> MLXArray {
         precondition(q.shape == [nKVHeads, dHead], "expected [\(nKVHeads), \(dHead)], got \(q.shape)")
         if jlMatrix == nil {
@@ -182,7 +189,7 @@ public final class BatchedRetrievalAttentionIndex {
         let W = jlMatrix!  // [contentDim, dHead]
         // [nh, dHead] @ [dHead, contentDim] = [nh, contentDim]
         let contentQ = matmul(q.asType(.float32), W.transposed(1, 0))
-        // Trig at relative_pos=0, broadcast across heads.
+        guard config.usesTrigFeatures else { return contentQ }
         let trigQ = broadcast(
             retrievalAttentionTrigFeatures(
                 relativePositions: MLXArray([Int32(0)]), base: ropeBase, config: config
@@ -198,46 +205,36 @@ public final class BatchedRetrievalAttentionIndex {
         guard let features = fineBlockFeatures else {
             return MLXArray.zeros([nKVHeads, 0], dtype: .float32)
         }
-        // features: [nh, nBlocks, selectorDim], q: [nh, selectorDim]
-        // We want [nh, nBlocks] = sum over selectorDim of features * q.expand
-        let qExp = projectedQ.reshaped(nKVHeads, 1, config.selectorDim)
-        let lambdaPos = config.lambdaPos
-        if lambdaPos == 0.0 {
-            // Pure content. Sum over contentDim only.
-            let cD = config.contentDim
-            let prod = features[0..., 0..., ..<cD] * qExp[0..., 0..., ..<cD]
-            return prod.sum(axis: -1)
-        } else if lambdaPos == 1.0 {
-            let cD = config.contentDim
-            let prod = features[0..., 0..., cD...] * qExp[0..., 0..., cD...]
-            return prod.sum(axis: -1)
-        } else {
-            // Mixture.
-            let cD = config.contentDim
-            let content = (features[0..., 0..., ..<cD] * qExp[0..., 0..., ..<cD]).sum(axis: -1)
-            let trig = (features[0..., 0..., cD...] * qExp[0..., 0..., cD...]).sum(axis: -1)
-            return (1 - lambdaPos) * content + lambdaPos * trig
-        }
+        return scoreBlocksBatched(features: features, projectedQ: projectedQ)
     }
 
     public func scoreCoarseBlocksBatched(projectedQ: MLXArray) -> MLXArray? {
         guard fineBlockFeatures != nil, let features = coarseBlockFeatures else {
             return nil
         }
-        let qExp = projectedQ.reshaped(nKVHeads, 1, config.selectorDim)
+        return scoreBlocksBatched(features: features, projectedQ: projectedQ)
+    }
+
+    /// Shared scoring kernel. `features` is `[nKVHeads, nBlocks, dim]`
+    /// where dim is `effectiveSelectorDim`. When trig is skipped, both
+    /// features and projectedQ are contentDim wide and we do a single
+    /// elementwise-mul + sum. Otherwise we honor the lambda blend.
+    private func scoreBlocksBatched(features: MLXArray, projectedQ: MLXArray) -> MLXArray {
+        let lastDim = features.dim(2)
+        let qExp = projectedQ.reshaped(nKVHeads, 1, lastDim)
+        if !config.usesTrigFeatures {
+            // λ=0 pure content. features + q are both contentDim-wide.
+            return (features * qExp).sum(axis: -1)
+        }
         let lambdaPos = config.lambdaPos
         let cD = config.contentDim
-        if lambdaPos == 0.0 {
-            let prod = features[0..., 0..., ..<cD] * qExp[0..., 0..., ..<cD]
-            return prod.sum(axis: -1)
-        } else if lambdaPos == 1.0 {
+        if lambdaPos == 1.0 {
             let prod = features[0..., 0..., cD...] * qExp[0..., 0..., cD...]
             return prod.sum(axis: -1)
-        } else {
-            let content = (features[0..., 0..., ..<cD] * qExp[0..., 0..., ..<cD]).sum(axis: -1)
-            let trig = (features[0..., 0..., cD...] * qExp[0..., 0..., cD...]).sum(axis: -1)
-            return (1 - lambdaPos) * content + lambdaPos * trig
         }
+        let content = (features[0..., 0..., ..<cD] * qExp[0..., 0..., ..<cD]).sum(axis: -1)
+        let trig = (features[0..., 0..., cD...] * qExp[0..., 0..., cD...]).sum(axis: -1)
+        return (1 - lambdaPos) * content + lambdaPos * trig
     }
 
     /// Top-k block starts (fine or coarse) per head. Uses MLX argPartition

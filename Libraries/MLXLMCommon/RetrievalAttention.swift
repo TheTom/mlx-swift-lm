@@ -92,6 +92,19 @@ public struct RetrievalAttentionConfig: Sendable {
     /// Total selector embedding dim = contentDim + trigDim.
     public var selectorDim: Int { contentDim + trigDim }
 
+    /// True if the selector path needs to compute and store the trig half
+    /// of the selector embedding. Pure content (λ=0, ship default) skips
+    /// trig — saves 5-6 MLX ops per index update and halves the stored
+    /// per-token feature size.
+    public var usesTrigFeatures: Bool { lambdaPos > 0.0 }
+
+    /// Effective selector dim given `usesTrigFeatures` — `contentDim` when
+    /// trig is off, `selectorDim` otherwise. Used by callers that need to
+    /// know the actual stored width.
+    public var effectiveSelectorDim: Int {
+        usesTrigFeatures ? selectorDim : contentDim
+    }
+
     // ----- Scoring (Decisions 4, 19; PRD line 161)
 
     /// Content vs position blend. 0=pure content, 1=pure position.
