@@ -3599,6 +3599,123 @@ struct RetrievalAttentionTests {
         print(line)
     }
 
+    // F-79 ship-config regression: asserts the recorded properties of
+    // the SHIPPED RetrievalAttention default. If this test fails after
+    // any future change, the change has regressed the ship config —
+    // investigate before merging.
+    //
+    // Shipped: selectorAmortization=16, useFusedMaskBuild=true.
+    //
+    // Asserted at 32K on Qwen2.5-14B-1M-4bit (the PRD target model):
+    //   - default config flags are unchanged (the lock-in)
+    //   - argmax match >= 7/8 vs dense over 8 decode steps
+    //   - mean logit cosine vs dense >= 0.997 (loose enough to ride
+    //     thermal variance — cold-system measurement was 0.99960,
+    //     hot-system 0.99882)
+    //
+    // Latency is logged but NOT asserted — thermal state varies the
+    // absolute numbers by 4x. The regression target is the QUALITY
+    // contract, not a specific ms-budget.
+    @Test func shipConfigRegression_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        // Verify the shipped defaults haven't drifted.
+        let shipped = RetrievalAttentionConfig()
+        #expect(shipped.selectorAmortization == 16,
+            "shipped selectorAmortization changed — investigate before merging")
+        #expect(shipped.useFusedMaskBuild == true,
+            "shipped useFusedMaskBuild changed — investigate before merging")
+
+        let prefillLen = 32_767
+        let nSteps = 8
+        MLXRandom.seed(0x5141)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let startNext = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        // Dense reference
+        let dn = model.newCache(parameters: nil)
+        _ = model(prefillTokens, cache: dn)
+        eval(dn.flatMap { $0.state })
+        var dnNext = startNext
+        var dnTokens: [Int32] = []
+        var dnLogits: [MLXArray] = []
+        let dnStart = Date()
+        for _ in 0..<nSteps {
+            let logits = model(dnNext, cache: dn)
+            eval(logits)
+            dnLogits.append(logits)
+            let tok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            dnTokens.append(tok.asArray(Int32.self)[0])
+            dnNext = tok
+        }
+        let denseMs = Date().timeIntervalSince(dnStart) / Double(nSteps) * 1000
+
+        // RA with shipped defaults
+        let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                ropeBase: cfg.ropeTheta)
+        }
+        _ = model(prefillTokens, cache: ra)
+        eval(ra.flatMap { $0.state })
+        var raNext = startNext
+        var matches = 0
+        var sumCos: Double = 0
+        let raStart = Date()
+        for s in 0..<nSteps {
+            let logits = model(raNext, cache: ra)
+            eval(logits)
+            let d = dnLogits[s].reshaped(dnLogits[s].size).asType(.float32)
+            let r = logits.reshaped(logits.size).asType(.float32)
+            let dot = (d * r).sum().asArray(Float.self)[0]
+            let dn_ = sqrt((d * d).sum()).asArray(Float.self)[0]
+            let rn_ = sqrt((r * r).sum()).asArray(Float.self)[0]
+            sumCos += Double(dot / (dn_ * rn_ + 1e-12))
+            let rTok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            if rTok.asArray(Int32.self)[0] == dnTokens[s] { matches += 1 }
+            raNext = rTok
+        }
+        let raMs = Date().timeIntervalSince(raStart) / Double(nSteps) * 1000
+        let meanCos = sumCos / Double(nSteps)
+        let gapMs = raMs - denseMs
+
+        print("[F-79-ship-regression] T=32K matches=\(matches)/\(nSteps) "
+            + "mean_cosine=\(String(format: "%.5f", meanCos)) "
+            + "dense=\(String(format: "%.1f", denseMs))ms "
+            + "ra=\(String(format: "%.1f", raMs))ms "
+            + "gap=+\(String(format: "%.1f", gapMs))ms")
+
+        // Hard-fail bounds. Pad above the actual measured numbers so
+        // run-to-run variance doesn't flap CI, but tight enough to
+        // catch real regressions.
+        #expect(matches >= 7, "argmax match regressed: \(matches)/\(nSteps)")
+        #expect(meanCos >= 0.997, "logit cosine regressed: \(meanCos)")
+        // Latency NOT asserted — thermal state varies the absolute
+        // numbers by up to 4x across long bench sessions. Quality is
+        // the contract; latency is the reward for shipping it right.
+    }
+
     // F-48 fallback parity — confirm the MLX-ops fallback path (used
     // when nBlocks != power of 2 ≤ 1024) produces the same top-K set
     // as the fused Metal kernel given identical scores. Order within
