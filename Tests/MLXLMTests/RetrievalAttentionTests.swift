@@ -3820,6 +3820,74 @@ struct RetrievalAttentionTests {
             + "min_at_step=\(minAtStep)")
     }
 
+    // F-79 49K bug isolation: is the noise from MLX-level
+    // non-determinism in dense itself, or from something in the RA
+    // path? Run dense at 49K twice and compare.
+    @Test func denseNonDeterminism_49K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 49_151
+        let nSteps = 8
+        MLXRandom.seed(0x4910)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        let forceTokens: [MLXArray] = (0..<nSteps).map { _ in
+            MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+        }
+        eval(forceTokens)
+
+        func runDense() -> [MLXArray] {
+            let dn = model.newCache(parameters: nil)
+            _ = model(prefillTokens, cache: dn)
+            eval(dn.flatMap { $0.state })
+            var out: [MLXArray] = []
+            for s in 0..<nSteps {
+                let logits = model(forceTokens[s], cache: dn)
+                eval(logits)
+                out.append(logits)
+            }
+            return out
+        }
+
+        let a = runDense()
+        let b = runDense()
+        var sumCos: Double = 0
+        var minCos: Float = 1.0
+        for s in 0..<nSteps {
+            let aF = a[s].reshaped(a[s].size).asType(.float32)
+            let bF = b[s].reshaped(b[s].size).asType(.float32)
+            let dot = (aF * bF).sum().asArray(Float.self)[0]
+            let an = sqrt((aF * aF).sum()).asArray(Float.self)[0]
+            let bn = sqrt((bF * bF).sum()).asArray(Float.self)[0]
+            let cos = dot / (an * bn + 1e-12)
+            sumCos += Double(cos)
+            if cos < minCos { minCos = cos }
+        }
+        print("[F-79-dense-noise-49K] dense vs dense steps=\(nSteps) "
+            + "mean_cosine=\(String(format: "%.5f", sumCos / Double(nSteps))) "
+            + "min_cosine=\(String(format: "%.5f", minCos))")
+    }
+
     // MLX non-determinism floor test at 49K: run amort=1 TWICE and
     // compare. If cosine is low, MLX itself is non-deterministic at
     // 49K (F-33 cliff at 32K; probably another at ~64K), and the
