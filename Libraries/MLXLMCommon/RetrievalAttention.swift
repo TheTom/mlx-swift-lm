@@ -95,8 +95,11 @@ public struct RetrievalAttentionConfig: Sendable {
     // ----- Scoring (Decisions 4, 19; PRD line 161)
 
     /// Content vs position blend. 0=pure content, 1=pure position.
-    /// PRD default 0.5; Week 2 A/B 1 sweep ∈ {0.25, 0.5, 0.75}.
-    public var lambdaPos: Float = 0.5
+    /// PRD v5 default 0.5; revised to 0.0 (pure content) per F-17 and
+    /// F-18 — both synthetic and real Qwen3 K microbenches show λ=0
+    /// matches or beats the mixture. Also a perf win: when 0.0, the
+    /// scoring path skips the trig basis multiply entirely.
+    public var lambdaPos: Float = 0.0
 
     /// ALiBi-style recency bias coefficient (PRD line 166).
     /// score += -alpha · log(distance_in_blocks + 1).

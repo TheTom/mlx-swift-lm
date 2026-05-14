@@ -25,7 +25,9 @@ struct RetrievalAttentionTests {
         #expect(c.contentDim == 16)
         #expect(c.trigDim == 16)
         #expect(c.selectorDim == 32)
-        #expect(c.lambdaPos == 0.5)
+        // Revised in feature/retrieval-attention from PRD v5's 0.5 → 0.0
+        // per F-17 / F-18 (pure content wins on real Qwen3 K).
+        #expect(c.lambdaPos == 0.0)
         #expect(c.recencyAlpha == 0.0)
         #expect(c.denseFirstN == 4)
         #expect(c.denseLastN == 4)
