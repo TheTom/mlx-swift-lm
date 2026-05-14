@@ -167,13 +167,13 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         let groupSize = nQHeads / index.nKVHeads
 
         // Pick the representative Q head per KV group (head index = h * groupSize).
-        // Stack into [nKVHeads, dHead].
-        var headSlices: [MLXArray] = []
-        headSlices.reserveCapacity(index.nKVHeads)
-        for h in 0..<index.nKVHeads {
-            headSlices.append(q[h * groupSize, 0...].reshaped(1, q.dim(1)))
-        }
-        let qStacked = concatenated(headSlices, axis: 0).asType(.float32)
+        // Single strided gather → [nKVHeads, dHead]. Replaces an N-iter
+        // Swift loop with N MLX slice ops + a concat (was ~9 ops at
+        // nKVHeads=8; now 1 op).
+        let headIdx = MLXArray(
+            (0..<index.nKVHeads).map { Int32($0 * groupSize) }
+        )
+        let qStacked = q.take(headIdx, axis: 0).asType(.float32)
         let projQ = index.projectQueriesBatched(qStacked)
 
         let fineStartsPerHead = index.topKFineBlockStartsAllHeads(projectedQ: projQ)
