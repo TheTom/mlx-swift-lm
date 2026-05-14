@@ -206,6 +206,20 @@ public func attentionWithCacheUpdate(
                     )
                 }
             }
+            if raCache.raConfig.useParallelScoreTopK {
+                // F-75 — parallel fine+coarse score+topK kernel + F-73
+                // mask kernel. 3 kernel dispatches per sparse layer.
+                let T = cachedKeys.dim(2)
+                let raMask = raCache.buildAttentionMaskFusedParallelKernel(
+                    q: qFlat, dtype: cachedKeys.dtype, T: T
+                )
+                return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                    MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: cachedKeys, values: cachedValues,
+                        scale: scale, mask: .array(raMask), sinks: sinks
+                    )
+                }
+            }
             if raCache.raConfig.useFusedSelectorBundle {
                 // F-74 — fused selector bundle (projectQ + scoreTopK_fine
                 // + scoreTopK_coarse) followed by F-73 mask build.

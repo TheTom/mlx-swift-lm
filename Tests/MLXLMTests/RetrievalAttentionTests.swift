@@ -3444,6 +3444,163 @@ struct RetrievalAttentionTests {
         #expect(diff < 1e-3, "F-71 kernel max_abs_diff \(diff)")
     }
 
+    // F-75 correctness: parallel score+topK kernel matches the F-59
+    // multi-op path.
+    @Test func parallelScoreTopKMatchesReference() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let seqLen = 17_000
+        MLXRandom.seed(0xF75A)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        var maskCfg = RetrievalAttentionConfig()
+        maskCfg.useMaskedDense = true
+        let raMask: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: maskCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raMask)
+        let maskLog = model(nextTok, cache: raMask)
+        eval(maskLog)
+
+        var parCfg = RetrievalAttentionConfig()
+        parCfg.useParallelScoreTopK = true
+        let raPar: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: parCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raPar)
+        let parLog = model(nextTok, cache: raPar)
+        eval(parLog)
+
+        let m = maskLog.reshaped(maskLog.size).asType(.float32)
+        let p = parLog.reshaped(parLog.size).asType(.float32)
+        let dot = (m * p).sum().asArray(Float.self)[0]
+        let mn = sqrt((m * m).sum()).asArray(Float.self)[0]
+        let pn = sqrt((p * p).sum()).asArray(Float.self)[0]
+        let cosine = dot / (mn * pn + 1e-12)
+        let diff = (m - p).abs().max().asArray(Float.self)[0]
+        print("[F-75-par-vs-mask] seqLen=\(seqLen) cosine=\(cosine) max_abs_diff=\(diff)")
+        #expect(cosine >= 0.9999, "parallel diverges from F-59; cosine=\(cosine)")
+    }
+
+    // F-75 latency: include alongside F-73 and F-74 on 14B-1M @ 32K.
+    @Test func fusedKernelLatencySweep_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32767
+        let warmupSteps = 2
+        let timedSteps = 8
+
+        func runOne(mode: String) -> Double {
+            let caches: [KVCache]
+            switch mode {
+            case "dense":
+                caches = (0..<cfg.hiddenLayers).map { _ in StandardKVCache() }
+            case "F-59":
+                var raConf = RetrievalAttentionConfig()
+                raConf.useMaskedDense = true
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            case "F-73":
+                var raConf = RetrievalAttentionConfig()
+                raConf.useFusedMaskBuild = true
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            case "F-75":
+                var raConf = RetrievalAttentionConfig()
+                raConf.useParallelScoreTopK = true
+                caches = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raConf, ropeBase: cfg.ropeTheta)
+                }
+            default: fatalError("bad mode")
+            }
+            MLXRandom.seed(0x7500)
+            let prefillTokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens, cache: caches)
+            eval(caches.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: caches)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        let denseMs = runOne(mode: "dense")
+        let f59Ms = runOne(mode: "F-59")
+        let f73Ms = runOne(mode: "F-73")
+        let f75Ms = runOne(mode: "F-75")
+        print(
+            "[F-75-latency] T=32K "
+                + "dense=\(String(format: "%.1f", denseMs)) "
+                + "F-59=\(String(format: "%.1f", f59Ms)) "
+                + "F-73=\(String(format: "%.1f", f73Ms)) "
+                + "F-75=\(String(format: "%.1f", f75Ms)) | "
+                + "F-75-overhead=\(String(format: "%.1f", f75Ms - denseMs))ms"
+        )
+    }
+
     // F-74 correctness: fused selector-bundle (projectQ + scoreTopK_fine
     // + scoreTopK_coarse + buildMask) matches the F-59 multi-op path.
     @Test func fusedSelectorBundleMatchesReference() throws {

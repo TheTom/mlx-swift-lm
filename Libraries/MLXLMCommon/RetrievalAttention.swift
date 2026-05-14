@@ -199,6 +199,13 @@ public struct RetrievalAttentionConfig: Sendable {
     /// benches confirm a measurable win over the F-59 mask path.
     public var usePerKVHeadGather: Bool = false
 
+    /// F-75 parallel fine+coarse score+topK kernel. 2 × NKVH
+    /// threadgroups in one launch (fine and coarse concurrent), then
+    /// the F-73 mask kernel. Total 3 kernel dispatches per sparse layer
+    /// vs F-73's 4. Targets the remaining 13ms gap after F-73's 9.8ms
+    /// win.
+    public var useParallelScoreTopK: Bool = false
+
     /// F-74 fused selector-bundle path: collapse projectQ + scoreTopK_fine
     /// + scoreTopK_coarse + buildMask into 2 Metal kernel calls per
     /// sparse layer (vs F-73's 4 calls, vs F-59's ~10 MLX ops). Targets
