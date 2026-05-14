@@ -167,6 +167,15 @@ public struct RetrievalAttentionConfig: Sendable {
     /// dense-SDPA-over-T compute would dominate gather overhead).
     public var useMaskedDense: Bool = true
 
+    /// F-63: minimum cache size before RA mask/gather even kicks in.
+    /// Below this threshold the dispatcher falls through to standard
+    /// dense SDPA — at small caches RA's selector + mask construction
+    /// overhead outweighs the modest mask coverage savings (gather
+    /// covers ~78% of cache at 8K with default preBudget=6272, leaving
+    /// only ~20% to mask out). Empirically RA only starts paying off
+    /// near 2-3x the preBudget. Default 16384 = ~2.6x preBudget.
+    public var sparseMinContext: Int = 16384
+
     public init() {}
 }
 

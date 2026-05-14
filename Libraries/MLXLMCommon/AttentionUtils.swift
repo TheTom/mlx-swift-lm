@@ -153,7 +153,8 @@ public func attentionWithCacheUpdate(
         // exactly (the union of static + sliding == [0, T)), so fall through
         // to dense and skip the selector overhead.
         let preBudget = retrievalAttentionPreDedupeBudget(config: raCache.raConfig)
-        let canGather = L == 1 && raCache.isSparseEligible && cachedKeys.dim(2) > preBudget
+        let threshold = max(preBudget, raCache.raConfig.sparseMinContext)
+        let canGather = L == 1 && raCache.isSparseEligible && cachedKeys.dim(2) > threshold
         if canGather {
             let qFlat = queries[0, 0..., 0, 0...]
             if raCache.raConfig.useMaskedDense {
