@@ -195,3 +195,61 @@ public func retrievalAttentionPreDedupeBudget(
         + config.fineTopK * config.fineBlockSize
         + (config.coarseRescueEnabled ? config.coarseTopK * config.coarseBlockSize : 0)
 }
+
+// MARK: - Gather-not-mask execution path (PRD line 136-141)
+
+/// Gather K/V rows at the deduplicated indices and dispatch dense SDPA
+/// on the contiguous result. Stays on `MLXFast.scaledDotProductAttention`'s
+/// fused Metal kernel path (no sparse mask).
+///
+/// - Parameters:
+///   - queries: `[B, nHeads, L, D]` query tensor (current step or
+///     prefill chunk).
+///   - keys: `[B, nKVHeads, T, D]` full per-layer cached keys (post-RoPE,
+///     [F-01]).
+///   - values: `[B, nKVHeads, T, D]` full per-layer cached values.
+///   - gatherIndices: sorted unique positions into the time axis (T),
+///     produced by `retrievalAttentionGatherIndices`. Count is ≤ 6272
+///     for the default config.
+///   - scale: attention scale factor (typically `1/√D`).
+///   - sinks: optional per-head sink logits ([nHeads]). Flows through.
+/// - Returns: SDPA output `[B, nHeads, L, D]`.
+public func retrievalAttentionGatherAndAttend(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    gatherIndices: [Int],
+    scale: Float,
+    sinks: MLXArray? = nil
+) -> MLXArray {
+    precondition(
+        keys.shape.count == 4 && values.shape.count == 4,
+        "keys/values must be [B, nKVHeads, T, D]"
+    )
+    let T = keys.dim(2)
+    precondition(
+        gatherIndices.last == nil || gatherIndices.last! < T,
+        "gather index out of cache range"
+    )
+
+    // MLXArray of int32 indices; gather along the time axis (axis 2).
+    let idxArray = MLXArray(gatherIndices.map { Int32($0) })
+
+    // `take(_:axis:)` is MLX's gather. Time axis is index 2 for both
+    // keys and values. Result shape: [B, nKVHeads, gatherIndices.count, D].
+    let gatheredKeys = keys.take(idxArray, axis: 2)
+    let gatheredValues = values.take(idxArray, axis: 2)
+
+    // Standard dense SDPA on the contiguous tensor. No mask — the
+    // deduplicated indices are the entire attention region.
+    return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+        MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: gatheredKeys,
+            values: gatheredValues,
+            scale: scale,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode.none,
+            sinks: sinks
+        )
+    }
+}
