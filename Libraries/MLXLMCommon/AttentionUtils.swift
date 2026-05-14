@@ -155,8 +155,22 @@ public func attentionWithCacheUpdate(
         let preBudget = retrievalAttentionPreDedupeBudget(config: raCache.raConfig)
         let canGather = L == 1 && raCache.isSparseEligible && cachedKeys.dim(2) > preBudget
         if canGather {
-            // queries: [B, nHeads, 1, D] → [nHeads, D] for the selector.
             let qFlat = queries[0, 0..., 0, 0...]
+            if raCache.raConfig.useMaskedDense {
+                // F-59 mask-not-gather path. Build [1, 1, 1, T] attention
+                // mask on GPU (0 at gather positions, -inf elsewhere) and
+                // run dense SDPA. Skips CPU dedupe + asArray sync entirely.
+                let T = cachedKeys.dim(2)
+                let raMask = raCache.buildAttentionMaskGPU(
+                    q: qFlat, dtype: cachedKeys.dtype, T: T
+                )
+                return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                    MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: cachedKeys, values: cachedValues,
+                        scale: scale, mask: .array(raMask), sinks: sinks
+                    )
+                }
+            }
             let gather = raCache.gatherIndicesForDecode(q: qFlat)
             return retrievalAttentionGatherAndAttend(
                 queries: queries,

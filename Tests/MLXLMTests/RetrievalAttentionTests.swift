@@ -2942,6 +2942,135 @@ struct RetrievalAttentionTests {
         )
     }
 
+    // F-59: validate mask-not-gather path produces the same output as
+    // gather path. Run Qwen3-0.6B-4bit at 8K with both paths and compare
+    // logits cosine. Should be ~1.0 (mathematically equivalent).
+    @Test func maskedDensePathMatchesGather() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let seqLen = 8192
+        MLXRandom.seed(0xF559)
+        let tokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, seqLen]
+        ).asType(.int32)
+        let nextTok = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        // Gather path (default).
+        let gatherCfg = RetrievalAttentionConfig()
+        let raGather: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: gatherCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raGather)
+        let gatherLog = model(nextTok, cache: raGather)
+
+        // Mask path.
+        var maskCfg = RetrievalAttentionConfig()
+        maskCfg.useMaskedDense = true
+        let raMask: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: maskCfg, ropeBase: cfg.ropeTheta)
+        }
+        _ = model(tokens, cache: raMask)
+        let maskLog = model(nextTok, cache: raMask)
+
+        let g = gatherLog.reshaped(gatherLog.size).asType(.float32)
+        let m = maskLog.reshaped(maskLog.size).asType(.float32)
+        let dot = (g * m).sum().asArray(Float.self)[0]
+        let gn = sqrt((g * g).sum()).asArray(Float.self)[0]
+        let mn = sqrt((m * m).sum()).asArray(Float.self)[0]
+        let cosine = dot / (gn * mn + 1e-12)
+        let diff = (g - m).abs().max().asArray(Float.self)[0]
+        print("[F-59-mask-vs-gather] seqLen=\(seqLen) cosine=\(cosine) max_abs_diff=\(diff)")
+        #expect(cosine >= 0.999, "mask path diverges from gather; cosine=\(cosine)")
+    }
+
+    // F-60: latency comparison gather vs mask path on the F-48 harness.
+    @Test func maskedDensePathLatency() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen3-0.6B-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen3Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen3Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 16384
+        let warmupSteps = 4
+        let timedSteps = 16
+        MLXRandom.seed(0x6060)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+
+        func runRA(useMask: Bool) -> Double {
+            var raConf = RetrievalAttentionConfig()
+            raConf.useMaskedDense = useMask
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raConf, ropeBase: cfg.ropeTheta)
+            }
+            _ = model(prefillTokens, cache: ra)
+            eval(ra.flatMap { $0.state })
+            var next = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            for _ in 0..<warmupSteps {
+                let logits = model(next, cache: ra)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            let start = Date()
+            for _ in 0..<timedSteps {
+                let logits = model(next, cache: ra)
+                next = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                eval(next)
+            }
+            return Date().timeIntervalSince(start) / Double(timedSteps) * 1000
+        }
+
+        let gatherMs = runRA(useMask: false)
+        let maskMs = runRA(useMask: true)
+        print(
+            "[F-60-mask-vs-gather-latency] gather=\(String(format: "%.2f", gatherMs))ms "
+                + "mask=\(String(format: "%.2f", maskMs))ms "
+                + "ratio=\(String(format: "%.2fx", maskMs / gatherMs))"
+        )
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.

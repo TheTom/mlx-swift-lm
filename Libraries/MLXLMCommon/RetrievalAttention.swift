@@ -157,6 +157,16 @@ public struct RetrievalAttentionConfig: Sendable {
     /// where magnitude correlates with semantic specificity.
     public var sentinelEnabled: Bool = false
 
+    /// F-59 + F-60 SHIP DEFAULT: build attention mask on GPU instead of
+    /// gathering K/V. Trades a slightly larger dense SDPA matmul for
+    /// eliminating the CPU dedupe + asArray sync + idx upload + take K/V
+    /// chain. Bit-exact equivalent to the gather path (F-59 verified
+    /// max abs diff 0.0, cosine 1.0). F-60 measured **4.7x faster** at
+    /// 16K on Qwen3-0.6B-4bit (gather 126ms → mask 27ms/decode step).
+    /// Set to `false` to opt out (e.g., for very long contexts where
+    /// dense-SDPA-over-T compute would dominate gather overhead).
+    public var useMaskedDense: Bool = true
+
     public init() {}
 }
 

@@ -204,6 +204,61 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         )
     }
 
+    /// F-59 mask-not-gather path: build a [1, 1, 1, T] additive attention
+    /// mask on GPU with 0 at gathered positions and -inf elsewhere.
+    /// Scatter is idempotent for setting to 0, so duplicate positions
+    /// across heads collapse naturally — no CPU dedupe needed.
+    public func buildAttentionMaskGPU(
+        q: MLXArray, dtype: DType, T: Int
+    ) -> MLXArray {
+        precondition(q.shape.count == 2, "expected [nHeads, dHead], got \(q.shape)")
+        guard let index = batchedIndex else {
+            fatalError("indices not initialized; call update first")
+        }
+        let nQHeads = q.dim(0)
+        precondition(
+            nQHeads % index.nKVHeads == 0,
+            "Q heads (\(nQHeads)) must be a multiple of KV heads (\(index.nKVHeads))"
+        )
+        let groupSize = nQHeads / index.nKVHeads
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray(
+                (0..<index.nKVHeads).map { Int32($0 * groupSize) }
+            )
+            eval(cachedHeadIdx!)
+        }
+        let qStacked = q.take(cachedHeadIdx!, axis: 0).asType(.float32)
+        let projQ = index.projectQueriesBatched(qStacked)
+
+        // GPU-side expanded top-K positions (may overlap with static/sliding
+        // and across heads; scatter dedupes for us).
+        let topKPositions = index.expandedTopKPositionsGPU(projectedQ: projQ)
+
+        // Static + sliding ranges.
+        let staticEnd = min(raConfig.staticInit, T)
+        let staticPositions = staticEnd > 0
+            ? MLXArray(Int32(0) ..< Int32(staticEnd))
+            : MLXArray.zeros([0], dtype: .int32)
+        let slidingStart = max(0, T - raConfig.slidingWindow)
+        let slidingPositions = slidingStart < T
+            ? MLXArray(Int32(slidingStart) ..< Int32(T))
+            : MLXArray.zeros([0], dtype: .int32)
+
+        let allPositions = concatenated(
+            [staticPositions, slidingPositions, topKPositions], axis: 0
+        )
+        // Clip to [0, T) — defensive against any small overrun from block
+        // expansion at sequence tail.
+        let clipped = clip(allPositions, min: Int32(0), max: Int32(T - 1))
+
+        // Build mask [1, 1, 1, T] init to -inf, scatter 0 at gather positions.
+        let negInf: Float = -.infinity
+        let fillValue = MLXArray(negInf)
+        let mask = MLXArray.full([1, 1, 1, T], values: fillValue).asType(dtype)
+        mask[0, 0, 0, clipped] = MLXArray(Float(0)).asType(dtype)
+        return mask
+    }
+
     public var debugDescription: String {
         "RetrievalAttentionKVCache(layer=\(layerIdx)/\(totalLayers), "
             + "offset=\(offset), heads=\(batchedIndex?.nKVHeads ?? 0), "

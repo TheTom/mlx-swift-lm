@@ -348,6 +348,51 @@ public final class BatchedRetrievalAttentionIndex {
         )
     }
 
+    /// F-59 path: return expanded per-token positions for fine + coarse
+    /// top-K, ENTIRELY ON GPU (no asArray sync). Used by the
+    /// mask-not-gather attention path.
+    ///
+    /// - Returns: A 1-D MLXArray of int32 positions in [0, seqLen). May
+    ///   contain duplicates across heads and overlap with the
+    ///   static/sliding regions — caller dedupes via mask scatter
+    ///   (idempotent for "set to 0").
+    public func expandedTopKPositionsGPU(projectedQ: MLXArray) -> MLXArray {
+        var sources: [MLXArray] = []
+        // Fine.
+        if let ff = fineBlockFeatures {
+            let kFine = min(config.effectiveFineTopK(seqLen: seqLen), ff.dim(1))
+            if kFine > 0 {
+                let fineStarts = computeTopKBlockStarts(
+                    features: ff, projectedQ: projectedQ,
+                    k: kFine, blockSize: config.fineBlockSize
+                )  // [nKVH, kFine]
+                // Expand each block start to blockSize positions.
+                let bs = config.fineBlockSize
+                let offsets = MLXArray(0..<Int32(bs)).reshaped(1, 1, bs)
+                let expanded = fineStarts.expandedDimensions(axis: 2) + offsets
+                sources.append(expanded.reshaped(-1))
+            }
+        }
+        // Coarse.
+        if config.coarseRescueEnabled, let cf = coarseBlockFeatures {
+            let kCoarse = min(config.coarseTopK, cf.dim(1))
+            if kCoarse > 0 {
+                let coarseStarts = computeTopKBlockStarts(
+                    features: cf, projectedQ: projectedQ,
+                    k: kCoarse, blockSize: config.coarseBlockSize
+                )
+                let bs = config.coarseBlockSize
+                let offsets = MLXArray(0..<Int32(bs)).reshaped(1, 1, bs)
+                let expanded = coarseStarts.expandedDimensions(axis: 2) + offsets
+                sources.append(expanded.reshaped(-1))
+            }
+        }
+        if sources.isEmpty {
+            return MLXArray.zeros([0], dtype: .int32)
+        }
+        return concatenated(sources, axis: 0)
+    }
+
     /// Combined fine + coarse topK in ONE asArray sync. Both topK MLX op
     /// chains stay queued, get concat'd into a single [nKVHeads, kFine +
     /// kCoarse] tensor, and one CPU↔GPU sync pulls all the indices.
