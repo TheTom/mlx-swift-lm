@@ -3599,6 +3599,105 @@ struct RetrievalAttentionTests {
         print(line)
     }
 
+    // F-79 fine-grained quality sweep — find the largest amort where
+    // cosine vs amort=1 reference still stays ≥0.999.
+    @Test func selectorAmortizationQualitySweep_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 24_576
+        let nSteps = 16
+
+        // Build reference (amort=1) sequence ONCE. Compare all amort
+        // values to the same reference (saves ~5x test time vs running
+        // reference per-amort).
+        var refConf = RetrievalAttentionConfig()
+        refConf.selectorAmortization = 1
+        let raRef: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: refConf, ropeBase: cfg.ropeTheta)
+        }
+        MLXRandom.seed(0x79FF)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        _ = model(prefillTokens, cache: raRef)
+        eval(raRef.flatMap { $0.state })
+        var refNext = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+        var refLogits: [MLXArray] = []
+        var refTokens: [Int32] = []
+        for _ in 0..<nSteps {
+            let logits = model(refNext, cache: raRef)
+            eval(logits)
+            refLogits.append(logits)
+            let nextTok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            refTokens.append(nextTok.asArray(Int32.self)[0])
+            refNext = nextTok
+        }
+
+        for amort in [6, 8, 10, 12, 16, 24, 32] {
+            var aConf = RetrievalAttentionConfig()
+            aConf.selectorAmortization = amort
+            let raA: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: aConf, ropeBase: cfg.ropeTheta)
+            }
+            MLXRandom.seed(0x79FF)
+            let prefillTokens2 = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, prefillLen]
+            ).asType(.int32)
+            _ = model(prefillTokens2, cache: raA)
+            eval(raA.flatMap { $0.state })
+            var aNext = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+            var sumCos: Double = 0
+            var matches = 0
+            for s in 0..<nSteps {
+                let logits = model(aNext, cache: raA)
+                eval(logits)
+                let r = refLogits[s].reshaped(refLogits[s].size).asType(.float32)
+                let a = logits.reshaped(logits.size).asType(.float32)
+                let dot = (r * a).sum().asArray(Float.self)[0]
+                let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+                let an = sqrt((a * a).sum()).asArray(Float.self)[0]
+                sumCos += Double(dot / (rn * an + 1e-12))
+                let aTok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                let aTokVal = aTok.asArray(Int32.self)[0]
+                if aTokVal == refTokens[s] { matches += 1 }
+                aNext = aTok
+            }
+            let meanCos = sumCos / Double(nSteps)
+            print("[F-79-quality-sweep] amort=\(amort) "
+                + "mean_cosine=\(String(format: "%.5f", meanCos)) "
+                + "argmax_match=\(matches)/\(nSteps)")
+        }
+    }
+
     // F-79 quality: cosine drift over 32 decode steps for amort=1/2/4/8
     @Test func selectorAmortizationQuality_14B1M() throws {
         let modelPath = URL(

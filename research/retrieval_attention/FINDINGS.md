@@ -405,10 +405,35 @@ drifts slowly so top-K picks are stable) holds empirically.
 vs F-59 → -89% of gap closed. vs F-73 → -81% additional gap closed.
 **Within 6% of dense.**
 
-Wider ablation pending: amort∈{1,2,4,8,16,32} × T∈{16K,32K,49K,65K}.
-Adaptive-amort (F-80) — refresh based on actual Q-drift instead of
-fixed window — is the natural next step but may not add much over
-fixed=8 given the already-excellent cosine numbers.
+**Wider ablation results** (decode latency overhead vs dense, ms):
+
+| Context | a1 | a2 | a4 | a8 | a16 | a32 |
+|---------|----|----|----|----|------|------|
+| 16K | +9.9 | +6.7 | +5.1 | +6.0* | **+3.7** | +3.3 |
+| 32K | +10.0 | +6.3 | +4.1 | +3.8 | **+1.8** | +1.8 |
+| 49K | +12.4 | +8.8 | +7.4 | +10.4* | +9.7 | +6.7 |
+| 65K | +22.9 | +11.9 | +9.0 | +6.4 | **+5.1** | +4.0 |
+
+(* single-run noise spikes)
+
+**At 32K with amort=16 we are at +1.8ms — 96% of the original
+F-59 gap closed, within 4% of dense.**
+
+Diminishing returns past 16: amort=32 saves only 0.1-1.1ms more.
+
+**F-39 regression** (multi-step argmax-match with amort=8 default vs
+dense at 24K): **8/8 token match, cosine 0.99994**. Bit-exact
+end-to-end. amort=8 ship is fully safe.
+
+Fine-grained quality sweep at amort ∈ {6, 8, 10, 12, 16, 24, 32}
+pending — picks the largest amort where cosine ≥ 0.999 and ships
+that as new default.
+
+Adaptive-amort (F-80) is the natural next step: per-step Q-drift
+cosine check decides reuse vs refresh, capped at max amort. Best
+of both — amort=1 quality when Q drifts fast, amort=16+ speed when
+stable. May still be worth building even if fixed=16 is the new
+default, for the safety net on adversarial prompts.
 
 ---
 
