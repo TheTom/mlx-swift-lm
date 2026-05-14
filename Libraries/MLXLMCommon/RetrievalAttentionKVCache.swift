@@ -33,9 +33,12 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
     /// Inner raw K/V cache — same storage layout as `StandardKVCache`.
     public let inner: StandardKVCache
 
-    /// Per-KV-head selector indices. Populated lazily on the first
-    /// `update(...)` once we know `nKVHeads` and `dHead`.
-    public private(set) var perHeadIndex: [RetrievalAttentionIndex] = []
+    /// Batched selector index covering all KV heads for this layer.
+    /// Populated lazily on the first `update(...)` once we know
+    /// `nKVHeads` and `dHead`. Replaces the per-head index array — F-43
+    /// surfaced the per-head Swift loop as the dominant decode-step
+    /// overhead.
+    public private(set) var batchedIndex: BatchedRetrievalAttentionIndex?
 
     /// RetrievalAttention configuration (block sizes, top-K, dense layers).
     public let raConfig: RetrievalAttentionConfig
@@ -104,30 +107,26 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         super.init()
     }
 
-    /// Allocate one selector index per KV head on first sight of the cache
+    /// Allocate the batched selector index on first sight of the cache
     /// shape. Cheap to call on every update; idempotent after the first.
-    private func ensureIndices(nKVHeads: Int, dHead: Int) {
-        guard perHeadIndex.isEmpty else { return }
-        perHeadIndex = (0..<nKVHeads).map { _ in
-            RetrievalAttentionIndex(
-                config: raConfig,
-                dHead: dHead,
-                ropeBase: ropeBase,
-                layerIdx: layerIdx
-            )
-        }
+    private func ensureIndex(nKVHeads: Int, dHead: Int) {
+        guard batchedIndex == nil else { return }
+        batchedIndex = BatchedRetrievalAttentionIndex(
+            config: raConfig,
+            dHead: dHead,
+            nKVHeads: nKVHeads,
+            ropeBase: ropeBase,
+            layerIdx: layerIdx
+        )
     }
 
-    /// Update inner storage AND (for sparse-eligible layers) every
-    /// per-head selector index.
+    /// Update inner storage AND (for sparse-eligible layers) the
+    /// batched selector index.
     ///
     /// `keys` / `values` come in as `[B, nKVHeads, L, D]` (post-RoPE for K).
     /// v1 supports B == 1. Multi-B caches would need per-request indices.
     ///
-    /// Dense-band layers (first-N / last-N) skip the index update entirely
-    /// — F-43 showed the selector update is the dominant per-step cost,
-    /// and dense layers never query the index. 8 of 48 layers on 14B-1M
-    /// → ~17% of the wasted overhead avoided "for free".
+    /// Dense-band layers (first-N / last-N) skip the index update entirely.
     public override func update(
         keys: MLXArray, values: MLXArray
     ) -> (MLXArray, MLXArray) {
@@ -135,30 +134,21 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         let nKVHeads = keys.dim(1)
         let dHead = keys.dim(3)
 
-        // Update the inner cache first — returns the *full* cached K/V tensor.
         let (cachedK, cachedV) = inner.update(keys: keys, values: values)
 
-        // Dense-band layer? Skip the index entirely.
         if !isSparseEligible {
             return (cachedK, cachedV)
         }
 
-        ensureIndices(nKVHeads: nKVHeads, dHead: dHead)
+        ensureIndex(nKVHeads: nKVHeads, dHead: dHead)
 
-        // Update per-head indices with just the new rows (L tokens of K).
-        // K is post-RoPE here (verified F-01).
-        // Casting to float32 keeps the selector math stable; the index is fp32.
-        let keysF32 = keys.asType(.float32)
-        for h in 0..<nKVHeads {
-            let newRows = keysF32[0, h, 0..., 0...]
-            perHeadIndex[h].update(newK: newRows)
-        }
+        // [1, nKVHeads, L, D] → [nKVHeads, L, D]
+        let keysF32 = keys.asType(.float32)[0, 0..., 0..., 0...]
+        batchedIndex!.update(newKeys: keysF32)
         return (cachedK, cachedV)
     }
 
-    /// Compute the union of per-head fine + coarse top-K block start positions
-    /// for a given decode-step query. Each head's index sees the same query;
-    /// downstream SDPA still runs per-head, so this is a gather-set hint only.
+    /// Compute the union of per-head fine + coarse top-K block start positions.
     ///
     /// - Parameter q: `[nHeads, dHead]` — current query, post-RoPE, for the
     ///   decode step.
@@ -166,37 +156,39 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
     ///   fine top-K + coarse top-K) ready for `keys.take(_, axis: 2)`.
     public func gatherIndicesForDecode(q: MLXArray) -> [Int] {
         precondition(q.shape.count == 2, "expected [nHeads, dHead], got \(q.shape)")
+        guard let index = batchedIndex else {
+            fatalError("indices not initialized; call update first")
+        }
         let nQHeads = q.dim(0)
-        let nKVHeads = perHeadIndex.count
-        precondition(nKVHeads > 0, "indices not initialized; call update first")
         precondition(
-            nQHeads % nKVHeads == 0,
-            "Q heads (\(nQHeads)) must be a multiple of KV heads (\(nKVHeads))"
+            nQHeads % index.nKVHeads == 0,
+            "Q heads (\(nQHeads)) must be a multiple of KV heads (\(index.nKVHeads))"
         )
-        let groupSize = nQHeads / nKVHeads
+        let groupSize = nQHeads / index.nKVHeads
 
-        let seqLen = self.offset
+        // Pick the representative Q head per KV group (head index = h * groupSize).
+        // Stack into [nKVHeads, dHead].
+        var headSlices: [MLXArray] = []
+        headSlices.reserveCapacity(index.nKVHeads)
+        for h in 0..<index.nKVHeads {
+            headSlices.append(q[h * groupSize, 0...].reshaped(1, q.dim(1)))
+        }
+        let qStacked = concatenated(headSlices, axis: 0).asType(.float32)
+        let projQ = index.projectQueriesBatched(qStacked)
+
+        let fineStartsPerHead = index.topKFineBlockStartsAllHeads(projectedQ: projQ)
+        let coarseStartsPerHead = raConfig.coarseRescueEnabled
+            ? index.topKCoarseBlockStartsAllHeads(projectedQ: projQ)
+            : Array(repeating: [], count: index.nKVHeads)
+
         var allFine = Set<Int>()
         var allCoarse = Set<Int>()
-        for h in 0..<nKVHeads {
-            // perKVGroupMax: score each Q-head in the group, keep the one
-            // with the highest top-of-list block, then take its top-K set.
-            // v1 simplification: just take the GQA-group max scorer instead
-            // of properly maxing scores. The first iteration we have the
-            // Q head index simply == h * groupSize (representative head).
-            // Future: do score(blockFeatures, q_i) for each q_i in group
-            // and elementwise max before topK.
-            let qHead = q[h * groupSize, 0...]
-            let projQ = perHeadIndex[h].projectQuery(qHead.asType(.float32))
-            let fineStarts = perHeadIndex[h].topKFineBlockStarts(against: projQ)
-            for s in fineStarts { allFine.insert(s) }
-            if raConfig.coarseRescueEnabled {
-                let coarseStarts = perHeadIndex[h].topKCoarseBlockStarts(against: projQ)
-                for s in coarseStarts { allCoarse.insert(s) }
-            }
+        for h in 0..<index.nKVHeads {
+            for s in fineStartsPerHead[h] { allFine.insert(s) }
+            for s in coarseStartsPerHead[h] { allCoarse.insert(s) }
         }
         return retrievalAttentionGatherIndices(
-            seqLen: seqLen,
+            seqLen: self.offset,
             fineBlockStarts: Array(allFine),
             coarseBlockStarts: Array(allCoarse),
             config: raConfig
@@ -205,7 +197,7 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
 
     public var debugDescription: String {
         "RetrievalAttentionKVCache(layer=\(layerIdx)/\(totalLayers), "
-            + "offset=\(offset), heads=\(perHeadIndex.count), "
+            + "offset=\(offset), heads=\(batchedIndex?.nKVHeads ?? 0), "
             + "sparseEligible=\(isSparseEligible))"
     }
 }
