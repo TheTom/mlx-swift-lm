@@ -252,6 +252,60 @@ cases that benefit from per-head divergence semantics.**
 
 ---
 
+## F-71 → F-72 → F-73 → F-74 → F-75 — closing the gap to dense
+
+**Dense baseline measured first.** Qwen2.5-14B-1M-4bit / M5 Max:
+
+| Context | Dense (no RA) | F-59 mask (old) | RA-over-dense |
+|---------|---------------|------------------|----------------|
+| 16K | 31.6 | 55.0 | +23.4 |
+| 32K | 38.3 | 62.4 | +22.9 |
+| 49K | 45.3 | 63.0 | +17.7 |
+| 65K | 66.7 | 83.7 | +17.0 |
+
+**F-73 selector-bypass diagnostic** isolated WHERE the gap is: route to plain dense SDPA at decode while keeping the RA cache. Result:
+
+```
+T=32K dense=38.3 RA-bypass=38.1 RA-mask=62.4 cache_overhead=-0.1 selector_overhead=24.3
+```
+
+→ **Cache overhead = 0ms. The entire RA-over-dense gap is the per-decode-step selector pipeline.** Cache updates, KV storage, dispatcher logic — all free.
+
+**F-71** — NSA-style fused sparse SDPA kernel. Tried two layouts:
+- F-71a tree-reduce, group-centric: 13-19x slower (only nKVH=8 threadgroups in flight; underutilizes M5 Max's 40 SMs)
+- F-71b mlx-swift sdpa_vector layout (BN=32 simdgroups × BD=32 lanes, simd_sum): 1.25-1.49x slower at 16-32K
+
+Both correct (cosine 1.0, max_abs_diff 3e-7). Can't beat mlx-swift's heavily-tuned `sdpa_vector` with mask=.array, which short-circuits inner FMA at -inf positions (mask path compute scales with K_padded, not T). Plus random gather access on Apple Silicon costs 2-4x vs coalesced K reads. **The cost ISN'T attention compute — it's selector pipeline ops.**
+
+**F-72** — skip BatchedRetrievalAttentionIndex.update at decode (L==1). No measurable improvement. Confirms the gap isn't index updates either.
+
+**F-73 — single Metal kernel that writes the [1, 1, 1, T] mask from topK starts**. Replaces ~6 MLX ops per layer (range_static + range_sliding + concat + clip + MLXArray.full + scatter) with one launch. T threads, threadgroup 256, cooperative load of topK arrays into 4.2 KB threadgroup memory, linear-scan membership test. **Bit-exact to F-59** (cosine 1.0, max_abs_diff 0.0). **Saves 9.8ms / decode step**. Now ship default (`useFusedMaskBuild = true`).
+
+**F-74** — monolithic projectQ + scoreTopK_fine + scoreTopK_coarse kernel. Bit-exact but 2.4ms SLOWER than F-73. Hypothesis confirmed: MLX runtime already runs F-73's separate projectQ + F-48-fine + F-48-coarse kernels concurrently on the GPU; combining them in one threadgroup serializes the work. Opt-in only.
+
+**F-75** — parallel fine+coarse score+topK kernel with 2 × nKVH threadgroups. Bit-exact, tied with F-73 (no improvement). Same hypothesis: MLX already scheduled both F-48 calls concurrently. Opt-in only.
+
+**Final result (Qwen2.5-14B-1M-4bit @ 32K):**
+
+```
+Dense           = 38.3ms     (baseline)
+F-73 (NEW)      = 52.5ms     +14.3ms (37% of original gap closed)
+F-59 (OLD)      = 62.4ms     +22.9ms
+F-74 monolith   = 55.2ms     +16.1ms
+F-75 parallel   = 52.3ms     +13.9ms (tied with F-73)
+```
+
+**Why we can't close the rest (yet):** the remaining 14.3ms is 4-6 kernel dispatches per sparse layer × 40 layers × ~57us per dispatch. Per the MLX backend source (`mlx/backend/metal/device.cpp`) and Apple's WWDC25 MLX session, this is dispatch latency — fundamentally per-op cost on Apple Silicon. The irreducible lower bound with current architecture is ~2-3ms (1 op per layer × 40 × 57us).
+
+Getting below 14.3ms requires either:
+1. Batching the selector pipeline across all 40 layers in one Metal kernel (requires restructuring the model forward to pre-collect projectedQ across layers — net loss because it doubles the model forward).
+2. Switching to NSA/Quest/FlexAttention's "no mask" design — pass topK block indices directly to a fused sparse SDPA kernel (needs F-71b-class kernel tuned to match mlx-swift's `sdpa_vector` quality — significant engineering).
+3. MLX runtime optimizations on Apple's side (lower per-dispatch overhead).
+
+The F-73 ship is the highest-leverage incremental win available without restructuring.
+
+---
+
 ## What's still open (in priority order)
 
 1. **Fused select-gather-attend Metal kernel.** Big engineering job — would
