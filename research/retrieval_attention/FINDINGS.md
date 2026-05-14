@@ -49,9 +49,13 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
     sensitivity)
 - **Latency:** NOT ship ready. 1.9x slower at 4K (gather skipped, only
   index update overhead), 17-27x slower at 8K-32K with gather active.
-  Cause is per-layer small-graph dispatch overhead in MLX; the bounded
-  gather doesn't beat dense MLX SDPA's Metal fusion. **Needs a fused
-  select-gather-attend Metal kernel** to ship for latency-sensitive use.
+  **F-48 pinned the bottleneck to dispatch-fixed cost (21ms/sparse-layer
+  on Qwen3-0.6B vs 23ms/sparse-layer on Qwen2.5-14B-1M at 16K — identical
+  overhead despite 24x model size difference).** Each sparse layer's ~4
+  Metal command queue submissions + asArray CPU↔GPU syncs dominate; the
+  bounded gather's compute win can't be realized today. **One fused
+  select-gather-attend Metal kernel reducing per-layer dispatch from ~4
+  ops to 1 would close the entire gap.**
 - **Memory:** acceptable; per-layer selector index is `[nKVHeads, T, 32]`
   fp32 + small block-pooled views. At 14B-1M / 24K / 48 sparse layers:
   ~960MB selector overhead. Not great; future work could eliminate the
