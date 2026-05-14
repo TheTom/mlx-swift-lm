@@ -47,15 +47,23 @@ Qwen2.5-7B (no Q/K norm, GQA 7:1), and Qwen2.5-14B-1M (GQA 7:1, rope_theta
   - `coarseRescueEnabled = true`, top-2 (F-19)
   - `denseFirstN = denseLastN = 4` (F-25 proved this absorbs boundary
     sensitivity)
-- **Latency:** NOT ship ready. 1.9x slower at 4K (gather skipped, only
-  index update overhead), 17-27x slower at 8K-32K with gather active.
-  **F-48 pinned the bottleneck to dispatch-fixed cost (21ms/sparse-layer
-  on Qwen3-0.6B vs 23ms/sparse-layer on Qwen2.5-14B-1M at 16K — identical
-  overhead despite 24x model size difference).** Each sparse layer's ~4
-  Metal command queue submissions + asArray CPU↔GPU syncs dominate; the
-  bounded gather's compute win can't be realized today. **One fused
-  select-gather-attend Metal kernel reducing per-layer dispatch from ~4
-  ops to 1 would close the entire gap.**
+- **Latency:** Improved (Phase C step 1). On Qwen3-0.6B-4bit at 16K,
+  per-sparse-layer overhead dropped **39ms → 14.47ms (63%)** through a
+  sequence of small wins:
+  - F-44: BatchedRetrievalAttentionIndex (batched per-head matmul)
+  - F-49: GPU argPartition replaces CPU sort
+  - F-50: combined fine+coarse asArray (1 sync instead of 2)
+  - F-51: pre-allocated perTokenFeatures buffer
+  - F-52: pre-allocated block-feature buffers + in-place writes
+  - F-53: dropped explicit eval() barrier (no longer needed with in-place writes)
+  - F-54: cached pre-transposed JL matrix W.T
+  - + λ=0 trig-skip, single take() for head slicing, head-slice refactor
+
+  On Qwen2.5-14B-1M at 24K: 1559ms/decode → 1210ms/decode (22%). Per-sparse-layer
+  ~30ms on 14B (compute bigger; per-op dispatch shared with 0.6B but
+  K/V tensors larger so take + SDPA take longer). Still 17-23x slower than
+  dense; further wins require a single fused Metal kernel that does the
+  whole select-gather-attend in one launch.
 - **Memory:** acceptable; per-layer selector index is `[nKVHeads, T, 32]`
   fp32 + small block-pooled views. At 14B-1M / 24K / 48 sparse layers:
   ~960MB selector overhead. Not great; future work could eliminate the
