@@ -36,8 +36,29 @@ public final class BatchedRetrievalAttentionIndex {
     private var populated: Int = 0
     private static let featureChunkSize: Int = 1024
 
-    private(set) public var fineBlockFeatures: MLXArray?
-    private(set) public var coarseBlockFeatures: MLXArray?
+    /// Pre-allocated block feature buffers (mirrors perTokenFeatures
+    /// pattern). Block means are written in-place at their slot index;
+    /// `effectiveFine/CoarseBlockFeatures` exposes the valid prefix
+    /// `[0..<currentFine/CoarseBlocks]` for scoring.
+    private var fineBlockBuffer: MLXArray?
+    private var coarseBlockBuffer: MLXArray?
+    private var fineBlockCapacity: Int = 0
+    private var coarseBlockCapacity: Int = 0
+    private static let blockBufferChunkSize: Int = 256
+
+    /// Number of currently-meaningful block features (completed + partial).
+    private var currentFineBlocks: Int { (populated + config.fineBlockSize - 1) / config.fineBlockSize }
+    private var currentCoarseBlocks: Int { (populated + config.coarseBlockSize - 1) / config.coarseBlockSize }
+
+    /// Public view onto the valid prefix of the pre-allocated buffer.
+    public var fineBlockFeatures: MLXArray? {
+        guard let buf = fineBlockBuffer, currentFineBlocks > 0 else { return nil }
+        return buf[0..., ..<currentFineBlocks, 0...]
+    }
+    public var coarseBlockFeatures: MLXArray? {
+        guard let buf = coarseBlockBuffer, currentCoarseBlocks > 0 else { return nil }
+        return buf[0..., ..<currentCoarseBlocks, 0...]
+    }
 
     public init(
         config: RetrievalAttentionConfig = RetrievalAttentionConfig(),
@@ -127,91 +148,84 @@ public final class BatchedRetrievalAttentionIndex {
         perTokenFeatures![0..., oldSeqLen ..< newSeqLen, 0...] = selectorNew
         populated = newSeqLen
 
-        // Block-pooled features. Incremental for L=1, full re-pool otherwise.
-        // Always operate on the valid populated slice, not the
-        // pre-allocated reservation.
-        if L == 1 && fineBlockFeatures != nil {
-            updateBlockTailIncremental(blockSize: config.fineBlockSize, oldSeqLen: oldSeqLen, isFine: true)
-            if config.coarseRescueEnabled && coarseBlockFeatures != nil {
-                updateBlockTailIncremental(blockSize: config.coarseBlockSize, oldSeqLen: oldSeqLen, isFine: false)
-            }
-        } else {
-            let validView = perTokenFeatures![0..., ..<populated, 0...]
-            fineBlockFeatures = batchedBlockMeanPool(
-                validView, blockSize: config.fineBlockSize
+        // Block-pooled features written in-place into pre-allocated
+        // buffers. F-52 perf — removes the eval() barrier that was needed
+        // when block features were a growing concat'd tensor, since the
+        // in-place writes don't accumulate a deep graph.
+        updateBlockBufferInPlace(
+            blockSize: config.fineBlockSize, oldSeqLen: oldSeqLen,
+            isFine: true, featureDim: featureDim, multiToken: L > 1
+        )
+        if config.coarseRescueEnabled {
+            updateBlockBufferInPlace(
+                blockSize: config.coarseBlockSize, oldSeqLen: oldSeqLen,
+                isFine: false, featureDim: featureDim, multiToken: L > 1
             )
-            if config.coarseRescueEnabled {
-                coarseBlockFeatures = batchedBlockMeanPool(
-                    validView, blockSize: config.coarseBlockSize
-                )
-            }
         }
-
-        // Materialize the block-pooled state to break the lazy graph chain.
-        // Evaling only block features (not perTokenFeatures) — block
-        // features transitively depend on perTokenFeatures via the slice
-        // + mean, so they get materialized along the way. Skipping the
-        // explicit perTokenFeatures eval saves the broadcast-of-the-full
-        // tensor when only its tail is needed.
-        var toEval: [MLXArray] = [fineBlockFeatures!]
-        if let coarse = coarseBlockFeatures { toEval.append(coarse) }
-        eval(toEval)
+        // Single eval at end of update — materializes the in-place writes
+        // (the buffer assignment is lazy under MLX).
+        eval(perTokenFeatures!, fineBlockBuffer!)
+        if let cb = coarseBlockBuffer { eval(cb) }
     }
 
-    /// Mean-pool a `[nKVHeads, T, selectorDim]` array into blocks of
-    /// `blockSize`, returning `[nKVHeads, nBlocks, selectorDim]`. Last
-    /// block is mean over `≤ blockSize` rows.
-    private func batchedBlockMeanPool(_ features: MLXArray, blockSize: Int) -> MLXArray {
-        let nh = features.dim(0)
-        let T = features.dim(1)
-        let D = features.dim(2)
-        let nBlocks = (T + blockSize - 1) / blockSize
-        let paddedT = nBlocks * blockSize
-        let padCount = paddedT - T
-        let working: MLXArray
-        if padCount == 0 {
-            working = features
+    /// In-place block-pool update onto a pre-allocated buffer.
+    /// For L=1 decode steps: rewrite only the last (partial) block — the
+    /// only one whose token count changed.
+    /// For multi-token prefill: rewrite all blocks touched by the new
+    /// region. Caller guarantees `populated` is the post-update value.
+    private func updateBlockBufferInPlace(
+        blockSize: Int, oldSeqLen: Int, isFine: Bool,
+        featureDim: Int, multiToken: Bool
+    ) {
+        ensureBlockBuffer(isFine: isFine, featureDim: featureDim)
+        let newBlockCount = (populated + blockSize - 1) / blockSize
+        let buf = isFine ? fineBlockBuffer! : coarseBlockBuffer!
+
+        let firstAffected: Int
+        if multiToken {
+            firstAffected = oldSeqLen / blockSize
         } else {
-            let pad = MLXArray.zeros([nh, padCount, D], dtype: features.dtype)
-            working = concatenated([features, pad], axis: 1)
+            firstAffected = newBlockCount - 1  // only last block can have changed
         }
-        // [nh, nBlocks, blockSize, D] → mean over axis 2
-        let pooled = working.reshaped(nh, nBlocks, blockSize, D).mean(axis: 2)
-        if padCount == 0 { return pooled }
-        let tail = T - (nBlocks - 1) * blockSize
-        let correction = Float(blockSize) / Float(tail)
-        var oneNB = Array(repeating: Float(1.0), count: nBlocks)
-        oneNB[nBlocks - 1] = correction
-        let mask = MLXArray(oneNB).reshaped(1, nBlocks, 1).asType(pooled.dtype)
-        return pooled * mask
+
+        for b in firstAffected ..< newBlockCount {
+            let start = b * blockSize
+            let end = min(start + blockSize, populated)
+            // [nKVHeads, end-start, D]
+            let slice = perTokenFeatures![0..., start ..< end, 0...]
+            let mean = slice.mean(axis: 1)  // [nKVHeads, D]
+            buf[0..., b, 0...] = mean
+        }
     }
 
-    private func updateBlockTailIncremental(blockSize: Int, oldSeqLen: Int, isFine: Bool) {
-        let pooled = isFine ? fineBlockFeatures! : coarseBlockFeatures!
-        let priorBlockCount = pooled.dim(1)
-        let lastBlockIdx = oldSeqLen / blockSize
-        let lastBlockStart = lastBlockIdx * blockSize
-        // Slice only the valid populated range — perTokenFeatures is now a
-        // pre-allocated buffer with reservation slots beyond `populated`.
-        let tail = perTokenFeatures![0..., lastBlockStart ..< populated, 0...]
-        let tailMean = tail.mean(axis: 1).reshaped(nKVHeads, 1, pooled.dim(2))
-        if priorBlockCount == lastBlockIdx + 1 {
-            if priorBlockCount == 1 {
-                if isFine { fineBlockFeatures = tailMean } else { coarseBlockFeatures = tailMean }
-            } else {
-                let head = pooled[0..., ..<(priorBlockCount - 1), 0...]
-                let merged = concatenated([head, tailMean], axis: 1)
-                if isFine { fineBlockFeatures = merged } else { coarseBlockFeatures = merged }
-            }
-        } else if priorBlockCount == lastBlockIdx {
-            let merged = concatenated([pooled, tailMean], axis: 1)
-            if isFine { fineBlockFeatures = merged } else { coarseBlockFeatures = merged }
+    /// Ensure block buffer has capacity for `currentXBlocks` blocks; grow
+    /// in `blockBufferChunkSize` chunks otherwise.
+    private func ensureBlockBuffer(isFine: Bool, featureDim: Int) {
+        let needed = isFine ? currentFineBlocks : currentCoarseBlocks
+        let cap = isFine ? fineBlockCapacity : coarseBlockCapacity
+        if cap >= needed && (isFine ? fineBlockBuffer : coarseBlockBuffer) != nil {
+            return
+        }
+        let chunkSize = Self.blockBufferChunkSize
+        let newCap = max(chunkSize, ((needed + chunkSize - 1) / chunkSize) * chunkSize)
+        let dtype = perTokenFeatures?.dtype ?? .float32
+        let newBuf = MLXArray.zeros([nKVHeads, newCap, featureDim], dtype: dtype)
+        // Copy old contents into new buffer at [0..<cap].
+        if cap > 0, let old = isFine ? fineBlockBuffer : coarseBlockBuffer {
+            newBuf[0..., ..<cap, 0...] = old[0..., ..<cap, 0...]
+        }
+        if isFine {
+            fineBlockBuffer = newBuf
+            fineBlockCapacity = newCap
         } else {
-            let validView = perTokenFeatures![0..., ..<populated, 0...]
-            let full = batchedBlockMeanPool(validView, blockSize: blockSize)
-            if isFine { fineBlockFeatures = full } else { coarseBlockFeatures = full }
+            coarseBlockBuffer = newBuf
+            coarseBlockCapacity = newCap
         }
     }
+
+    // (batchedBlockMeanPool + updateBlockTailIncremental removed in F-52;
+    // updateBlockBufferInPlace handles both prefill and decode paths
+    // against the pre-allocated block buffers.)
 
     /// Project the query for all heads in one go.
     /// - Parameter q: `[nKVHeads, dHead]`
