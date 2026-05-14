@@ -2264,6 +2264,68 @@ struct RetrievalAttentionTests {
         }
     }
 
+    // F-38: PRD target at LONG context. Test 14B-1M at 32K and 64K with
+    // dense-vs-dense determinism check first, then RA vs dense cosine.
+    @Test func trainedQwen25_14B_1M_LongContext() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        let quant = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        try loadWeights(modelDirectory: modelPath, model: model, quantization: quant)
+
+        for seqLen in [32767, 65535] {
+            MLXRandom.seed(UInt64(0x14B1 + seqLen))
+            let tokens = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, seqLen]
+            ).asType(.int32)
+            let nextTok = MLXRandom.randInt(
+                low: MLXArray(Int32(0)),
+                high: MLXArray(Int32(cfg.vocabularySize)),
+                [1, 1]
+            ).asType(.int32)
+
+            // Step 1: dense-vs-dense determinism.
+            let dnA = model.newCache(parameters: nil)
+            _ = model(tokens, cache: dnA)
+            let lA = model(nextTok, cache: dnA)
+            let dnB = model.newCache(parameters: nil)
+            _ = model(tokens, cache: dnB)
+            let lB = model(nextTok, cache: dnB)
+            let fa = lA.reshaped(lA.size).asType(.float32)
+            let fb = lB.reshaped(lB.size).asType(.float32)
+            let dnDet = (fa - fb).abs().max().asArray(Float.self)[0]
+
+            // Step 2: RA vs dense.
+            let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    ropeBase: cfg.ropeTheta)
+            }
+            _ = model(tokens, cache: ra)
+            let lR = model(nextTok, cache: ra)
+            let fr = lR.reshaped(lR.size).asType(.float32)
+            let dot = (fa * fr).sum().asArray(Float.self)[0]
+            let na = sqrt((fa * fa).sum()).asArray(Float.self)[0]
+            let nr = sqrt((fr * fr).sum()).asArray(Float.self)[0]
+            let cosine = dot / (na * nr + 1e-12)
+            print(
+                "[F-38-qwen25-14B-1M-long] seqLen=\(seqLen) "
+                    + "dense_det_max_diff=\(dnDet) RA_cosine=\(cosine) "
+                    + "norms d=\(na) r=\(nr)"
+            )
+        }
+    }
+
     @Test func dedupe1MFullBudget() {
         // PRD example: 1M context, 32 fine blocks + 2 coarse, none
         // overlapping. Result should equal exactly 6272.
