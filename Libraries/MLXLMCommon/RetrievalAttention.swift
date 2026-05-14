@@ -213,13 +213,13 @@ public struct RetrievalAttentionConfig: Sendable {
     /// the original 22.8ms gap.
     public var useFusedSelectorBundle: Bool = false
 
-    /// F-73 build-mask path: replace the multi-op buildAttentionMaskGPU
-    /// pipeline with a single fused Metal kernel that writes the
-    /// `[1, 1, 1, T]` additive mask from the top-K block starts in one
-    /// launch. F-73 diagnostic isolated 22.9ms / 22.9ms gap-to-dense as
-    /// the selector pipeline overhead — this kernel is the primary
-    /// path to close it.
-    public var useFusedMaskBuild: Bool = false
+    /// F-73 SHIP DEFAULT: build the additive `[1, 1, 1, T]` attention
+    /// mask via a single fused Metal kernel that consumes the topK
+    /// block starts directly. Bit-exact to F-59 (cosine 1.0, diff 0.0).
+    /// Measured -9.8ms / decode step on Qwen2.5-14B-1M-4bit @ 32K
+    /// (F-59 = 62.4ms → F-73 = 52.6ms). Set to `false` to fall back to
+    /// F-59's multi-op MLX path for replay / debugging.
+    public var useFusedMaskBuild: Bool = true
 
     /// F-73 diagnostic: bypass the entire RetrievalAttention selector
     /// pipeline at decode steps and route to plain dense SDPA over the
