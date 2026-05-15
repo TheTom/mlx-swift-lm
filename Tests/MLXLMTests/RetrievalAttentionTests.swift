@@ -4148,9 +4148,16 @@ struct RetrievalAttentionTests {
                 try? h.close()
             }
         }
-        let prefillLen = 256 * 1024
+        // Bench supports a tunable prefill length via env var so we can
+        // walk up the curve (128K → 192K → 256K) and isolate any
+        // process-death cliff. Three earlier 256K runs died silently
+        // at chunk 144 (147K) — likely an MLX memory or watchdog limit.
+        let envLen = ProcessInfo.processInfo.environment["F83_PREFILL_LEN"]
+        let prefillLen = (envLen.flatMap(Int.init) ?? (256 * 1024))
         let chunkSize = 1024
         let nDecode = 8
+        // Raise MLX's memory limit defensively (default is ~50% of memsize).
+        _ = MLX.GPU.set(memoryLimit: 56 * 1024 * 1024 * 1024)  // 56 GB
         MLXRandom.seed(0xF8302560)
         let prefillTokens = MLXRandom.randInt(
             low: MLXArray(Int32(0)),
