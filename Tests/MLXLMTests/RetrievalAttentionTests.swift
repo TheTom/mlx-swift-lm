@@ -3653,23 +3653,31 @@ struct RetrievalAttentionTests {
             [1, 1]
         ).asType(.int32)
 
-        // Dense reference
+        // Dense reference. Run nSteps + 2 warmup; report median of the
+        // last nSteps so we exclude JIT-compile-dominated first calls.
         let dn = model.newCache(parameters: nil)
         _ = model(prefillTokens, cache: dn)
         eval(dn.flatMap { $0.state })
         var dnNext = startNext
         var dnTokens: [Int32] = []
         var dnLogits: [MLXArray] = []
-        let dnStart = Date()
-        for _ in 0..<nSteps {
+        var dnPerStep: [Double] = []
+        let totalSteps = nSteps + 2  // 2 warmup
+        for _ in 0..<totalSteps {
+            let t0 = Date()
             let logits = model(dnNext, cache: dn)
             eval(logits)
+            dnPerStep.append(Date().timeIntervalSince(t0) * 1000)
             dnLogits.append(logits)
             let tok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
             dnTokens.append(tok.asArray(Int32.self)[0])
             dnNext = tok
         }
-        let denseMs = Date().timeIntervalSince(dnStart) / Double(nSteps) * 1000
+        func median(_ arr: [Double]) -> Double {
+            let s = arr.sorted()
+            return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
+        }
+        let denseMs = median(Array(dnPerStep.suffix(nSteps)))
 
         // RA with shipped defaults
         let ra: [KVCache] = (0..<cfg.hiddenLayers).map { i in
@@ -3679,24 +3687,40 @@ struct RetrievalAttentionTests {
         }
         _ = model(prefillTokens, cache: ra)
         eval(ra.flatMap { $0.state })
+        // Mirror dense: totalSteps = nSteps + 2 (2 warmup); report median
+        // of last nSteps so JIT-compile-dominated first calls don't skew.
         var raNext = startNext
-        var matches = 0
-        var sumCos: Double = 0
-        let raStart = Date()
-        for s in 0..<nSteps {
+        var raLogits: [MLXArray] = []
+        var raTokens: [Int32] = []
+        var raPerStep: [Double] = []
+        for _ in 0..<totalSteps {
+            let t0 = Date()
             let logits = model(raNext, cache: ra)
             eval(logits)
-            let d = dnLogits[s].reshaped(dnLogits[s].size).asType(.float32)
-            let r = logits.reshaped(logits.size).asType(.float32)
+            raPerStep.append(Date().timeIntervalSince(t0) * 1000)
+            raLogits.append(logits)
+            let rTok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+            raTokens.append(rTok.asArray(Int32.self)[0])
+            raNext = rTok
+        }
+        let raMs = median(Array(raPerStep.suffix(nSteps)))
+        print("[F-79-ship-regression-perstep-dense] " + dnPerStep.enumerated().map { "step\($0.0)=\(String(format: "%.1f", $0.1))ms" }.joined(separator: " "))
+        print("[F-79-ship-regression-perstep-ra]    " + raPerStep.enumerated().map { "step\($0.0)=\(String(format: "%.1f", $0.1))ms" }.joined(separator: " "))
+
+        // Quality math AFTER timed region — compare steady-state suffix
+        // so warmup steps don't contaminate the cosine/argmax counts.
+        var matches = 0
+        var sumCos: Double = 0
+        let warmup = totalSteps - nSteps
+        for s in 0..<nSteps {
+            let d = dnLogits[warmup + s].reshaped(dnLogits[warmup + s].size).asType(.float32)
+            let r = raLogits[warmup + s].reshaped(raLogits[warmup + s].size).asType(.float32)
             let dot = (d * r).sum().asArray(Float.self)[0]
             let dn_ = sqrt((d * d).sum()).asArray(Float.self)[0]
             let rn_ = sqrt((r * r).sum()).asArray(Float.self)[0]
             sumCos += Double(dot / (dn_ * rn_ + 1e-12))
-            let rTok = logits[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
-            if rTok.asArray(Int32.self)[0] == dnTokens[s] { matches += 1 }
-            raNext = rTok
+            if raTokens[warmup + s] == dnTokens[warmup + s] { matches += 1 }
         }
-        let raMs = Date().timeIntervalSince(raStart) / Double(nSteps) * 1000
         let meanCos = sumCos / Double(nSteps)
         let gapMs = raMs - denseMs
 
@@ -3704,7 +3728,7 @@ struct RetrievalAttentionTests {
             + "mean_cosine=\(String(format: "%.5f", meanCos)) "
             + "dense=\(String(format: "%.1f", denseMs))ms "
             + "ra=\(String(format: "%.1f", raMs))ms "
-            + "gap=+\(String(format: "%.1f", gapMs))ms")
+            + "gap=\(String(format: "%+.1f", gapMs))ms")
 
         // Hard-fail bounds. Pad above the actual measured numbers so
         // run-to-run variance doesn't flap CI, but tight enough to
@@ -4306,10 +4330,51 @@ struct RetrievalAttentionTests {
         }
         eval(forceTokens)
 
+        // Chunked prefill with progress logging written DIRECTLY to a
+        // side file (swift-testing buffers stdout until test completes,
+        // so print() is invisible during long runs). Tail this file:
+        //   tail -f /tmp/f79-256K-progress.log
+        let progressPath = "/tmp/f79-256K-progress.log"
+        // Truncate at test start.
+        try? Data().write(to: URL(fileURLWithPath: progressPath))
+        func logProgress(_ msg: String) {
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: progressPath)) {
+                try? handle.seekToEnd()
+                handle.write((msg + "\n").data(using: .utf8)!)
+                try? handle.close()
+            }
+        }
+        let prefillStepSize = 1024
+        func chunkedPrefill(cache: [KVCache], tag: String) {
+            let totalChunks = (prefillLen + prefillStepSize - 1) / prefillStepSize
+            var y = prefillTokens  // [1, prefillLen]
+            var chunkIdx = 0
+            let t0 = Date()
+            while y.dim(1) > 1 {
+                let sz = min(prefillStepSize, y.dim(1) - 1)
+                _ = model(y[0..., ..<sz], cache: cache)
+                var arrays: [MLXArray] = []
+                for c in cache { arrays.append(contentsOf: c.innerState()) }
+                asyncEval(arrays)
+                y = y[0..., sz...]
+                chunkIdx += 1
+                if chunkIdx % 16 == 0 || chunkIdx == totalChunks {
+                    let elapsed = Date().timeIntervalSince(t0)
+                    let rate = Double(chunkIdx) / elapsed
+                    let eta = rate > 0 ? Double(totalChunks - chunkIdx) / rate : 0
+                    logProgress("[F-79-256K] \(tag) chunk=\(chunkIdx)/\(totalChunks) "
+                        + "elapsed=\(String(format: "%.1f", elapsed))s "
+                        + "eta=\(String(format: "%.1f", eta))s")
+                }
+            }
+            eval(cache.flatMap { $0.state })
+            MLX.Memory.clearCache()
+            logProgress("[F-79-256K] \(tag) prefill done")
+        }
+
         func runDense() -> (logits: [MLXArray], ms: [Double]) {
             let cache = model.newCache(parameters: nil)
-            _ = model(prefillTokens, cache: cache)
-            eval(cache.flatMap { $0.state })
+            chunkedPrefill(cache: cache, tag: "dense")
             var logits: [MLXArray] = []
             var ms: [Double] = []
             for s in 0..<nSteps {
@@ -4329,8 +4394,7 @@ struct RetrievalAttentionTests {
                     raConfig: raConfig, ropeBase: cfg.ropeTheta
                 )
             }
-            _ = model(prefillTokens, cache: caches)
-            eval(caches.flatMap { $0.state })
+            chunkedPrefill(cache: caches, tag: "ra")
             var logits: [MLXArray] = []
             var ms: [Double] = []
             for s in 0..<nSteps {
