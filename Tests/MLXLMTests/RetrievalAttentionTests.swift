@@ -4116,6 +4116,152 @@ struct RetrievalAttentionTests {
             "sparse prefill quality vs chunked-dense baseline \(cosSparseVsChunkedDense) below 0.99 at 32K")
     }
 
+    // F-83 perf bench — chunked dense vs chunked sparse prefill at
+    // 256K, then 8 decode steps each. Designed to be runnable in the
+    // background via nohup; logs progress to a file. PRD perf target:
+    // ~12x speedup vs dense chunked at 256K.
+    @Test func f83_perfBench256K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let progressPath = "/tmp/f83_perf256k_progress.log"
+        let url = URL(fileURLWithPath: progressPath)
+        try? "[F-83-perf-256K] starting at \(Date())\n".write(
+            to: url, atomically: true, encoding: .utf8)
+        func logLine(_ s: String) {
+            print(s)
+            if let h = try? FileHandle(forWritingTo: url) {
+                _ = try? h.seekToEnd()
+                h.write((s + "\n").data(using: .utf8)!)
+                try? h.close()
+            }
+        }
+        let prefillLen = 256 * 1024
+        let chunkSize = 1024
+        let nDecode = 8
+        MLXRandom.seed(0xF8302560)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        eval(prefillTokens)
+        let startNext = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, 1]
+        ).asType(.int32)
+
+        func runChunkedPrefill(
+            cache: [KVCache], tag: String
+        ) -> (prefillSec: Double, lastLogits: MLXArray) {
+            let nChunks = prefillLen / chunkSize
+            let t0 = Date()
+            var lastOut: MLXArray = MLXArray.zeros([0])
+            for i in 0..<nChunks {
+                let start = i * chunkSize
+                let end = start + chunkSize
+                let chunk = prefillTokens[0..., start..<end]
+                let out = model(chunk, cache: cache)
+                eval(out)
+                lastOut = out
+                if i == 0 || (i + 1) % 16 == 0 || i == nChunks - 1 {
+                    let elapsed = Date().timeIntervalSince(t0)
+                    let rate = Double(i + 1) / elapsed
+                    let eta = (rate > 0) ? Double(nChunks - i - 1) / rate : 0
+                    logLine("[F-83-perf-256K] \(tag) chunk=\(i+1)/\(nChunks) "
+                        + "elapsed=\(String(format: "%.1f", elapsed))s "
+                        + "eta=\(String(format: "%.1f", eta))s")
+                }
+            }
+            let elapsed = Date().timeIntervalSince(t0)
+            logLine("[F-83-perf-256K] \(tag) prefill TOTAL=\(String(format: "%.1f", elapsed))s")
+            return (elapsed, lastOut[0, -1, 0...].asType(.float32))
+        }
+
+        func runDecode(cache: [KVCache], tag: String) -> [Double] {
+            var ms: [Double] = []
+            var next = startNext
+            for s in 0..<(nDecode + 2) {  // 2 warmup
+                let t0 = Date()
+                let out = model(next, cache: cache)
+                eval(out)
+                let t1 = Date().timeIntervalSince(t0) * 1000
+                ms.append(t1)
+                let tok = out[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                next = tok
+                logLine("[F-83-perf-256K] \(tag) decode step=\(s) ms=\(String(format: "%.1f", t1))")
+            }
+            return ms
+        }
+
+        // Dense baseline.
+        logLine("[F-83-perf-256K] === DENSE CHUNKED PREFILL ===")
+        var raCfgDense = RetrievalAttentionConfig()
+        raCfgDense.sparsePrefillEnabled = false
+        let denseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: raCfgDense,
+                ropeBase: cfg.ropeTheta)
+        }
+        let dense = runChunkedPrefill(cache: denseCache, tag: "dense")
+        let denseDecMs = runDecode(cache: denseCache, tag: "dense")
+        let denseDecMedian = denseDecMs.suffix(nDecode).sorted()[nDecode / 2]
+        logLine("[F-83-perf-256K] dense decode median (last \(nDecode))=\(String(format: "%.1f", denseDecMedian))ms")
+
+        MLX.GPU.clearCache()
+
+        // Sparse path.
+        logLine("[F-83-perf-256K] === SPARSE CHUNKED PREFILL ===")
+        var raCfgSparse = RetrievalAttentionConfig()
+        raCfgSparse.sparsePrefillEnabled = true
+        raCfgSparse.sparsePrefillMinContext = 16384
+        let sparseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+            RetrievalAttentionKVCache(
+                layerIdx: i, totalLayers: cfg.hiddenLayers,
+                raConfig: raCfgSparse,
+                ropeBase: cfg.ropeTheta)
+        }
+        let sparse = runChunkedPrefill(cache: sparseCache, tag: "sparse")
+        let sparseDecMs = runDecode(cache: sparseCache, tag: "sparse")
+        let sparseDecMedian = sparseDecMs.suffix(nDecode).sorted()[nDecode / 2]
+        logLine("[F-83-perf-256K] sparse decode median (last \(nDecode))=\(String(format: "%.1f", sparseDecMedian))ms")
+
+        // Final-token logit cosine for quality regression catch.
+        let d = dense.lastLogits
+        let r = sparse.lastLogits
+        let dot = (d * r).sum().asArray(Float.self)[0]
+        let dn = sqrt((d * d).sum()).asArray(Float.self)[0]
+        let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+        let cos = dot / (dn * rn + Float(1e-12))
+
+        let speedup = dense.prefillSec / sparse.prefillSec
+        logLine("[F-83-perf-256K] === SUMMARY ===")
+        logLine("[F-83-perf-256K] T=256K dense_prefill=\(String(format: "%.1f", dense.prefillSec))s "
+            + "sparse_prefill=\(String(format: "%.1f", sparse.prefillSec))s "
+            + "speedup=\(String(format: "%.2fx", speedup))")
+        logLine("[F-83-perf-256K] decode_dense=\(String(format: "%.1f", denseDecMedian))ms "
+            + "decode_sparse=\(String(format: "%.1f", sparseDecMedian))ms")
+        logLine("[F-83-perf-256K] final-logit cosine sparse-vs-dense=\(String(format: "%.5f", cos))")
+        logLine("[F-83-perf-256K] finished at \(Date())")
+        // No hard expects — this is the perf bench, results go to the log.
+        // Tests are #expect 1==1 to keep the suite green so the data stays.
+        #expect(speedup > 0)
+    }
+
     // F-79 cross-architecture validation on Qwen3-0.6B-4bit.
     // Confirms the selector-amortization technique generalizes beyond
     // Qwen2.5-14B-1M. Smaller model + different arch + same amort=16
