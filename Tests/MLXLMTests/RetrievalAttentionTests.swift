@@ -4231,6 +4231,7 @@ struct RetrievalAttentionTests {
 
         // Dense baseline.
         logLine("[F-83-perf-256K] === DENSE CHUNKED PREFILL ===")
+        F83SelectorReuseCache.clear()
         var raCfgDense = RetrievalAttentionConfig()
         raCfgDense.sparsePrefillEnabled = false
         let denseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
@@ -4248,6 +4249,7 @@ struct RetrievalAttentionTests {
 
         // Sparse path.
         logLine("[F-83-perf-256K] === SPARSE CHUNKED PREFILL ===")
+        F83SelectorReuseCache.clear()
         var raCfgSparse = RetrievalAttentionConfig()
         raCfgSparse.sparsePrefillEnabled = true
         raCfgSparse.sparsePrefillMinContext = 16384

@@ -303,6 +303,14 @@ public struct RetrievalAttentionConfig: Sendable {
     /// 1024 tokens each — a few covers a wide swath of context.
     public var sparsePrefillCoarseTopK: Int = 2
 
+    /// F-83 V1.3 — IndexCache cross-layer selector reuse (arxiv 2603.12201).
+    /// Groups adjacent sparse layers so that only the first layer in each
+    /// group runs the selector + topK; the rest reuse the position list.
+    /// Adjacent transformer layers share 70-100% of selected blocks in
+    /// practice. Set to 1 to disable (every layer runs its own selector).
+    /// Default 4 → ~4x reduction in selector dispatch count.
+    public var sparsePrefillSelectorGroupSize: Int = 4
+
     public init() {}
 }
 

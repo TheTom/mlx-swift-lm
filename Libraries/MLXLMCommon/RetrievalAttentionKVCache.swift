@@ -27,6 +27,68 @@
 import Foundation
 import MLX
 
+/// F-83 V1.3 — cross-layer selector reuse (IndexCache pattern,
+/// arxiv 2603.12201). Within a single prefill chunk, the first
+/// sparse layer in each `sparsePrefillGroupSize`-sized group runs
+/// the selector and stores its gather-position list here; the rest
+/// of the group reads it instead of re-running the selector. The
+/// paper reports adjacent transformer layers share 70-100% of
+/// selected blocks, so this is mostly free quality-wise while
+/// reducing selector dispatch count by `groupSize`x.
+///
+/// Cache is keyed by `(priorLen, layerGroup)` and is automatically
+/// invalidated when `priorLen` changes (i.e. the next chunk starts).
+/// Safe for single-stream inference (B=1); the lock protects against
+/// future multi-stream eval.
+public final class F83SelectorReuseCache: @unchecked Sendable {
+    public static let shared = F83SelectorReuseCache()
+    private let lock = NSLock()
+    private var lastPriorLen: Int = -1
+    private var positionsByGroup: [Int: MLXArray] = [:]
+    private init() {}
+
+    public static func cachedPositions(
+        group: Int, priorLen: Int
+    ) -> MLXArray? {
+        return shared.cachedPositions(group: group, priorLen: priorLen)
+    }
+
+    public static func cachePositions(
+        group: Int, priorLen: Int, positions: MLXArray
+    ) {
+        shared.cachePositions(group: group, priorLen: priorLen, positions: positions)
+    }
+
+    public static func clear() {
+        shared.clear()
+    }
+
+    private func cachedPositions(group: Int, priorLen: Int) -> MLXArray? {
+        lock.lock(); defer { lock.unlock() }
+        if priorLen != lastPriorLen {
+            positionsByGroup.removeAll(keepingCapacity: true)
+            lastPriorLen = priorLen
+            return nil
+        }
+        return positionsByGroup[group]
+    }
+
+    private func cachePositions(group: Int, priorLen: Int, positions: MLXArray) {
+        lock.lock(); defer { lock.unlock() }
+        if priorLen != lastPriorLen {
+            positionsByGroup.removeAll(keepingCapacity: true)
+            lastPriorLen = priorLen
+        }
+        positionsByGroup[group] = positions
+    }
+
+    private func clear() {
+        lock.lock(); defer { lock.unlock() }
+        positionsByGroup.removeAll()
+        lastPriorLen = -1
+    }
+}
+
 /// KV cache that backs `RetrievalAttention` block-sparse decode.
 public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConvertible {
 
@@ -869,65 +931,80 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
             )
         }
 
-        let groupSize = nH / nKVH
-        if cachedHeadIdx == nil {
-            cachedHeadIdx = MLXArray((0..<nKVH).map { Int32($0 * groupSize) })
-            eval(cachedHeadIdx!)
-        }
-        // queries[0] → [nH, L, D]; take strided reps per KV group → [nKVH, L, D]
-        let qStacked = queries[0].take(cachedHeadIdx!, axis: 0).asType(.float32)
-        let qProj = index.projectQueriesBatchedL(qStacked)
-        // F-83 V1.1 — GPU-only top-K: cross-head union (one block list,
-        // not per-head) WITH static/sliding exclusion via score-mask, so
-        // the resulting block starts can never overlap the static or
-        // sliding regions. With fine blocks disjoint from each other
-        // (argpart returns unique block indices), no duplicates can arise
-        // anywhere in the gather position list — the CPU sync the V1
-        // path needed for `Set`-dedupe is gone.
         let cfg = raConfig
         let fineBS = cfg.fineBlockSize
         let staticEnd = Swift.min(cfg.staticInit, priorLen)
         let slidingStart = Swift.max(0, priorLen - cfg.slidingWindow)
-        let prefillFineTopK = cfg.sparsePrefillFineTopK > 0
-            ? cfg.sparsePrefillFineTopK
-            : cfg.effectiveFineTopK(seqLen: index.seqLen)
-        let fineStartsClean = index.crossHeadUnionTopKExcludingRangesGPU(
-            projectedQ: qProj,
-            k: prefillFineTopK,
-            blockSize: fineBS,
-            staticEnd: staticEnd,
-            slidingStart: slidingStart
-        )
+        let groupQHeadKV = nH / nKVH
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray((0..<nKVH).map { Int32($0 * groupQHeadKV) })
+            eval(cachedHeadIdx!)
+        }
 
-        // Build positions list — static + sliding + fine, no duplicates
-        // by construction. CRITICAL: when sliding overlaps static
-        // (slidingStart <= staticEnd, i.e. priorLen is short enough that
-        // the sliding window reaches back to within the static prefix),
-        // we drop static entirely — sliding already covers it. Otherwise
-        // we'd duplicate positions 0..slidingStart-1 in the gather list.
-        let includeStatic = staticEnd > 0 && slidingStart >= staticEnd
-        let staticPositions: MLXArray = includeStatic
-            ? MLXArray(Int32(0) ..< Int32(staticEnd))
-            : MLXArray.zeros([0], dtype: .int32)
-        let slidingPositions: MLXArray = slidingStart < priorLen
-            ? MLXArray(Int32(slidingStart) ..< Int32(priorLen))
-            : MLXArray.zeros([0], dtype: .int32)
-        let kFine = fineStartsClean.dim(0)
+        // F-83 V1.3 — IndexCache (arxiv 2603.12201): first sparse layer
+        // in each `sparsePrefillSelectorGroupSize` group computes the
+        // selector + position list once; remaining layers in the group
+        // reuse the cached positions. Adjacent transformer layers share
+        // 70-100% of selected blocks in practice, so this is mostly
+        // free quality-wise while reducing selector dispatch count by
+        // `groupSize`x (default 4 → from ~40 sparse layers per chunk
+        // down to ~10 selector runs per chunk).
+        let groupSize = Swift.max(1, cfg.sparsePrefillSelectorGroupSize)
+        let layerGroup = layerIdx / groupSize
         let positions: MLXArray
-        if kFine > 0 {
-            // [kFine, fineBS] = fineStartsClean[:, None] + 0..fineBS
-            let fineOffsets = MLXArray(0..<Int32(fineBS)).reshaped(1, fineBS)
-            let finePos = (fineStartsClean.reshaped(kFine, 1) + fineOffsets)
-                .reshaped(kFine * fineBS)
-            // Order: static (low) → fine (mid) → sliding (high). All
-            // strictly ascending and disjoint, so the combined list is
-            // already sorted. Clip is a defensive no-op.
-            let combined = concatenated(
-                [staticPositions, finePos, slidingPositions], axis: 0)
-            positions = clip(combined, min: Int32(0), max: Int32(priorLen - 1))
+        if let cached = F83SelectorReuseCache.cachedPositions(
+            group: layerGroup, priorLen: priorLen) {
+            positions = cached
         } else {
-            positions = concatenated(
-                [staticPositions, slidingPositions], axis: 0)
+            // queries[0] → [nH, L, D]; take strided reps per KV group → [nKVH, L, D]
+            let qStacked = queries[0].take(cachedHeadIdx!, axis: 0).asType(.float32)
+            let qProj = index.projectQueriesBatchedL(qStacked)
+            let prefillFineTopK = cfg.sparsePrefillFineTopK > 0
+                ? cfg.sparsePrefillFineTopK
+                : cfg.effectiveFineTopK(seqLen: index.seqLen)
+            let fineStartsClean = index.crossHeadUnionTopKExcludingRangesGPU(
+                projectedQ: qProj,
+                k: prefillFineTopK,
+                blockSize: fineBS,
+                staticEnd: staticEnd,
+                slidingStart: slidingStart
+            )
+
+            // Build positions list — static + sliding + fine, no duplicates
+            // by construction. CRITICAL: when sliding overlaps static
+            // (slidingStart <= staticEnd, i.e. priorLen is short enough
+            // that the sliding window reaches back to within the static
+            // prefix), we drop static entirely — sliding already covers
+            // it. Otherwise we'd duplicate positions 0..slidingStart-1.
+            let includeStatic = staticEnd > 0 && slidingStart >= staticEnd
+            let staticPositions: MLXArray = includeStatic
+                ? MLXArray(Int32(0) ..< Int32(staticEnd))
+                : MLXArray.zeros([0], dtype: .int32)
+            let slidingPositions: MLXArray = slidingStart < priorLen
+                ? MLXArray(Int32(slidingStart) ..< Int32(priorLen))
+                : MLXArray.zeros([0], dtype: .int32)
+            let kFine = fineStartsClean.dim(0)
+            let computedPositions: MLXArray
+            if kFine > 0 {
+                let fineOffsets = MLXArray(0..<Int32(fineBS)).reshaped(1, fineBS)
+                let finePos = (fineStartsClean.reshaped(kFine, 1) + fineOffsets)
+                    .reshaped(kFine * fineBS)
+                let combined = concatenated(
+                    [staticPositions, finePos, slidingPositions], axis: 0)
+                computedPositions = clip(
+                    combined, min: Int32(0), max: Int32(priorLen - 1))
+            } else {
+                computedPositions = concatenated(
+                    [staticPositions, slidingPositions], axis: 0)
+            }
+            // Force materialization before caching — if positions stays
+            // lazy, downstream reuse re-runs the selector graph for each
+            // group member, defeating the whole point.
+            eval(computedPositions)
+            F83SelectorReuseCache.cachePositions(
+                group: layerGroup, priorLen: priorLen,
+                positions: computedPositions)
+            positions = computedPositions
         }
 
         // Gather prior K/V at `positions`. Keep within-chunk K/V at the tail.
