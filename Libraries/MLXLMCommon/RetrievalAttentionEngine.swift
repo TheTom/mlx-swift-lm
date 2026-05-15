@@ -64,7 +64,7 @@ public func retrievalAttentionStep(
         if ctx.raConfig.usePerKVHeadGather {
             return ctx.perKVHeadGatherAndAttend(
                 queries: queries, keys: cachedKeys, values: cachedValues,
-                qHeads: qFlat, scale: scale)
+                qHeads: qFlat, scale: scale, offset: cache.offset)
         }
         if ctx.raConfig.useFusedMaskBuild {
             let raMask = ctx.buildAttentionMaskFusedKernel(

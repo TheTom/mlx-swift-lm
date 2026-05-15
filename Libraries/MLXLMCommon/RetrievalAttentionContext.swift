@@ -179,7 +179,8 @@ public final class RetrievalAttentionContext {
         keys: MLXArray,
         values: MLXArray,
         qHeads: MLXArray,
-        scale: Float
+        scale: Float,
+        offset: Int
     ) -> MLXArray {
         precondition(qHeads.shape.count == 2, "expected [nHeads, dHead]")
         precondition(keys.shape.count == 4, "expected [B, nKVH, T, D]")
@@ -196,11 +197,71 @@ public final class RetrievalAttentionContext {
             cachedHeadIdx = MLXArray((0..<nKVH).map { Int32($0 * groupSize) })
             eval(cachedHeadIdx!)
         }
-        let qStacked = qHeads.take(cachedHeadIdx!, axis: 0).asType(.float32)
-        let projQ = index.projectQueriesBatched(qStacked)
 
-        let (gather, kPadded) = index.perKVHeadGatherGPU(
-            projectedQ: projQ, seqLen: T)
+        // F-79 selector amortization on the gather path. The heavy work
+        // is `projectQ + topKBlockStarts` (~6-8 ms/step at 128K). Cache
+        // these across `selectorAmortization` consecutive decode steps;
+        // rebuild the gather array each step using cached starts +
+        // current static/sliding range.
+        let amort = max(1, raConfig.selectorAmortization)
+        let needRefresh = (cachedFineStarts == nil)
+            || (offset - lastRefreshOffset) >= amort
+        let fineStarts: MLXArray
+        let coarseStarts: MLXArray
+        if needRefresh {
+            let qStacked = qHeads.take(cachedHeadIdx!, axis: 0).asType(.float32)
+            let projQ = index.projectQueriesBatched(qStacked)
+            let (f, c) = index.topKBlockStartsAllHeadsCombinedGPU(projectedQ: projQ)
+            cachedFineStarts = f
+            cachedCoarseStarts = c
+            lastRefreshOffset = offset
+            fineStarts = f
+            coarseStarts = c
+        } else {
+            fineStarts = cachedFineStarts!
+            coarseStarts = cachedCoarseStarts!
+        }
+
+        // Build gather array using cached top-K + current static/sliding
+        // ranges. Static + sliding shift every step (sliding window
+        // slides forward), so they rebuild each call — cheap (just
+        // ranges + broadcast).
+        let staticInit = raConfig.staticInit
+        let slidingWindow = raConfig.slidingWindow
+        let fineBS = raConfig.fineBlockSize
+        let coarseBS = raConfig.coarseBlockSize
+        let staticEnd = min(staticInit, T)
+        let slidingStart = max(0, T - slidingWindow)
+        let staticCount = staticEnd
+        let slidingCount = max(0, T - slidingStart)
+        let kFineEff = fineStarts.dim(1)
+        let kCoarseEff = coarseStarts.dim(1)
+
+        let staticPositions = staticCount > 0
+            ? MLXArray(Int32(0)..<Int32(staticEnd))
+            : MLXArray.zeros([0], dtype: .int32)
+        let slidingPositions = slidingCount > 0
+            ? MLXArray(Int32(slidingStart)..<Int32(T))
+            : MLXArray.zeros([0], dtype: .int32)
+        let staticPlus = concatenated([staticPositions, slidingPositions], axis: 0)
+            .reshaped(1, staticCount + slidingCount)
+        let staticBroadcast = broadcast(staticPlus, to: [nKVH, staticCount + slidingCount])
+
+        var pieces: [MLXArray] = [staticBroadcast]
+        if kFineEff > 0 {
+            let offs = MLXArray(0..<Int32(fineBS)).reshaped(1, 1, fineBS)
+            let expanded = fineStarts.expandedDimensions(axis: 2) + offs
+            pieces.append(expanded.reshaped(nKVH, kFineEff * fineBS))
+        }
+        if kCoarseEff > 0 {
+            let offs = MLXArray(0..<Int32(coarseBS)).reshaped(1, 1, coarseBS)
+            let expanded = coarseStarts.expandedDimensions(axis: 2) + offs
+            pieces.append(expanded.reshaped(nKVH, kCoarseEff * coarseBS))
+        }
+        let unsorted = concatenated(pieces, axis: 1)
+        let clipped = clip(unsorted, min: Int32(0), max: Int32(T - 1))
+        let gather = sorted(clipped, axis: 1)
+        let kPadded = staticCount + slidingCount + kFineEff * fineBS + kCoarseEff * coarseBS
 
         let gatherForTake = gather.expandedDimensions(axes: [0, 3])
         let gatheredK = takeAlong(keys, gatherForTake, axis: 2)
