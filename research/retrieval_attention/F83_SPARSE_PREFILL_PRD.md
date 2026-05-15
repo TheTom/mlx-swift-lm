@@ -1,9 +1,198 @@
 # F-83 PRD — Sparse Prefill (Chunked-Sparse Attention)
 
-**Status**: Design / not started.
+**Status**: Design / not started. Research-strengthened 2026-05-14.
 **Owner**: feature/retrieval-attention (local-only).
 **Created**: 2026-05-14.
 **Parents**: F-79 (decode-side block-sparse, shipped), F-80 (MLX cliff fix), F-81 (RA × TQ compose scaffold).
+**Reference impl**: NSA fla-org Triton — https://github.com/fla-org/native-sparse-attention (MIT). Port selector + dispatcher 1:1 to Swift; reimplement kernel via mlx-swift primitives.
+
+## Research-derived revisions (read these BEFORE the original design)
+
+Two research passes (prior-art + Apple Silicon kernel deep-dive) on
+2026-05-14 produced these critical revisions to the original design:
+
+### REVISION 1 — Mask-not-gather DOES NOT save FLOPs on NAX/steel
+The original PRD assumed `[B, H, L, T]` -inf mask passed to existing
+SDPA would give us sparse compute for free (extrapolating from
+sdpa_vector's L=1 short-circuit at `sdpa_vector.h:105-107`). This is
+WRONG for L>1. Steel attention (`kernels/steel/attn/`) and NAX path
+(`steel_attention_nax.h:309-350`) **always run the full Q·Kᵀ matmul**
+then apply mask post-matmul before softmax. A -inf mask kills the
+softmax contribution but the matmul work is already paid.
+
+**Implication**: to actually save compute we must (a) reduce kL via
+real gather, OR (b) write a custom sparse kernel that walks a block
+bitmap and only loads selected blocks of K/V.
+
+### REVISION 2 — NAX is worth ~2-3x vs non-NAX steel; custom kernel ~30-50% slower than NAX per FLOP
+- NAX (M5+): `bq=64, bk=32`, native MMA path
+- Non-NAX steel: `bq=32, bk=16` at D=128, native simdgroup MMA
+- Custom Metal kernel via `simdgroup_matrix`: ~30-50% slower per FLOP
+
+Net effect at 96% sparsity (K_padded=8K out of T=256K):
+- Raw work savings: ~24x
+- Custom-kernel penalty vs NAX: ~1.5x
+- **Net wall-clock speedup ≈ 16x → ~5 min at 256K (was 5000s = 83 min)**
+
+Original PRD claimed ~20x → 250s. Realistic is 16x → ~5 min after
+the kernel work. **Revised target table below.**
+
+### REVISION 3 — Hyperparameter starting point from NSA / MoBA
+- Selection block size: **64**
+- Top-n selection: **16** (per query)
+- Compression block size: **32** stride **16** (for the "coarse" branch)
+- Sliding window: **512-2048** (default 2048 matching F-79)
+- Static prefix: **128** (matching F-79)
+- → K_padded per query ≈ 16·64 + 2048 + 128 = **~3200 positions**
+- Out of 256K = **~99% reduction in K positions attended**
+
+### REVISION 4 — Single sparse SDPA call, not split/merge
+Original PRD had within-chunk dense + prior-chunks sparse + online
+merge. NSA/SeerAttention/MInference all use **monolithic** block-sparse
+including current chunk. Within-chunk is just N+1 more blocks in the
+selection that happen to be local. Saves the merge cost.
+
+**However**: the split is still preferred for **correctness simplicity**
+— within-chunk causal is exact, no quality risk from "selector missed
+the local context." F-79's decode path is the L=1 case of "within-chunk"
+== "the new token." Keep the split for V1, revisit in V2 once we have
+data on the union-monolithic alternative.
+
+### REVISION 5 — Per-chunk union top-K per KV head, NOT per-query
+- Per-query top-K: L parallel argpartitions = L=1024× selector cost
+- Union top-K per chunk per KV head: 1 argpartition per chunk per KV head
+- NSA's GQA-group pattern is exactly this: queries within a chunk in
+  the same KV head all select the same blocks.
+- Trade-off: queries late in chunk vs early in chunk may want
+  different blocks. F-79's amort=16 already showed adjacent decode
+  steps share top-K with 0 quality loss; chunk neighbors should too.
+- Quality lever: bump from union to per-query in V2 if needed.
+
+### REVISION 6 — Online softmax merge — exact formula
+Lift from `mlx-swift/Source/Cmlx/mlx-generated/metal/sdpa_vector.h:320-394`
+(the `sdpa_vector_2pass_2` kernel). Pseudo-code:
+
+```c
+// Inputs: (O_a, m_a, l_a), (O_b, m_b, l_b) per row
+// Output: (O, m, l)
+// All accumulators fp32; O can be fp16 at output cast.
+if (m_a == -inf) { return (O_b, m_b, l_b); }
+if (m_b == -inf) { return (O_a, m_a, l_a); }
+float m = max(m_a, m_b);
+float factor_a = exp(m_a - m);
+float factor_b = exp(m_b - m);
+float l = factor_a * l_a + factor_b * l_b;
+if (l == 0.0f) { return (zeros, -inf, 0); }  // both empty
+float O[D];
+for (int i = 0; i < D; ++i) {
+  O[i] = (factor_a * l_a * O_a[i] + factor_b * l_b * O_b[i]) / l;
+}
+return (O, m, l);
+```
+
+Already battle-tested inside mlx — copy-paste ~30 lines.
+
+### REVISION 7 — Block bitmap, NOT materialized [L, T] mask
+F-73 builds a `[1, 1, 1, T]` mask. Naive extension to `[1, 1, L, T]`
+at L=1024, T=256K = 1 GB fp16. Build time scales L× per chunk ≈ 1s
+per chunk per layer = unworkable.
+
+**Right design** (from F-69 group-sparse SDPA pattern):
+- Build per-query (or per-chunk-union) **block bitmap** of shape
+  `[L, nBlocks]` (or `[1, nBlocks]` for union) where nBlocks = T/64.
+- For union+T=256K: bitmap = 4096 bits = 512 bytes per chunk per
+  layer — trivial.
+- Sparse SDPA kernel walks block_idx ∈ [0, nBlocks), checks bitmap,
+  skips K/V load entirely for unset blocks. F-69 already does this
+  for decode; extend to L>1.
+
+### REVISION 8 — Files to change (concrete list)
+
+| File | Change | Loc |
+|---|---|---|
+| `Libraries/MLXLMCommon/AttentionUtils.swift` | Drop the `L == 1 && canGather` guard. New L>1 branch routing to `prefillSparseSDPA(queries, keys, values, blockBitmap, scale, mask)`. | ~229-320 |
+| `Libraries/MLXLMCommon/RetrievalAttentionKVCache.swift` | New `unionGatherForChunk(chunkQ: MLXArray) -> (positions, K_padded)`. | ~440 |
+| `Libraries/MLXLMCommon/RetrievalAttentionKernels.swift` | New `retrievalAttentionBuildBlockBitmap` (returns `[L, nBlocks]` int8) replacing the materialized mask. | ~1437 |
+| `Libraries/MLXLMCommon/RetrievalAttentionKernels.swift` | New `retrievalAttentionPrefillSparseSDPA` Metal kernel — per-Q-block walk bitmap, online softmax, merge with global stats. Online merge lifted from `sdpa_vector_2pass_2`. | ~1103 |
+| `Libraries/MLXLMCommon/RetrievalAttention.swift` | Add config: `sparsePrefillEnabled`, `sparsePrefillChunkSize` (default 1024), `sparsePrefillMinContext` (default 16K), `sparsePrefillFineTopN` (default 16). | ~155 |
+| `Libraries/MLXLMCommon/Models/Qwen2.swift` (etc) | Thread the chunk's absolute offset into attention so selector knows the chunk's causal range. | ~120 |
+
+### REVISION 9 — Revised target table
+
+| Context | Dense prefill | F-83 target (realistic) | Speedup |
+|---|---|---|---|
+| 32K | 45s | ≤ 15s | ~3x |
+| 64K | 180s | ≤ 30s | ~6x |
+| 128K | 1100s | ≤ 120s | ~9x |
+| 256K | 5000s | ≤ 400s (~7 min) | **~12x** |
+| 512K | OOM today | ≤ 1000s | unblocks |
+| 1M | OOM today | ≤ 2500s | unblocks (matches SubQ) |
+
+The original PRD's "20x → 4 min" was over-optimistic by ~2x. Honest
+target is **12x → 7 min** at 256K. Still a huge product win.
+
+### REVISION 10 — Validation: add RULER
+
+Original PRD said "cosine ≥ 0.99 vs dense." That's necessary but not
+sufficient. Add: **RULER benchmark** at 32K, 64K, 128K. Within 2
+absolute points of dense baseline (MInference's published bar).
+
+- RULER repo: https://github.com/NVIDIA/RULER
+- NIAH script: https://github.com/gkamradt/LLMTest_NeedleInAHaystack
+- Per-layer cosine: each attention layer's output cosine vs dense
+  (so we catch error accumulation early, not just at logit head)
+
+### Highest-risk issues (Agent 2 ranking)
+
+1. **Quality regression on prefill**: decode RA is robust because the
+   model has full prefill context. Sparse prefill = approximate prefix
+   attention, error compounds across 48 layers. Per-layer cosine
+   measurement mandatory before claiming success.
+2. **Selector cost at L>1**: at L=1024 each query needs its own top-K
+   IF per-query path is taken. Union path collapses to 1 argpartition
+   per chunk per KV head — load-bearing optimization.
+3. **NAX vs custom-kernel tradeoff**: custom Metal kernel ~30-50%
+   slower per FLOP. At 99% sparsity still wins big, but quality
+   regressions could force lower sparsity → less win.
+4. **Gather contiguous-copy cost**: `takeAlong` on 256K cache with
+   K_padded=8K is 32 MB copy per layer per chunk × 256 × 48 = 400 GB
+   memory traffic. Consider **gather-fused sparse SDPA kernel**
+   (extension of F-71 group-sparse path) that reads from indices
+   directly without intermediate copy.
+5. **Stream overlap stalls**: F-78 showed M5 command queues serialize
+   when both GPU-bound. Stream overlap optimistic = 10-15% wall-time
+   win, not 2x.
+
+### Things to copy-paste
+
+- Online merge: `sdpa_vector_2pass_2` (`sdpa_vector.h:320-394`) — 30 lines
+- Block-skip walk in sparse SDPA: F-69 pattern in `RetrievalAttentionKernels.swift`
+- F-73 mask kernel: starting point for block bitmap builder
+- F-77 parallel-bundle: starting point for batched-Q selector
+
+### Things that are new work
+
+- Batched-Q top-K selector (L=1024 in parallel, not L=1)
+- L>1 sparse SDPA Metal kernel with bitmap-driven block skip
+- Two-branch online merge in the model attention forward
+- Per-layer cosine instrumentation for quality validation
+
+### NSA porting strategy (lifted from Agent 1)
+
+The fla-org/native-sparse-attention repo's `parallel_nsa` Python wrapper
+is framework-agnostic — port these pieces 1:1 to Swift:
+- Block-indices construction logic
+- GQA aggregation across heads in a group
+- Gate combination (compression + selection + sliding window branches)
+- Sliding-window fusion logic
+
+Reimplement the actual attention kernel via existing mlx-swift steel
+SDPA + the bitmap-driven sparse path described above. **80% of the
+algorithmic risk is knocked out** by following NSA's tested algorithm.
+
+---
+
+# Original PRD (kept for context — see revisions above for current direction)
 
 ## Motivation
 
