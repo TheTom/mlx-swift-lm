@@ -4142,9 +4142,11 @@ struct RetrievalAttentionTests {
             to: url, atomically: true, encoding: .utf8)
         func logLine(_ s: String) {
             print(s)
+            fflush(stdout)
             if let h = try? FileHandle(forWritingTo: url) {
                 _ = try? h.seekToEnd()
                 h.write((s + "\n").data(using: .utf8)!)
+                try? h.synchronize()   // flush to disk immediately
                 try? h.close()
             }
         }
@@ -4162,8 +4164,14 @@ struct RetrievalAttentionTests {
         // contexts.
         let skipDecode = ProcessInfo.processInfo.environment["F83_SKIP_DECODE"] == "1"
         let nDecode = 8
-        // Raise MLX's memory limit defensively (default is ~50% of memsize).
-        _ = MLX.GPU.set(memoryLimit: 56 * 1024 * 1024 * 1024)  // 56 GB
+        // Raise MLX's memory limit and the wired-buffer limit. M5 Max
+        // has 64 GB unified memory; default MLX caps are conservative.
+        _ = MLX.GPU.set(memoryLimit: 62 * 1024 * 1024 * 1024)  // 62 GB
+        let memLimitEnv = ProcessInfo.processInfo.environment["F83_MEM_LIMIT_GB"]
+            .flatMap(Int.init)
+        if let m = memLimitEnv {
+            _ = MLX.GPU.set(memoryLimit: m * 1024 * 1024 * 1024)
+        }
         MLXRandom.seed(0xF8302560)
         let prefillTokens = MLXRandom.randInt(
             low: MLXArray(Int32(0)),
@@ -4218,15 +4226,30 @@ struct RetrievalAttentionTests {
             return (elapsed, lastOut[0, -1, 0...].asType(.float32))
         }
 
+        func memSnapshot(_ label: String) {
+            let activeMB = Double(MLX.GPU.activeMemory) / (1024 * 1024)
+            let peakMB = Double(MLX.GPU.peakMemory) / (1024 * 1024)
+            let cacheMB = Double(MLX.GPU.cacheMemory) / (1024 * 1024)
+            logLine("[F-83-perf-256K] MEM[\(label)] "
+                + "active=\(String(format: "%.0f", activeMB))MB "
+                + "peak=\(String(format: "%.0f", peakMB))MB "
+                + "cache=\(String(format: "%.0f", cacheMB))MB")
+        }
+
         func runDecode(cache: [KVCache], tag: String) -> [Double] {
+            memSnapshot("\(tag)-decode-pre-start")
             var ms: [Double] = []
             var next = startNext
             for s in 0..<(nDecode + 2) {  // 2 warmup
+                logLine("[F-83-perf-256K] \(tag) decode step=\(s) STARTING (mem before model call)")
+                memSnapshot("\(tag)-decode-step\(s)-pre")
                 let t0 = Date()
                 let out = model(next, cache: cache)
+                logLine("[F-83-perf-256K] \(tag) decode step=\(s) model returned, about to eval")
                 eval(out)
                 let t1 = Date().timeIntervalSince(t0) * 1000
                 ms.append(t1)
+                memSnapshot("\(tag)-decode-step\(s)-post-eval")
                 let tok = out[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
                 next = tok
                 logLine("[F-83-perf-256K] \(tag) decode step=\(s) ms=\(String(format: "%.1f", t1))")
@@ -4307,16 +4330,22 @@ struct RetrievalAttentionTests {
                     step: stepOverride)
             }
             sparse = runChunkedPrefill(cache: sparseCache, tag: "sparse")
+            memSnapshot("sparse-after-prefill")
             if skipDecode {
                 logLine("[F-83-perf-256K] sparse decode SKIPPED (F83_SKIP_DECODE=1)")
             } else {
-                // F-83 256K-decode survival — drop the metal allocator's
-                // cached buffers from prefill before decode tries to
-                // allocate its working set. At 256K the K/V cache alone
-                // is ~51 GB and the first decode step's lazy materialization
-                // has been OOM'ing without this clear.
+                // F-83 256K-decode survival sequence:
+                //   1. eval the cache state so nothing is lazily held
+                //   2. clearCache to drop metal allocator's prefill buffers
+                //   3. force GC pause? (not available — rely on Swift ARC)
+                //   4. snapshot memory before decode starts
+                eval(sparseCache.flatMap { $0.state })
                 MLX.GPU.clearCache()
-                logLine("[F-83-perf-256K] cleared metal cache before sparse decode")
+                // F-83 bump cache limit to 0 so allocator releases buffers
+                // aggressively instead of pooling them. At 256K every MB
+                // of pool is a MB we can't use for decode intermediates.
+                _ = MLX.GPU.set(cacheLimit: 0)
+                memSnapshot("sparse-after-clearCache")
                 let sparseDecMs = runDecode(cache: sparseCache, tag: "sparse")
                 sparseDecMedian = sparseDecMs.suffix(nDecode).sorted()[nDecode / 2]
                 logLine("[F-83-perf-256K] sparse decode median (last \(nDecode))=\(String(format: "%.1f", sparseDecMedian))ms")
