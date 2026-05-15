@@ -156,12 +156,28 @@ public enum Qwen2 {
         @ModuleInfo(key: "down_proj") var down: Linear
 
         public init(dimensions: Int, hiddenDimensions: Int) {
+            self.hiddenDim = hiddenDimensions
             self._gateUp.wrappedValue = Linear(dimensions, 2 * hiddenDimensions, bias: false)
             self._down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
             super.init()
         }
 
+        // Hidden dim is needed by the fused-gate-activation kernel — cached
+        // once at init since it never changes.
+        let hiddenDim: Int
+
         public func callAsFunction(_ x: MLXArray) -> MLXArray {
+            // F-83 sprint iter #9 found that MLX.MLXFast.fusedGateActivation
+            // didn't move the needle on Qwen2 16K decode (within noise vs
+            // compiled-swiglu). The split+swiglu path appears to already be
+            // fused by MLX's lazy graph through the compile() pattern.
+            // Kept the env opt-in for future experimentation.
+            if ProcessInfo.processInfo.environment["F83_FUSED_GATE_ACT"] == "1" {
+                let gateUpOut = gateUp(x)
+                let activated = MLX.MLXFast.fusedGateActivation(
+                    gateUpOut, hiddenDims: hiddenDim, activation: .silu)
+                return down(activated)
+            }
             let parts = MLX.split(gateUp(x), parts: 2, axis: -1)
             return down(Qwen2.compiledSwiglu(parts[0], parts[1]))
         }
