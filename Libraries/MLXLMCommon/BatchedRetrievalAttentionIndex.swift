@@ -100,7 +100,6 @@ public final class BatchedRetrievalAttentionIndex {
             jlMatrixT = jlMatrix!.transposed(1, 0)
             eval(jlMatrix!, jlMatrixT!)
         }
-        let W = jlMatrix!
         let WT = jlMatrixT!
 
         let oldSeqLen = seqLen
@@ -255,7 +254,6 @@ public final class BatchedRetrievalAttentionIndex {
             jlMatrixT = jlMatrix!.transposed(1, 0)
             eval(jlMatrix!, jlMatrixT!)
         }
-        let W = jlMatrix!
         let WT = jlMatrixT!
         // [nh, dHead] @ [dHead, contentDim] = [nh, contentDim]
         let contentQ = matmul(q.asType(.float32), WT)
