@@ -4156,6 +4156,11 @@ struct RetrievalAttentionTests {
         let prefillLen = (envLen.flatMap(Int.init) ?? (256 * 1024))
         let envChunk = ProcessInfo.processInfo.environment["F83_CHUNK_SIZE"]
         let chunkSize = (envChunk.flatMap(Int.init) ?? 1024)
+        // At 256K context the cache alone is ~30 GB and the first decode
+        // step's lazy-graph materialization has OOM'd in practice. Allow
+        // skipping decode so we still get prefill numbers from the heavy
+        // contexts.
+        let skipDecode = ProcessInfo.processInfo.environment["F83_SKIP_DECODE"] == "1"
         let nDecode = 8
         // Raise MLX's memory limit defensively (default is ~50% of memsize).
         _ = MLX.GPU.set(memoryLimit: 56 * 1024 * 1024 * 1024)  // 56 GB
@@ -4241,9 +4246,15 @@ struct RetrievalAttentionTests {
                 ropeBase: cfg.ropeTheta)
         }
         let dense = runChunkedPrefill(cache: denseCache, tag: "dense")
-        let denseDecMs = runDecode(cache: denseCache, tag: "dense")
-        let denseDecMedian = denseDecMs.suffix(nDecode).sorted()[nDecode / 2]
-        logLine("[F-83-perf-256K] dense decode median (last \(nDecode))=\(String(format: "%.1f", denseDecMedian))ms")
+        let denseDecMedian: Double
+        if skipDecode {
+            denseDecMedian = -1
+            logLine("[F-83-perf-256K] dense decode SKIPPED (F83_SKIP_DECODE=1)")
+        } else {
+            let denseDecMs = runDecode(cache: denseCache, tag: "dense")
+            denseDecMedian = denseDecMs.suffix(nDecode).sorted()[nDecode / 2]
+            logLine("[F-83-perf-256K] dense decode median (last \(nDecode))=\(String(format: "%.1f", denseDecMedian))ms")
+        }
 
         MLX.GPU.clearCache()
 
@@ -4280,9 +4291,15 @@ struct RetrievalAttentionTests {
                 ropeBase: cfg.ropeTheta)
         }
         let sparse = runChunkedPrefill(cache: sparseCache, tag: "sparse")
-        let sparseDecMs = runDecode(cache: sparseCache, tag: "sparse")
-        let sparseDecMedian = sparseDecMs.suffix(nDecode).sorted()[nDecode / 2]
-        logLine("[F-83-perf-256K] sparse decode median (last \(nDecode))=\(String(format: "%.1f", sparseDecMedian))ms")
+        let sparseDecMedian: Double
+        if skipDecode {
+            sparseDecMedian = -1
+            logLine("[F-83-perf-256K] sparse decode SKIPPED (F83_SKIP_DECODE=1)")
+        } else {
+            let sparseDecMs = runDecode(cache: sparseCache, tag: "sparse")
+            sparseDecMedian = sparseDecMs.suffix(nDecode).sorted()[nDecode / 2]
+            logLine("[F-83-perf-256K] sparse decode median (last \(nDecode))=\(String(format: "%.1f", sparseDecMedian))ms")
+        }
 
         // Final-token logit cosine for quality regression catch.
         // NaN-defensive: at long context with random tokens, FP16
