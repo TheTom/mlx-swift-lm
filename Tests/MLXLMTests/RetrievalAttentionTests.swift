@@ -3980,6 +3980,57 @@ struct RetrievalAttentionTests {
         print("[F-83-M2-bitmap] block bitmap matches hand-computed reference (\(nKVH) heads × \(nBlocks) blocks)")
     }
 
+    // F-83 M3 — plumbing test: at tiny prior (< preBudget) the union
+    // of static + sliding covers all prior positions, so sparse output
+    // must be bit-identical to dense. Validates gather/concat/mask
+    // wiring without quality risk.
+    @Test func f83_prefillSparseAttend_equalsDenseAtSmallPrior() throws {
+        let nH = 4, nKVH = 4, L = 4, prior = 256, D = 32
+        var cfg = RetrievalAttentionConfig()
+        cfg.sparsePrefillEnabled = true
+        cfg.sparsePrefillMinContext = 0
+        cfg.denseFirstN = 0  // make layer eligible
+        cfg.denseLastN = 0
+        let ra = RetrievalAttentionKVCache(
+            layerIdx: 4, totalLayers: 16, raConfig: cfg, ropeBase: 10_000.0)
+
+        MLXRandom.seed(0xF830003)
+        let priorK = MLXRandom.normal([1, nKVH, prior, D]).asType(.float32)
+        let priorV = MLXRandom.normal([1, nKVH, prior, D]).asType(.float32)
+        _ = ra.update(keys: priorK, values: priorV)
+        let chunkK = MLXRandom.normal([1, nKVH, L, D]).asType(.float32)
+        let chunkV = MLXRandom.normal([1, nKVH, L, D]).asType(.float32)
+        let (cachedK, cachedV) = ra.update(keys: chunkK, values: chunkV)
+        let chunkQ = MLXRandom.normal([1, nH, L, D]).asType(.float32)
+        let scale = 1.0 / sqrt(Float(D))
+
+        let denseOut = MLXFast.scaledDotProductAttention(
+            queries: chunkQ, keys: cachedK, values: cachedV,
+            scale: scale, mask: .causal
+        )
+        let sparseOut = ra.prefillSparseAttend(
+            queries: chunkQ, cachedKeys: cachedK, cachedValues: cachedV,
+            scale: scale
+        )
+        eval(denseOut, sparseOut)
+        let denseShape = "\(denseOut.shape)"
+        let sparseShape = "\(sparseOut.shape)"
+        #expect(denseOut.shape == sparseOut.shape,
+            "shape mismatch dense \(denseShape) vs sparse \(sparseShape)")
+        func cosine(_ a: MLXArray, _ b: MLXArray) -> Float {
+            let aF = a.reshaped(a.size).asType(.float32)
+            let bF = b.reshaped(b.size).asType(.float32)
+            let dot = (aF * bF).sum().asArray(Float.self)[0]
+            let an = sqrt((aF * aF).sum()).asArray(Float.self)[0]
+            let bn = sqrt((bF * bF).sum()).asArray(Float.self)[0]
+            return dot / (an * bn + 1e-12)
+        }
+        let cosineVal = cosine(denseOut, sparseOut)
+        print("[F-83-M3-small-prior] cosine=\(cosineVal) (expect ~1.0; tiny prior fully covered)")
+        #expect(cosineVal >= 0.999,
+            "small-prior sparse should match dense; got cosine=\(cosineVal)")
+    }
+
     // F-79 cross-architecture validation on Qwen3-0.6B-4bit.
     // Confirms the selector-amortization technique generalizes beyond
     // Qwen2.5-14B-1M. Smaller model + different arch + same amort=16

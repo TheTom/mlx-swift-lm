@@ -825,6 +825,135 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         return mask
     }
 
+    /// F-83 M3 — sparse prefill attend for a chunk of L queries.
+    ///
+    /// Called from the dispatcher's `.retrievalSparse` branch when
+    /// `L > 1` and `priorChunkLen > sparsePrefillMinContext`. Splits
+    /// attention into:
+    ///   1. Prior chunks: gather K/V at the union top-K of fine +
+    ///      coarse positions across all L queries per KV head, plus
+    ///      static prefix and sliding window. All positions are <
+    ///      chunk_start so the prior portion is uniformly causal-safe
+    ///      (no per-row mask needed for it).
+    ///   2. Within-chunk: dense causal SDPA on the chunk's own K/V.
+    ///
+    /// Concatenates prior_gathered + chunk K/V into a single
+    /// `[B, nKVH, P+L, D]` tensor and runs one `MLXFast.SDPA` call
+    /// with a `[L, P+L]` mask. This bypasses the explicit online
+    /// softmax merge — the merge is implicit in SDPA's single softmax.
+    ///
+    /// `cachedKeys` / `cachedValues` are the result of `update()` —
+    /// they already include the chunk's own K/V at the tail.
+    public func prefillSparseAttend(
+        queries: MLXArray,
+        cachedKeys: MLXArray,
+        cachedValues: MLXArray,
+        scale: Float
+    ) -> MLXArray {
+        precondition(queries.shape.count == 4, "queries [B, nH, L, D]")
+        precondition(cachedKeys.shape.count == 4, "cachedKeys [B, nKVH, T, D]")
+        guard let index = batchedIndex else {
+            fatalError("indices not initialized; call update first")
+        }
+        let nH = queries.dim(1)
+        let L = queries.dim(2)
+        let Tcache = cachedKeys.dim(2)
+        let nKVH = cachedKeys.dim(1)
+        let priorLen = Tcache - L
+        precondition(priorLen >= 0, "cache shrunk during update?")
+        // Fast path: nothing to gather. Fall through to dense.
+        if priorLen <= 0 {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                scale: scale, mask: .causal
+            )
+        }
+
+        let groupSize = nH / nKVH
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray((0..<nKVH).map { Int32($0 * groupSize) })
+            eval(cachedHeadIdx!)
+        }
+        // queries[0] → [nH, L, D]; take strided reps per KV group → [nKVH, L, D]
+        let qStacked = queries[0].take(cachedHeadIdx!, axis: 0).asType(.float32)
+        let qProj = index.projectQueriesBatchedL(qStacked)
+        let (fineStarts, coarseStarts) = index.topKBlockStartsUnionBatchedQGPU(
+            projectedQ: qProj)
+
+        // Build the union of static + sliding + fine + coarse positions.
+        // Cross-head combined (the F-69 pattern). Duplicates are tolerated
+        // (sorted into adjacency, SDPA softmax handles them as no-op).
+        let cfg = raConfig
+        let staticEnd = min(cfg.staticInit, priorLen)
+        let staticPositions: MLXArray = staticEnd > 0
+            ? MLXArray(Int32(0) ..< Int32(staticEnd))
+            : MLXArray.zeros([0], dtype: .int32)
+        let slidingStart = max(0, priorLen - cfg.slidingWindow)
+        let slidingPositions: MLXArray = slidingStart < priorLen
+            ? MLXArray(Int32(slidingStart) ..< Int32(priorLen))
+            : MLXArray.zeros([0], dtype: .int32)
+        let fineBS = cfg.fineBlockSize
+        let coarseBS = cfg.coarseBlockSize
+        let kFine = fineStarts.dim(1)
+        let kCoarse = coarseStarts.dim(1)
+        let fineOffsets = MLXArray(0..<Int32(fineBS)).reshaped(1, 1, fineBS)
+        let coarseOffsets = MLXArray(0..<Int32(coarseBS)).reshaped(1, 1, coarseBS)
+        let finePos = (fineStarts.expandedDimensions(axis: -1) + fineOffsets)
+            .reshaped(nKVH * kFine * fineBS)
+        let coarsePos = (coarseStarts.expandedDimensions(axis: -1) + coarseOffsets)
+            .reshaped(nKVH * kCoarse * coarseBS)
+        let allPositions = concatenated(
+            [staticPositions, slidingPositions, finePos, coarsePos], axis: 0
+        )
+        // Clip to [0, priorLen-1] so chunk's own keys are never re-attended
+        // here (they go through the within-chunk causal path).
+        let clipped = clip(
+            allPositions.asType(.int32),
+            min: Int32(0), max: Int32(priorLen - 1)
+        )
+        // DEDUPE positions. Duplicate K rows in the SDPA input double the
+        // softmax weight at that token and silently break correctness
+        // (we measured cosine drop to 0.04 with duplicates at small prior
+        // where static+sliding overlap fully). CPU dedupe pulls ~6K
+        // int32s per layer per chunk — one sync per chunk, negligible
+        // vs the gather + SDPA wall-clock at long context.
+        let clippedCpu = clipped.asArray(Int32.self)
+        let uniqueSorted = Array(Set(clippedCpu)).sorted()
+        let positions = MLXArray(uniqueSorted)
+
+        // Gather prior K/V at `positions`. Keep within-chunk K/V at the tail.
+        let priorK = cachedKeys[0..., 0..., ..<priorLen, 0...]
+        let priorV = cachedValues[0..., 0..., ..<priorLen, 0...]
+        let gK = priorK.take(positions, axis: 2)   // [B, nKVH, P, D]
+        let gV = priorV.take(positions, axis: 2)
+        let chunkK = cachedKeys[0..., 0..., priorLen..., 0...]   // [B, nKVH, L, D]
+        let chunkV = cachedValues[0..., 0..., priorLen..., 0...]
+        let combinedK = concatenated([gK, chunkK], axis: 2)
+        let combinedV = concatenated([gV, chunkV], axis: 2)
+        let P = positions.dim(0)
+
+        // Mask shape: [1, 1, L, P+L]. Prior portion (cols [0..P)): all 0
+        // (attend — every position is < chunk_start so causally valid for
+        // every query in the chunk). Chunk portion (cols [P..P+L)): causal
+        // — row l attends to col c iff c-P ≤ l.
+        let neginf: Float = -.infinity
+        let priorMask = MLXArray.zeros([L, P], dtype: queries.dtype)
+        let iRow = MLXArray(0..<Int32(L)).reshaped(L, 1)
+        let iCol = MLXArray(0..<Int32(L)).reshaped(1, L)
+        let chunkMask = MLX.where(
+            iCol .<= iRow,
+            MLXArray(Float(0)),
+            MLXArray(neginf)
+        ).asType(queries.dtype)
+        let combinedMask = concatenated([priorMask, chunkMask], axis: 1)
+            .reshaped(1, 1, L, P + L)
+
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: combinedK, values: combinedV,
+            scale: scale, mask: .array(combinedMask)
+        )
+    }
+
     public var debugDescription: String {
         "RetrievalAttentionKVCache(layer=\(layerIdx)/\(totalLayers), "
             + "offset=\(offset), heads=\(batchedIndex?.nKVHeads ?? 0), "

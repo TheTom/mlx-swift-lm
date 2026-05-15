@@ -244,6 +244,26 @@ public func attentionWithCacheUpdate(
         let preBudget = retrievalAttentionPreDedupeBudget(config: raCache.raConfig)
         let threshold = max(preBudget, raCache.raConfig.sparseMinContext)
         let canGather = L == 1 && raCache.isSparseEligible && cachedKeys.dim(2) > threshold
+
+        // F-83 — sparse prefill (chunked attention). Engages when L > 1
+        // and the prior cache portion is long enough that gather pays
+        // off vs dense O(L * T) compute. Sinks-using models would need
+        // an online merge with the sink token logits — skip for V1.
+        let priorLen = cachedKeys.dim(2) - L
+        if L > 1 && raCache.isSparseEligible
+            && raCache.raConfig.sparsePrefillEnabled
+            && priorLen > raCache.raConfig.sparsePrefillMinContext
+            && sinks == nil
+        {
+            return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                raCache.prefillSparseAttend(
+                    queries: queries,
+                    cachedKeys: cachedKeys,
+                    cachedValues: cachedValues,
+                    scale: scale
+                )
+            }
+        }
         // F-73 diagnostic: bypass selector pipeline entirely at decode.
         // Falls through to the dense `MLXFast.scaledDotProductAttention`
         // below. Lets us isolate selector vs cache-update overhead.

@@ -278,6 +278,18 @@ public struct RetrievalAttentionConfig: Sendable {
     /// near 2-3x the preBudget. Default 16384 = ~2.6x preBudget.
     public var sparseMinContext: Int = 16384
 
+    /// F-83 — enable sparse prefill (chunked attention with prior-chunks
+    /// gather + within-chunk dense). When false, prefill falls through
+    /// to dense SDPA. Default false to keep existing behavior; opt-in
+    /// per cache or via the `RA_SPARSE_PREFILL=1` env var.
+    public var sparsePrefillEnabled: Bool = false
+
+    /// F-83 — minimum prior cache length (in tokens) before sparse
+    /// prefill engages. Below this, the chunk runs dense. Mirrors
+    /// `sparseMinContext` for the decode path. Default 16384 = ~2.6x
+    /// dedupe pre-budget at default config.
+    public var sparsePrefillMinContext: Int = 16384
+
     public init() {}
 }
 
