@@ -4185,29 +4185,45 @@ struct RetrievalAttentionTests {
             [1, 1]
         ).asType(.int32)
 
+        // Per-chunk memory logging knob — F83_LOG_EVERY=N logs MEM and
+        // pre/post-asyncEval snapshots every N chunks. Default 8.
+        let logEveryN = ProcessInfo.processInfo.environment["F83_LOG_EVERY"]
+            .flatMap(Int.init) ?? 8
+
         func runChunkedPrefill(
             cache: [KVCache], tag: String
         ) -> (prefillSec: Double, lastLogits: MLXArray) {
-            // Mirror f79Quality_256K's proven pattern: slice off processed
-            // tokens each chunk (frees old reference), asyncEval cache
-            // state only (NOT logits — those are huge and only the LAST
-            // one matters), clearCache between paths.
+            // ASYNC eval per chunk (matches f79Quality_256K_14B1M's pattern).
+            // Memory diagnostics logged every F83_LOG_EVERY chunks so we
+            // see WHERE active memory grows during prefill, not just at
+            // the end.
             let nChunks = prefillLen / chunkSize
             let t0 = Date()
-            var y = prefillTokens  // [1, prefillLen]
+            var y = prefillTokens
             var lastOut: MLXArray = MLXArray.zeros([0])
             var i = 0
             while y.dim(1) > 0 {
                 let sz = Swift.min(chunkSize, y.dim(1))
                 let isLast = (sz == y.dim(1)) && (i == nChunks - 1)
+                let shouldSnap = (i == 0) || (i % logEveryN == 0) || isLast
+                if shouldSnap {
+                    memSnapshot("\(tag)-chunk\(i)-pre-model")
+                }
                 let out = model(y[0..., ..<sz], cache: cache)
+                if shouldSnap {
+                    memSnapshot("\(tag)-chunk\(i)-post-model")
+                }
                 if isLast {
                     eval(out)
                     lastOut = out
+                    memSnapshot("\(tag)-chunk\(i)-post-eval(out)")
                 } else {
                     var arrays: [MLXArray] = []
                     for c in cache { arrays.append(contentsOf: c.innerState()) }
                     asyncEval(arrays)
+                    if shouldSnap {
+                        memSnapshot("\(tag)-chunk\(i)-post-asyncEval")
+                    }
                 }
                 y = y[0..., sz...]
                 i += 1
