@@ -4154,7 +4154,8 @@ struct RetrievalAttentionTests {
         // at chunk 144 (147K) — likely an MLX memory or watchdog limit.
         let envLen = ProcessInfo.processInfo.environment["F83_PREFILL_LEN"]
         let prefillLen = (envLen.flatMap(Int.init) ?? (256 * 1024))
-        let chunkSize = 1024
+        let envChunk = ProcessInfo.processInfo.environment["F83_CHUNK_SIZE"]
+        let chunkSize = (envChunk.flatMap(Int.init) ?? 1024)
         let nDecode = 8
         // Raise MLX's memory limit defensively (default is ~50% of memsize).
         _ = MLX.GPU.set(memoryLimit: 56 * 1024 * 1024 * 1024)  // 56 GB
