@@ -1479,6 +1479,113 @@ public func retrievalAttentionBuildMaskFused(
     return outputs[0].asType(outputDtype)
 }
 
+/// F-83 M2 — block bitmap for L>1 sparse prefill.
+///
+/// Builds a per-KV-head bitmap of "blocks the chunk wants to attend to."
+/// Bit `b` set ⇔ block `b` of the prior cache is in the union of
+///   { static prefix ∪ sliding window ∪ fine top-K ∪ coarse top-K }
+/// for this head.
+///
+/// Where F-73's `retrievalAttentionBuildMaskFused` returns a position
+/// mask `[1, 1, 1, T]` (float32 sized to T tokens), this returns a
+/// block bitmap `[nKVH, nBlocks]` (int8 sized to T/fineBlockSize) — at
+/// T=256K, fineBlockSize=64 that's 512 bytes/head, four orders of
+/// magnitude cheaper than the position mask, and four cheaper still
+/// than the naive L×T extension.
+///
+/// Within-chunk attention is intentionally NOT represented here —
+/// dispatcher splits prior-chunks (sparse, this bitmap) from
+/// within-chunk (dense causal).
+///
+/// - Parameters:
+///   - fineStarts: `[nKVH, K_fine]` int32 token positions where fine
+///     top-K blocks start (output of `topKBlockStartsUnionBatchedQGPU`).
+///   - coarseStarts: `[nKVH, K_coarse]` int32 token positions where
+///     coarse top-K blocks start.
+///   - priorChunkLen: tokens in the prior cache (chunk's first abs
+///     position). Bitmap covers `[0, priorChunkLen)`.
+///   - staticInit: static-prefix length in tokens. Blocks fully or
+///     partially in `[0, staticInit)` are set.
+///   - slidingWindow: sliding-window length in tokens. Blocks fully
+///     or partially in `[priorChunkLen - slidingWindow, priorChunkLen)`
+///     are set.
+///   - fineBlockSize: tokens per fine block.
+///   - coarseBlockSize: tokens per coarse block. Each coarse start
+///     covers `coarseBlockSize / fineBlockSize` fine-block bits.
+/// - Returns: `[nKVH, nBlocks]` int8 bitmap (0 or 1) where
+///   `nBlocks = ceil(priorChunkLen / fineBlockSize)`. Returns
+///   `[nKVH, 0]` when `priorChunkLen == 0`.
+public func retrievalAttentionBuildBlockBitmap(
+    fineStarts: MLXArray,
+    coarseStarts: MLXArray,
+    priorChunkLen: Int,
+    staticInit: Int,
+    slidingWindow: Int,
+    fineBlockSize: Int,
+    coarseBlockSize: Int
+) -> MLXArray {
+    precondition(fineStarts.shape.count == 2, "fineStarts must be [nKVH, K_fine]")
+    precondition(coarseStarts.shape.count == 2, "coarseStarts must be [nKVH, K_coarse]")
+    let nKVH = fineStarts.dim(0)
+    precondition(coarseStarts.dim(0) == nKVH, "head count mismatch")
+    let kFine = fineStarts.dim(1)
+    let kCoarse = coarseStarts.dim(1)
+    precondition(coarseBlockSize % fineBlockSize == 0,
+        "coarseBlockSize (\(coarseBlockSize)) must be a multiple of fineBlockSize (\(fineBlockSize))")
+    let coarseSpan = coarseBlockSize / fineBlockSize
+
+    let nBlocks = (priorChunkLen + fineBlockSize - 1) / fineBlockSize
+    if nBlocks == 0 {
+        return MLXArray.zeros([nKVH, 0], dtype: .int8)
+    }
+
+    var bitmap = MLXArray.zeros([nKVH, nBlocks], dtype: .int8)
+
+    // Static prefix — any block overlapping [0, staticInit).
+    let staticBlocks = min(nBlocks, (staticInit + fineBlockSize - 1) / fineBlockSize)
+    if staticBlocks > 0 {
+        bitmap[0..., ..<staticBlocks] = MLXArray.ones(
+            [nKVH, staticBlocks], dtype: .int8)
+    }
+    // Sliding window — any block overlapping [priorChunkLen - slidingWindow, priorChunkLen).
+    let slidingStart = max(0, priorChunkLen - slidingWindow)
+    let slidingStartBlock = slidingStart / fineBlockSize
+    if slidingStartBlock < nBlocks {
+        let w = nBlocks - slidingStartBlock
+        bitmap[0..., slidingStartBlock..<nBlocks] = MLXArray.ones(
+            [nKVH, w], dtype: .int8)
+    }
+
+    // Fine top-K — per-head scatter.
+    if kFine > 0 {
+        let fineBlockIdx = clip(
+            (fineStarts / Int32(fineBlockSize)).asType(.int32),
+            min: Int32(0), max: Int32(nBlocks - 1)
+        ).asType(.int32)
+        for h in 0..<nKVH {
+            bitmap[h, fineBlockIdx[h]] = MLXArray.ones(
+                [kFine], dtype: .int8)
+        }
+    }
+
+    // Coarse top-K — each coarse start covers `coarseSpan` fine blocks.
+    // Expand [H, K_coarse] → [H, K_coarse * coarseSpan] by adding 0..span.
+    if kCoarse > 0 {
+        let coarseBase = (coarseStarts / Int32(fineBlockSize)).asType(.int32)
+        let offsets = MLXArray(0..<Int32(coarseSpan)).reshaped(1, 1, coarseSpan)
+        let expanded = (coarseBase.expandedDimensions(axis: -1) + offsets)
+            .reshaped(nKVH, kCoarse * coarseSpan)
+        let clamped = clip(expanded, min: Int32(0), max: Int32(nBlocks - 1))
+            .asType(.int32)
+        for h in 0..<nKVH {
+            bitmap[h, clamped[h]] = MLXArray.ones(
+                [kCoarse * coarseSpan], dtype: .int8)
+        }
+    }
+
+    return bitmap
+}
+
 /// F-74 — fused projectQ + scoreTopK_fine + scoreTopK_coarse wrapper.
 /// One Metal kernel call replaces 3 MLX op chains
 /// (`projectQueriesBatched` + 2× `computeTopKBlockStarts`).

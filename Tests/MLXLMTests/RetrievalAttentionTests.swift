@@ -3927,6 +3927,59 @@ struct RetrievalAttentionTests {
         print("[F-83-M1-semantics] L=\(L) union top-K matches manual max-pool reference on \(nKVH) heads (kFine=\(kFine))")
     }
 
+    // F-83 M2 — block bitmap correctness. Hand-computed expected
+    // bitmap from static prefix + sliding window + fine + coarse
+    // top-K positions, then compared element-wise to the builder
+    // output.
+    @Test func f83_blockBitmapMatchesReference() throws {
+        let nKVH = 2
+        let fineBS = 64
+        let coarseBS = 128  // span = 2 fine blocks
+        let priorLen = 512  // 8 fine blocks
+        let staticInit = 64       // → block 0
+        let slidingWin = 128      // → start = 512-128 = 384 → blocks 6, 7
+
+        let fineStarts = MLXArray(
+            [Int32(64), Int32(192), Int32(128), Int32(320)],
+            [nKVH, 2]
+        )
+        // head 0: fine block-idx {1, 3}
+        // head 1: fine block-idx {2, 5}
+        let coarseStarts = MLXArray(
+            [Int32(0), Int32(256)],
+            [nKVH, 1]
+        )
+        // head 0: coarse base=0, span=2 → block-idx {0, 1}
+        // head 1: coarse base=4, span=2 → block-idx {4, 5}
+
+        let bitmap = retrievalAttentionBuildBlockBitmap(
+            fineStarts: fineStarts, coarseStarts: coarseStarts,
+            priorChunkLen: priorLen,
+            staticInit: staticInit, slidingWindow: slidingWin,
+            fineBlockSize: fineBS, coarseBlockSize: coarseBS
+        )
+        eval(bitmap)
+        let cpu = bitmap.asArray(Int8.self)
+        let nBlocks = 8
+        #expect(bitmap.shape == [nKVH, nBlocks],
+            "bitmap shape \(bitmap.shape) != [\(nKVH), \(nBlocks)]")
+
+        // Expected union per head:
+        // Head 0: static{0} ∪ sliding{6,7} ∪ fine{1,3} ∪ coarse{0,1}
+        //         = {0,1,3,6,7}. Zeros: blocks 2, 4, 5.
+        // Head 1: static{0} ∪ sliding{6,7} ∪ fine{2,5} ∪ coarse{4,5}
+        //         = {0,2,4,5,6,7}. Zeros: blocks 1, 3.
+        let expected0: [Int8] = [1, 1, 0, 1, 0, 0, 1, 1]
+        let expected1: [Int8] = [1, 0, 1, 0, 1, 1, 1, 1]
+        for b in 0..<nBlocks {
+            #expect(cpu[b] == expected0[b],
+                "head 0 block \(b): got \(cpu[b]) expected \(expected0[b])")
+            #expect(cpu[nBlocks + b] == expected1[b],
+                "head 1 block \(b): got \(cpu[nBlocks + b]) expected \(expected1[b])")
+        }
+        print("[F-83-M2-bitmap] block bitmap matches hand-computed reference (\(nKVH) heads × \(nBlocks) blocks)")
+    }
+
     // F-79 cross-architecture validation on Qwen3-0.6B-4bit.
     // Confirms the selector-amortization technique generalizes beyond
     // Qwen2.5-14B-1M. Smaller model + different arch + same amort=16
