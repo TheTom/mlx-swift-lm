@@ -17,6 +17,7 @@
 | V1.2 (top-K=32 cross-head) | 250 s | 1.48x | 190 ms | 0.965 | reverted — extra K cost > coverage gain |
 | chunkSize=2048 alone | 200 s | 1.77x | 197 ms | 0.966 | per-chunk overhead amortizes over 2x queries |
 | **V1.3 = chunk2K + IndexCache** | **174 s** | **2.01x** | **169 ms** | **0.967** | first 2x! cross-layer selector reuse |
+| V1.3 + chunkSize=4096 | 171 s | 1.98x | 181 ms | 0.970 | plateau — chunk size knob exhausted |
 
 V1.0 → V1.1 deltas:
 - 90s prefill savings (44% sparse-side reduction) — from killing per-chunk
