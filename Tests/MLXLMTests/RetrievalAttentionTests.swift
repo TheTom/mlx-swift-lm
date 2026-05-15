@@ -4191,15 +4191,15 @@ struct RetrievalAttentionTests {
 
         let logEveryN = ProcessInfo.processInfo.environment["F83_LOG_EVERY"]
             .flatMap(Int.init) ?? 8
-        // F-83 V1.6 — SYNC eval per chunk + clearCache. SGLang / vLLM /
-        // mlx-lm Python all do this. asyncEval lets Metal's completion-
-        // handler shared_ptr retention pin chunks of activations until
-        // GPU completion; on long context that compounds to 162 GB at
-        // 256K, which leaves no headroom for decode step 0's transients.
-        // Sync per chunk: peak = model + KV_pool + ONE chunk's activations.
-        let useAsync = ProcessInfo.processInfo.environment["F83_ASYNC"] == "1"
+        // F-83 V1.7 — A/B'd V8 (async, no clearCache) vs V9 (sync + clearCache
+        // per chunk) at 256K: identical peak (163 GB) and identical death at
+        // decode-0 eval(out). Completion-handler retention hypothesis was
+        // wrong; sync + clearCache are dead weight here. Defaults restored to
+        // async + no clear. Both knobs kept for diagnostics. The load-bearing
+        // recipe change is the pre-allocated `step` below.
+        let useAsync = ProcessInfo.processInfo.environment["F83_SYNC"] != "1"
         let clearEveryN = ProcessInfo.processInfo.environment["F83_CLEAR_EVERY"]
-            .flatMap(Int.init) ?? 1
+            .flatMap(Int.init) ?? 0
 
         func runChunkedPrefill(
             cache: [KVCache], tag: String
@@ -4234,9 +4234,9 @@ struct RetrievalAttentionTests {
                     if useAsync {
                         asyncEval(arrays)
                     } else {
-                        eval(arrays)   // SYNC — drains GPU queue, releases completion-handler refs
+                        eval(arrays)   // diagnostic SYNC — proven neutral at 256K
                     }
-                    if (i + 1) % clearEveryN == 0 {
+                    if clearEveryN > 0 && (i + 1) % clearEveryN == 0 {
                         MLX.GPU.clearCache()
                     }
                     if shouldSnap {

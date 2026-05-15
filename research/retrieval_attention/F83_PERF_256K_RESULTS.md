@@ -4,7 +4,46 @@
 **Branch**: `feature/retrieval-attention`
 **Test**: `f83_perfBench256K_14B1M`
 
-## Headline numbers
+## Headline — 128K, V9 recipe (pre-allocated step), both paths run end-to-end
+
+| Phase | Variant | Time | tok/s |
+|---|---|---|---|
+| Prefill | Dense 128K | 396.3 s | **330.7** |
+| Prefill | Sparse 128K | 162.8 s | **805.0** |
+| Decode | Dense 128K | 99.7 ms/step | **10.03** |
+| Decode | Sparse 128K | 102.3 ms/step | **9.78** |
+
+- Prefill speedup at 128K = **2.43x** (V12 vs V11, both under V9 recipe).
+- Decode parity recovered: previous V1.x decodes were ~2x slower than dense
+  (200 ms vs 94 ms) under the legacy recipe; with the V9 recipe and a
+  pre-allocated inner KV step, sparse decode lands at 102.3 ms ≈ dense's
+  99.7 ms (2.6% slower, within run-to-run noise).
+
+## 256K — recipe ablation (M5 Max 128 GB)
+
+256K decode does not fit on a 128 GB box without compressed KV — the inner
+KV pool alone is 51 GB at step=263176, peak active climbs to 163 GB through
+prefill, decode-0 eval(out) is jetsam-killed every time. Prefill alone is
+recoverable; the table below isolates which recipe pieces are load-bearing.
+
+| Run | step | sync eval | clearCache | peak active | outcome |
+|---|---|---|---|---|---|
+| V8 | 263176 (pre-alloc) | async | off | 163 GB | prefill 1030.8 s; decode-0 OOM |
+| V9 | 263176 (pre-alloc) | sync | every chunk | 163 GB | prefill 1037.2 s; decode-0 OOM |
+| V10 | 2048 (default) | sync | every chunk | 208 GB at ch 200/256 | **prefill died** at ~200K context |
+
+V8 vs V9: bit-exact identical active MB at every checkpoint (chunk 8/16/24/
+32/40/48/56/64/96/127) and identical death point. **Sync eval and
+clearCache-per-chunk are dead weight** — the completion-handler retention
+hypothesis they were meant to address was wrong.
+
+V9 vs V10: same recipe except V10 disabled the pre-allocated step. V10
+reallocated the inner KV buffer every chunk (~256 reallocs over the run);
+transients accumulated, peak active climbed +45 GB beyond V9, **process
+died at chunk 200** before reaching 256K. **Pre-allocated step is the
+single load-bearing recipe change**, worth ~45 GB at 256K context.
+
+## Legacy 128K results (V1.x recipe, reference only)
 
 ### 128K context (`F83_PREFILL_LEN=131072`)
 
