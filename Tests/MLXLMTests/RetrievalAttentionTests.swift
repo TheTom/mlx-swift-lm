@@ -4237,13 +4237,16 @@ struct RetrievalAttentionTests {
         // Dense baseline.
         logLine("[F-83-perf-256K] === DENSE CHUNKED PREFILL ===")
         F83SelectorReuseCache.clear()
+        let stepOverride = ProcessInfo.processInfo.environment["F83_STEP"]
+            .flatMap(Int.init) ?? 256
         var raCfgDense = RetrievalAttentionConfig()
         raCfgDense.sparsePrefillEnabled = false
         let denseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
             RetrievalAttentionKVCache(
                 layerIdx: i, totalLayers: cfg.hiddenLayers,
                 raConfig: raCfgDense,
-                ropeBase: cfg.ropeTheta)
+                ropeBase: cfg.ropeTheta,
+                step: stepOverride)
         }
         let dense = runChunkedPrefill(cache: denseCache, tag: "dense")
         let denseDecMedian: Double
@@ -4282,13 +4285,14 @@ struct RetrievalAttentionTests {
             + "fineTopK=\(raCfgSparse.sparsePrefillFineTopK) "
             + "groupSize=\(raCfgSparse.sparsePrefillSelectorGroupSize) "
             + "slidingWindow=\(raCfgSparse.slidingWindow) "
-            + "minContext=\(raCfgSparse.sparsePrefillMinContext)")
-        raCfgSparse.sparsePrefillMinContext = 16384
+            + "minContext=\(raCfgSparse.sparsePrefillMinContext) "
+            + "step=\(stepOverride)")
         let sparseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
             RetrievalAttentionKVCache(
                 layerIdx: i, totalLayers: cfg.hiddenLayers,
                 raConfig: raCfgSparse,
-                ropeBase: cfg.ropeTheta)
+                ropeBase: cfg.ropeTheta,
+                step: stepOverride)
         }
         let sparse = runChunkedPrefill(cache: sparseCache, tag: "sparse")
         let sparseDecMedian: Double
