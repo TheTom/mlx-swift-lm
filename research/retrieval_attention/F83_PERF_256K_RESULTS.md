@@ -16,8 +16,11 @@
 | **V1.1** (cross-head union + GPU-only positions + exp grow) | 239 s | 1.53x | 143 ms | 0.964 | killed CPU dedupe sync |
 | V1.2 (top-K=32 cross-head) | 250 s | 1.48x | 190 ms | 0.965 | reverted — extra K cost > coverage gain |
 | chunkSize=2048 alone | 200 s | 1.77x | 197 ms | 0.966 | per-chunk overhead amortizes over 2x queries |
-| **V1.3 = chunk2K + IndexCache** | **174 s** | **2.01x** | **169 ms** | **0.967** | first 2x! cross-layer selector reuse |
+| **V1.3 = chunk2K + IndexCache** | 174 s | 2.01x | 169 ms | 0.967 | first 2x! cross-layer selector reuse |
 | V1.3 + chunkSize=4096 | 171 s | 1.98x | 181 ms | 0.970 | plateau — chunk size knob exhausted |
+| **V1.4 (.causal mask)** | **165 s** | **2.13x** | 183 ms | 0.967 | drop 6 ops/layer/chunk via .causal |
+| V1.5 (groupSize=8) | 165 s | 2.10x | 198 ms | 0.966 | selector not the bottleneck — flat |
+| V1.6 (sliding=1024) | 162 s | 2.13x | 182 ms | 0.963 | same speed, slight cosine drop — back to 2048 |
 
 V1.0 → V1.1 deltas:
 - 90s prefill savings (44% sparse-side reduction) — from killing per-chunk
