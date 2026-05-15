@@ -4262,8 +4262,22 @@ struct RetrievalAttentionTests {
         logLine("[F-83-perf-256K] sparse decode median (last \(nDecode))=\(String(format: "%.1f", sparseDecMedian))ms")
 
         // Final-token logit cosine for quality regression catch.
-        let d = dense.lastLogits
-        let r = sparse.lastLogits
+        // NaN-defensive: at long context with random tokens, FP16
+        // activations can overflow. Cast to FP32, replace ±inf/NaN
+        // with 0, log min/max for diagnosis.
+        func sanitize(_ a: MLXArray) -> (MLXArray, Float, Float, Bool) {
+            let f = a.asType(.float32)
+            let hasNan = isNaN(f).any().asArray(Bool.self)[0]
+            let mn = f.min().asArray(Float.self)[0]
+            let mx = f.max().asArray(Float.self)[0]
+            // Replace nan/inf with 0 so cosine math doesn't blow up.
+            let clean = MLX.where(isFinite(f), f, MLXArray(Float(0)))
+            return (clean, mn, mx, hasNan)
+        }
+        let (d, dMin, dMax, dHasNan) = sanitize(dense.lastLogits)
+        let (r, sMin, sMax, sHasNan) = sanitize(sparse.lastLogits)
+        logLine("[F-83-perf-256K] dense logit range=[\(dMin), \(dMax)] hasNaN=\(dHasNan)")
+        logLine("[F-83-perf-256K] sparse logit range=[\(sMin), \(sMax)] hasNaN=\(sHasNan)")
         let dot = (d * r).sum().asArray(Float.self)[0]
         let dn = sqrt((d * d).sum()).asArray(Float.self)[0]
         let rn = sqrt((r * r).sum()).asArray(Float.self)[0]

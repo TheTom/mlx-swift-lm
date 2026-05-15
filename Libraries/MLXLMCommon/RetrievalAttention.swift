@@ -290,6 +290,21 @@ public struct RetrievalAttentionConfig: Sendable {
     /// dedupe pre-budget at default config.
     public var sparsePrefillMinContext: Int = 16384
 
+    /// F-83 — fine top-K used by the SPARSE PREFILL path (overrides the
+    /// decode adaptive top-K to deliver real sparsity at long context).
+    /// Decode adaptive grows top-K with seqLen (~seqLen/256), which at
+    /// 256K context picks ~1024 fine blocks = 65K positions = only 4x
+    /// sparsity. NSA paper + F-83 PRD recommend a fixed 16 blocks
+    /// (1024 positions + 2K sliding + 128 static = ~3200 positions).
+    /// At 256K that's ~80x sparsity which is the PRD's target.
+    /// Set to 0 to use the decode adaptive top-K (legacy behavior).
+    public var sparsePrefillFineTopK: Int = 16
+
+    /// F-83 — coarse top-K used by the SPARSE PREFILL path. Smaller
+    /// than decode's coarseTopK by default since coarse blocks are
+    /// 1024 tokens each — a few covers a wide swath of context.
+    public var sparsePrefillCoarseTopK: Int = 2
+
     public init() {}
 }
 

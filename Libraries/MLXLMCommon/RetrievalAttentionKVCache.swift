@@ -877,8 +877,18 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         // queries[0] → [nH, L, D]; take strided reps per KV group → [nKVH, L, D]
         let qStacked = queries[0].take(cachedHeadIdx!, axis: 0).asType(.float32)
         let qProj = index.projectQueriesBatchedL(qStacked)
+        // F-83 PRD revision 3: use fixed top-K (NSA-style) for prefill,
+        // not the decode adaptive top-K which scales seqLen/256 → too
+        // many blocks at long context (1024 fine blocks at 256K = only
+        // 4x sparsity, vs the PRD's targeted 80x).
+        let prefillFineTopK = raConfig.sparsePrefillFineTopK > 0
+            ? raConfig.sparsePrefillFineTopK : nil
+        let prefillCoarseTopK = raConfig.sparsePrefillCoarseTopK > 0
+            ? raConfig.sparsePrefillCoarseTopK : nil
         let (fineStarts, coarseStarts) = index.topKBlockStartsUnionBatchedQGPU(
-            projectedQ: qProj)
+            projectedQ: qProj,
+            fineTopKOverride: prefillFineTopK,
+            coarseTopKOverride: prefillCoarseTopK)
 
         // Build the union of static + sliding + fine + coarse positions.
         // Cross-head combined (the F-69 pattern). Duplicates are tolerated

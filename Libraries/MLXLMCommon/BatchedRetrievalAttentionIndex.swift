@@ -666,14 +666,17 @@ public final class BatchedRetrievalAttentionIndex {
     ///   matches `topKBlockStartsAllHeadsCombinedGPU` so the downstream
     ///   mask/bitmap builder can ingest either.
     public func topKBlockStartsUnionBatchedQGPU(
-        projectedQ: MLXArray
+        projectedQ: MLXArray,
+        fineTopKOverride: Int? = nil,
+        coarseTopKOverride: Int? = nil
     ) -> (fine: MLXArray, coarse: MLXArray) {
         guard let fineFeatures = fineBlockFeatures else {
             return (MLXArray.zeros([nKVHeads, 1], dtype: .int32),
                     MLXArray.zeros([nKVHeads, 1], dtype: .int32))
         }
         let fineN = fineFeatures.dim(1)
-        let kFine = min(config.effectiveFineTopK(seqLen: seqLen), fineN)
+        let kFineRequested = fineTopKOverride ?? config.effectiveFineTopK(seqLen: seqLen)
+        let kFine = min(kFineRequested, fineN)
         guard kFine > 0 else {
             return (MLXArray.zeros([nKVHeads, 1], dtype: .int32),
                     MLXArray.zeros([nKVHeads, 1], dtype: .int32))
@@ -684,7 +687,8 @@ public final class BatchedRetrievalAttentionIndex {
         )
         let coarse: MLXArray
         if config.coarseRescueEnabled, let coarseFeatures = coarseBlockFeatures {
-            let kCoarse = min(config.coarseTopK, coarseFeatures.dim(1))
+            let kCoarseRequested = coarseTopKOverride ?? config.coarseTopK
+            let kCoarse = min(kCoarseRequested, coarseFeatures.dim(1))
             if kCoarse > 0 {
                 coarse = unionTopKBlockStarts(
                     features: coarseFeatures, projectedQ: projectedQ,
