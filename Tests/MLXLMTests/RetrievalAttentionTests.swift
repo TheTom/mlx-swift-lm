@@ -4189,18 +4189,21 @@ struct RetrievalAttentionTests {
             [1, 1]
         ).asType(.int32)
 
-        // Per-chunk memory logging knob — F83_LOG_EVERY=N logs MEM and
-        // pre/post-asyncEval snapshots every N chunks. Default 8.
         let logEveryN = ProcessInfo.processInfo.environment["F83_LOG_EVERY"]
             .flatMap(Int.init) ?? 8
+        // F-83 V1.6 — SYNC eval per chunk + clearCache. SGLang / vLLM /
+        // mlx-lm Python all do this. asyncEval lets Metal's completion-
+        // handler shared_ptr retention pin chunks of activations until
+        // GPU completion; on long context that compounds to 162 GB at
+        // 256K, which leaves no headroom for decode step 0's transients.
+        // Sync per chunk: peak = model + KV_pool + ONE chunk's activations.
+        let useAsync = ProcessInfo.processInfo.environment["F83_ASYNC"] == "1"
+        let clearEveryN = ProcessInfo.processInfo.environment["F83_CLEAR_EVERY"]
+            .flatMap(Int.init) ?? 1
 
         func runChunkedPrefill(
             cache: [KVCache], tag: String
         ) -> (prefillSec: Double, lastLogits: MLXArray) {
-            // ASYNC eval per chunk (matches f79Quality_256K_14B1M's pattern).
-            // Memory diagnostics logged every F83_LOG_EVERY chunks so we
-            // see WHERE active memory grows during prefill, not just at
-            // the end.
             let nChunks = prefillLen / chunkSize
             let t0 = Date()
             var y = prefillTokens
@@ -4228,10 +4231,17 @@ struct RetrievalAttentionTests {
                 } else {
                     var arrays: [MLXArray] = []
                     for c in cache { arrays.append(contentsOf: c.innerState()) }
-                    asyncEval(arrays)
+                    if useAsync {
+                        asyncEval(arrays)
+                    } else {
+                        eval(arrays)   // SYNC — drains GPU queue, releases completion-handler refs
+                    }
+                    if (i + 1) % clearEveryN == 0 {
+                        MLX.GPU.clearCache()
+                    }
                     if shouldSnap {
-                        memSnapshot("\(tag)-chunk\(i)-post-asyncEval")
-                        cacheStateSnapshot("\(tag)-chunk\(i)-post-asyncEval", cache)
+                        memSnapshot("\(tag)-chunk\(i)-post-eval+clear")
+                        cacheStateSnapshot("\(tag)-chunk\(i)-post-eval+clear", cache)
                     }
                 }
                 y = y[0..., sz...]
