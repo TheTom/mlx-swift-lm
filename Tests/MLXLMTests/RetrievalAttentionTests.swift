@@ -4208,6 +4208,8 @@ struct RetrievalAttentionTests {
                 let shouldSnap = (i == 0) || (i % logEveryN == 0) || isLast
                 if shouldSnap {
                     memSnapshot("\(tag)-chunk\(i)-pre-model")
+                    cacheStateSnapshot("\(tag)-chunk\(i)-pre-model", cache)
+                    sysmemSnapshot("\(tag)-chunk\(i)-pre-model")
                 }
                 let out = model(y[0..., ..<sz], cache: cache)
                 if shouldSnap {
@@ -4217,12 +4219,15 @@ struct RetrievalAttentionTests {
                     eval(out)
                     lastOut = out
                     memSnapshot("\(tag)-chunk\(i)-post-eval(out)")
+                    cacheStateSnapshot("\(tag)-chunk\(i)-post-eval(out)", cache)
+                    sysmemSnapshot("\(tag)-chunk\(i)-post-eval(out)")
                 } else {
                     var arrays: [MLXArray] = []
                     for c in cache { arrays.append(contentsOf: c.innerState()) }
                     asyncEval(arrays)
                     if shouldSnap {
                         memSnapshot("\(tag)-chunk\(i)-post-asyncEval")
+                        cacheStateSnapshot("\(tag)-chunk\(i)-post-asyncEval", cache)
                     }
                 }
                 y = y[0..., sz...]
@@ -4252,20 +4257,106 @@ struct RetrievalAttentionTests {
                 + "cache=\(String(format: "%.0f", cacheMB))MB")
         }
 
+        // System-level memory snapshot via vm_stat — free / inactive /
+        // wired pages, and the active list. Tells us OS-side state vs
+        // MLX's accounting.
+        func sysmemSnapshot(_ label: String) {
+            let p = Process()
+            p.launchPath = "/usr/bin/vm_stat"
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = Pipe()
+            do {
+                try p.run()
+                p.waitUntilExit()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                guard let raw = String(data: data, encoding: .utf8) else { return }
+                let pageSize: Double = 16384  // M-series default
+                var lines: [String] = []
+                for line in raw.split(separator: "\n") {
+                    let s = String(line)
+                    if s.contains("free")
+                        || s.contains("active")
+                        || s.contains("inactive")
+                        || s.contains("wired down")
+                        || s.contains("compressed") {
+                        // each line is "Pages X: NNNN."
+                        let parts = s.split(separator: ":")
+                        if parts.count == 2 {
+                            let key = parts[0].trimmingCharacters(in: .whitespaces)
+                            let val = parts[1].trimmingCharacters(in: .whitespaces)
+                                .replacingOccurrences(of: ".", with: "")
+                            if let pages = Int(val) {
+                                let gb = Double(pages) * pageSize / 1e9
+                                lines.append("\(key)=\(String(format: "%.1f", gb))GB")
+                            }
+                        }
+                    }
+                }
+                // Also pull resident size of this process.
+                let pid = ProcessInfo.processInfo.processIdentifier
+                let psP = Process()
+                psP.launchPath = "/bin/ps"
+                psP.arguments = ["-o", "rss=,vsz=", "-p", "\(pid)"]
+                let psPipe = Pipe()
+                psP.standardOutput = psPipe
+                try psP.run()
+                psP.waitUntilExit()
+                let psData = psPipe.fileHandleForReading.readDataToEndOfFile()
+                let psStr = (String(data: psData, encoding: .utf8) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let parts = psStr.split(separator: " ", omittingEmptySubsequences: true)
+                if parts.count >= 2,
+                    let rssKB = Int(parts[0]), let vszKB = Int(parts[1]) {
+                    lines.append("rss=\(String(format: "%.1f", Double(rssKB) / 1024 / 1024))GB")
+                    lines.append("vsz=\(String(format: "%.1f", Double(vszKB) / 1024 / 1024))GB")
+                }
+                logLine("[F-83-perf-256K] SYS[\(label)] \(lines.joined(separator: " "))")
+            } catch {
+                logLine("[F-83-perf-256K] SYS[\(label)] (vm_stat failed: \(error))")
+            }
+        }
+
+        // Cache state snapshot — inner cache shape + RA selector index
+        // populated count. Lets us see when the inner KV buffer grows
+        // and when the perTokenFeatures buffer grows.
+        func cacheStateSnapshot(_ label: String, _ cache: [KVCache]) {
+            guard let firstRA = cache.first as? RetrievalAttentionKVCache else { return }
+            let innerOffset = firstRA.inner.offset
+            let innerState = firstRA.inner.innerState()
+            var innerShape = "?"
+            if !innerState.isEmpty {
+                innerShape = "\(innerState[0].shape)"
+            }
+            logLine("[F-83-perf-256K] CACHE[\(label)] "
+                + "layer0.inner.offset=\(innerOffset) "
+                + "layer0.inner.K.shape=\(innerShape)")
+        }
+
         func runDecode(cache: [KVCache], tag: String) -> [Double] {
             memSnapshot("\(tag)-decode-pre-start")
+            sysmemSnapshot("\(tag)-decode-pre-start")
+            cacheStateSnapshot("\(tag)-decode-pre-start", cache)
             var ms: [Double] = []
             var next = startNext
-            for s in 0..<(nDecode + 2) {  // 2 warmup
-                logLine("[F-83-perf-256K] \(tag) decode step=\(s) STARTING (mem before model call)")
+            for s in 0..<(nDecode + 2) {
+                logLine("[F-83-perf-256K] \(tag) decode step=\(s) STARTING")
                 memSnapshot("\(tag)-decode-step\(s)-pre")
+                sysmemSnapshot("\(tag)-decode-step\(s)-pre")
+                cacheStateSnapshot("\(tag)-decode-step\(s)-pre", cache)
                 let t0 = Date()
                 let out = model(next, cache: cache)
-                logLine("[F-83-perf-256K] \(tag) decode step=\(s) model returned, about to eval")
+                logLine("[F-83-perf-256K] \(tag) decode step=\(s) model returned (lazy), about to eval")
+                memSnapshot("\(tag)-decode-step\(s)-post-model")
+                sysmemSnapshot("\(tag)-decode-step\(s)-post-model")
+                cacheStateSnapshot("\(tag)-decode-step\(s)-post-model", cache)
                 eval(out)
                 let t1 = Date().timeIntervalSince(t0) * 1000
                 ms.append(t1)
+                logLine("[F-83-perf-256K] \(tag) decode step=\(s) eval done")
                 memSnapshot("\(tag)-decode-step\(s)-post-eval")
+                sysmemSnapshot("\(tag)-decode-step\(s)-post-eval")
+                cacheStateSnapshot("\(tag)-decode-step\(s)-post-eval", cache)
                 let tok = out[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
                 next = tok
                 logLine("[F-83-perf-256K] \(tag) decode step=\(s) ms=\(String(format: "%.1f", t1))")
