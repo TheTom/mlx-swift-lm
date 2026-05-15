@@ -4310,6 +4310,13 @@ struct RetrievalAttentionTests {
             if skipDecode {
                 logLine("[F-83-perf-256K] sparse decode SKIPPED (F83_SKIP_DECODE=1)")
             } else {
+                // F-83 256K-decode survival — drop the metal allocator's
+                // cached buffers from prefill before decode tries to
+                // allocate its working set. At 256K the K/V cache alone
+                // is ~51 GB and the first decode step's lazy materialization
+                // has been OOM'ing without this clear.
+                MLX.GPU.clearCache()
+                logLine("[F-83-perf-256K] cleared metal cache before sparse decode")
                 let sparseDecMs = runDecode(cache: sparseCache, tag: "sparse")
                 sparseDecMedian = sparseDecMs.suffix(nDecode).sorted()[nDecode / 2]
                 logLine("[F-83-perf-256K] sparse decode median (last \(nDecode))=\(String(format: "%.1f", sparseDecMedian))ms")
