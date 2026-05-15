@@ -147,32 +147,28 @@ public final class BatchedRetrievalAttentionIndex {
                 [nKVHeads, initialCap, featureDim], dtype: selectorNew.dtype
             )
         } else if perTokenFeatures!.dim(1) < newSeqLen {
-            // F-83 V1.1 → V1.4 — HYBRID grow strategy.
+            // F-83 V1.1 → V1.4.1 — HYBRID grow strategy.
             //
-            // Prefill (L>1, adds many tokens per call): doubling. Reduces
-            // grow events to O(log N) over the whole prefill — at 128K
-            // that's 7 grows instead of 128.
+            // Gate on L (caller's batch dim), NOT on increment-vs-cap:
+            //   L == 1   → DECODE step — linear grow by featureChunkSize.
+            //              The 6 GB doubling alloc at cap=256K is what
+            //              jetsam-killed the 256K decode-step-0 attempt.
+            //   L  > 1   → PREFILL chunk — keep doubling (O(log N) grows).
             //
-            // Decode (L=1) or any small write: LINEAR `featureChunkSize`.
-            // At 256K context, doubling from cap=256K → 512K would alloc
-            // another 6 GB just to make room for 1 extra row. That's the
-            // OOM trigger when the post-prefill state is already near the
-            // 64 GB box ceiling (sparse-only 256K run jetsam'd here).
-            //
-            // Heuristic: if the increment is "small" (< current cap / 4)
-            // grow linearly by featureChunkSize-multiples; otherwise
-            // double. Amortized cost stays O(log N) during prefill, and
-            // decode pays a fixed featureChunkSize bytes per refill.
+            // Prior attempt gated on `increment * 4 < currentCap` which
+            // mistook every prefill chunk for "small" and triggered ~120
+            // small grows over a 256K prefill — slower than doubling AND
+            // more transient allocs.
             let currentCap = perTokenFeatures!.dim(1)
-            let increment = newSeqLen - currentCap
             let newCap: Int
-            if increment * 4 < currentCap {
-                // small grow — pad up by featureChunkSize multiples
-                let padding = ((increment + Self.featureChunkSize - 1)
+            if L == 1 {
+                // decode-style grow — pad by featureChunkSize multiples
+                let needed = newSeqLen - currentCap
+                let padding = ((needed + Self.featureChunkSize - 1)
                     / Self.featureChunkSize) * Self.featureChunkSize
                 newCap = currentCap + padding
             } else {
-                // bulk grow — keep doubling
+                // prefill-style doubling
                 var c = currentCap
                 while c < newSeqLen { c *= 2 }
                 newCap = c
