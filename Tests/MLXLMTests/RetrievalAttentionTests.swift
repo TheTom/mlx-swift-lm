@@ -4252,6 +4252,26 @@ struct RetrievalAttentionTests {
         F83SelectorReuseCache.clear()
         var raCfgSparse = RetrievalAttentionConfig()
         raCfgSparse.sparsePrefillEnabled = true
+        // Allow env-driven sweep of the IndexCache group size and the
+        // sliding window — both shift the sparse SDPA K dim and the
+        // selector run frequency.
+        if let g = ProcessInfo.processInfo.environment["F83_GROUP_SIZE"]
+            .flatMap(Int.init) {
+            raCfgSparse.sparsePrefillSelectorGroupSize = g
+        }
+        if let sw = ProcessInfo.processInfo.environment["F83_SLIDING_WINDOW"]
+            .flatMap(Int.init) {
+            raCfgSparse.slidingWindow = sw
+        }
+        if let ftk = ProcessInfo.processInfo.environment["F83_FINE_TOPK"]
+            .flatMap(Int.init) {
+            raCfgSparse.sparsePrefillFineTopK = ftk
+        }
+        logLine("[F-83-perf-256K] sparse cfg: chunkSize=\(chunkSize) "
+            + "fineTopK=\(raCfgSparse.sparsePrefillFineTopK) "
+            + "groupSize=\(raCfgSparse.sparsePrefillSelectorGroupSize) "
+            + "slidingWindow=\(raCfgSparse.slidingWindow) "
+            + "minContext=\(raCfgSparse.sparsePrefillMinContext)")
         raCfgSparse.sparsePrefillMinContext = 16384
         let sparseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
             RetrievalAttentionKVCache(
