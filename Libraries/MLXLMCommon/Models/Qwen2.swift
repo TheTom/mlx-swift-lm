@@ -104,7 +104,8 @@ public enum Qwen2 {
         }
 
         public func callAsFunction(
-            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+            raContext: RetrievalAttentionContext? = nil
         ) -> MLXArray {
             let (B, L) = (x.dim(0), x.dim(1))
 
@@ -121,7 +122,8 @@ public enum Qwen2 {
 
             let output = attentionWithCacheUpdate(
                 queries: queries, keys: keys, values: values,
-                cache: cache, scale: scale, mask: mask
+                cache: cache, scale: scale, mask: mask,
+                raContext: raContext
             )
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
@@ -238,7 +240,8 @@ public enum Qwen2 {
         }
 
         public func callAsFunction(
-            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+            raContext: RetrievalAttentionContext? = nil
         ) -> MLXArray {
             // F83_PROFILE_DECODE=1 — force eval per phase to attribute GPU
             // time. Breaks lazy fusion, so absolute numbers are inflated
@@ -265,7 +268,7 @@ public enum Qwen2 {
                         .utf8))
                 return out
             }
-            let r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+            let r = attention(inputLayerNorm(x), mask: mask, cache: cache, raContext: raContext)
             let h = x + r
             return h + mlp(postAttentionLayerNorm(h))
         }
@@ -292,7 +295,8 @@ public enum Qwen2 {
         public func callAsFunction(
             _ inputs: MLXArray? = nil,
             cache: [KVCache]? = nil,
-            inputEmbedding: MLXArray? = nil
+            inputEmbedding: MLXArray? = nil,
+            raContexts: [RetrievalAttentionContext?]? = nil
         ) -> MLXArray {
             var h: MLXArray
             if let inputEmbedding {
@@ -304,7 +308,7 @@ public enum Qwen2 {
             }
             let mask = createAttentionMask(h: h, cache: cache?.first)
             for (i, layer) in layers.enumerated() {
-                h = layer(h, mask: mask, cache: cache?[i])
+                h = layer(h, mask: mask, cache: cache?[i], raContext: raContexts?[i])
             }
             return norm(h)
         }
