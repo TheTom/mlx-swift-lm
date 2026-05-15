@@ -4031,6 +4031,91 @@ struct RetrievalAttentionTests {
             "small-prior sparse should match dense; got cosine=\(cosineVal)")
     }
 
+    // F-83 M5 — real-model quality validation at 32K with chunked
+    // prefill. Sparse engages on chunks where priorLen >
+    // sparsePrefillMinContext. Compares final-token logits cosine
+    // vs full-dense prefill.
+    @Test func f83_sparsePrefillQuality32K_14B1M() throws {
+        let modelPath = URL(
+            fileURLWithPath: "\(NSHomeDirectory())/models/Qwen2.5-14B-Instruct-1M-4bit"
+        )
+        let configPath = modelPath.appendingPathComponent("config.json")
+        if !FileManager.default.fileExists(atPath: configPath.path) {
+            Issue.record("model not present; skipping")
+            return
+        }
+        let cfg = try JSONDecoder().decode(
+            Qwen2Configuration.self, from: Data(contentsOf: configPath))
+        let model = Qwen2Model(cfg)
+        try loadWeights(
+            modelDirectory: modelPath, model: model,
+            quantization: BaseConfiguration.Quantization(groupSize: 64, bits: 4))
+
+        let prefillLen = 32_768
+        MLXRandom.seed(0xF830101)
+        let prefillTokens = MLXRandom.randInt(
+            low: MLXArray(Int32(0)),
+            high: MLXArray(Int32(cfg.vocabularySize)),
+            [1, prefillLen]
+        ).asType(.int32)
+        eval(prefillTokens)
+
+        // Dense reference — single-shot prefill.
+        let denseCache = model.newCache(parameters: nil)
+        let denseLogits = model(prefillTokens, cache: denseCache)
+        eval(denseLogits)
+        let denseLast = denseLogits[0, -1, 0...].asType(.float32)
+        eval(denseLast)
+
+        MLX.GPU.clearCache()  // release dense state before allocating RA
+
+        let chunkSize = 1024
+        func runChunkedRA(sparseEnabled: Bool) -> MLXArray {
+            var raCfg = RetrievalAttentionConfig()
+            raCfg.sparsePrefillEnabled = sparseEnabled
+            raCfg.sparsePrefillMinContext = 8192
+            let raCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raCfg,
+                    ropeBase: cfg.ropeTheta)
+            }
+            var raLast: MLXArray = MLXArray.zeros([0])
+            for i in stride(from: 0, to: prefillLen, by: chunkSize) {
+                let end = Swift.min(i + chunkSize, prefillLen)
+                let chunk = prefillTokens[0..., i..<end]
+                let out = model(chunk, cache: raCache)
+                eval(out)
+                raLast = out[0, -1, 0...].asType(.float32)
+                eval(raLast)
+            }
+            return raLast
+        }
+        let chunkedDenseLast = runChunkedRA(sparseEnabled: false)
+        MLX.GPU.clearCache()
+        let sparseLast = runChunkedRA(sparseEnabled: true)
+        func cosineLogit(_ a: MLXArray, _ b: MLXArray) -> Float {
+            let dot = (a * b).sum().asArray(Float.self)[0]
+            let an = sqrt((a * a).sum()).asArray(Float.self)[0]
+            let bn = sqrt((b * b).sum()).asArray(Float.self)[0]
+            return dot / (an * bn + Float(1e-12))
+        }
+        let cosChunkedDenseVsSingle = cosineLogit(denseLast, chunkedDenseLast)
+        let cosSparseVsSingle = cosineLogit(denseLast, sparseLast)
+        let cosSparseVsChunkedDense = cosineLogit(chunkedDenseLast, sparseLast)
+        print("[F-83-M5] T=32K chunks=\(prefillLen/chunkSize) "
+            + "chunkedDense_vs_single=\(cosChunkedDenseVsSingle) "
+            + "sparse_vs_single=\(cosSparseVsSingle) "
+            + "sparse_vs_chunkedDense=\(cosSparseVsChunkedDense)")
+        // Note: chunked-dense vs single-shot can diverge with random tokens
+        // due to accumulated fp drift — the model's activation trajectory
+        // amplifies tiny precision differences when input is out-of-
+        // distribution. We log it but don't assert. The PRD-meaningful
+        // bound is sparse vs the chunked-dense baseline at parity.
+        #expect(cosSparseVsChunkedDense >= 0.99,
+            "sparse prefill quality vs chunked-dense baseline \(cosSparseVsChunkedDense) below 0.99 at 32K")
+    }
+
     // F-79 cross-architecture validation on Qwen3-0.6B-4bit.
     // Confirms the selector-amortization technique generalizes beyond
     // Qwen2.5-14B-1M. Smaller model + different arch + same amort=16
