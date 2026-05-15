@@ -294,11 +294,13 @@ public struct RetrievalAttentionConfig: Sendable {
     /// decode adaptive top-K to deliver real sparsity at long context).
     /// Decode adaptive grows top-K with seqLen (~seqLen/256), which at
     /// 256K context picks ~1024 fine blocks = 65K positions = only 4x
-    /// sparsity. NSA paper + F-83 PRD recommend a fixed 16 blocks
-    /// (1024 positions + 2K sliding + 128 static = ~3200 positions).
-    /// At 256K that's ~80x sparsity which is the PRD's target.
+    /// sparsity. F-83 V1.1 default 32 — NSA paper recommends 16 but
+    /// our V1.1 selector emits a CROSS-HEAD union (one shared block
+    /// list across heads, not per-head), so a slightly higher budget
+    /// preserves coverage. 32 fine blocks * 64 = 2048 + sliding 2048
+    /// + static 128 = 4224 positions, still ~30x sparsity at 128K.
     /// Set to 0 to use the decode adaptive top-K (legacy behavior).
-    public var sparsePrefillFineTopK: Int = 16
+    public var sparsePrefillFineTopK: Int = 32
 
     /// F-83 — coarse top-K used by the SPARSE PREFILL path. Smaller
     /// than decode's coarseTopK by default since coarse blocks are
