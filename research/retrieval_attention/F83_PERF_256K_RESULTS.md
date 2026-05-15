@@ -8,17 +8,22 @@
 
 ### 128K context (`F83_PREFILL_LEN=131072`)
 
-| Metric | Value |
-|---|---|
-| Dense chunked prefill | 397.9 s |
-| Sparse chunked prefill (V1) | 329.4 s |
-| **Prefill speedup** | **1.21x** |
-| Dense decode steady-state | 94.2 ms |
-| Sparse decode steady-state | 200.4 ms |
-| Final-logit cosine sparse-vs-dense | **0.9855** |
-| Dense logit range | [-10.80, 8.48], no NaN |
-| Sparse logit range | [-9.95, 8.82], no NaN |
-| Quality target (cosine ≥ 0.99) | NEAR (-0.005 short) |
+| Variant | Prefill | Speedup | Decode | Cosine | hasNaN |
+|---|---|---|---|---|---|
+| Dense baseline | 397.9 s | 1.0x | 94.2 ms | — | false |
+| **V1.0** (top-K=512 adaptive, per-head + CPU dedupe) | 424.1 s | 0.95x | 193.1 ms | NaN (fp16 overflow in dense) | true |
+| **V1.0.1** (top-K=16 fixed, per-head + CPU dedupe) | 329.4 s | 1.21x | 200.4 ms | 0.9855 | false |
+| **V1.1** (top-K=16 cross-head union + GPU-only positions + exponential grow) | 239.0 s | **1.53x** | 142.9 ms | 0.9637 | false |
+| V1.2 (top-K=32 cross-head, recover coverage) | TBD | TBD | TBD | TBD | TBD |
+
+V1.0 → V1.1 deltas:
+- 90s prefill savings (44% sparse-side reduction) — from killing per-chunk
+  CPU sync (asArray + Set dedupe) and per-chunk eval barriers (linear → exp grow)
+- 57ms decode savings (28%) — fewer dangling lazy-graph references after prefill
+
+V1.1 quality cost: cosine 0.985 → 0.964, because cross-head union (one shared
+block list) has less coverage than per-head deduped union (~16 vs ~40-80 unique
+blocks). V1.2 bumps top-K to 32 to recover coverage.
 
 ### 256K context
 
