@@ -19,6 +19,34 @@
   pre-allocated inner KV step, sparse decode lands at 102.3 ms ≈ dense's
   99.7 ms (2.6% slower, within run-to-run noise).
 
+## mlx-lm Python baseline at 128K — apples-to-apples (KNOWN REGRESSION)
+
+Vanilla mlx-lm Python (0.31.2) on the same Qwen2.5-14B-1M-4bit weights,
+matched harness: random tokens U[0, vocab) of length 131072, chunked
+prefill at 2048, asyncEval per chunk, argmax decode, median of last 8 of
+10 steps. No prompt-cache reuse, no sampling.
+
+| Engine | Path | Prefill | Decode | Prefill tok/s | Decode tok/s |
+|---|---|---|---|---|---|
+| Swift V11 | Dense (RA wrap) | 396.3 s | 99.7 ms | 330.7 | 10.03 |
+| Swift V12 | Sparse | 162.8 s | 102.3 ms | 805.0 | 9.78 |
+| Python mlx-lm | Dense (vanilla) | 437.1 s | **70.5 ms** | 300 | **14.18** |
+
+- **Prefill**: Swift dense is 9% FASTER than Python (396 vs 437 s).
+  Sparse path is 2.76x faster than Python at 128K.
+- **Decode (REGRESSION)**: Swift dense is **41% SLOWER** than Python
+  (99.7 vs 70.5 ms/step; 10.03 vs 14.18 tok/s). Sparse essentially the
+  same as Swift dense — the deficit is in the RA cache wrapper / model
+  attention path, not the sparse branch.
+- Even with `raCfgDense.sparsePrefillEnabled = false` the Swift dense
+  cache is `RetrievalAttentionKVCache`, which still constructs the
+  `BatchedRetrievalAttentionIndex` and writes per-token features on
+  every decode step. Likely culprit for the ~30 ms/step overhead.
+- Target: Swift decode must match (or beat) Python's 70.5 ms. Either
+  short-circuit the RA cache on dense / sparse-disabled layers to a
+  bare StandardKVCache decode path, or eliminate per-token selector
+  work when no sparse layer downstream consumes it.
+
 ## 256K — recipe ablation (M5 Max 128 GB)
 
 256K decode does not fit on a 128 GB box without compressed KV — the inner
