@@ -147,22 +147,41 @@ public final class BatchedRetrievalAttentionIndex {
                 [nKVHeads, initialCap, featureDim], dtype: selectorNew.dtype
             )
         } else if perTokenFeatures!.dim(1) < newSeqLen {
-            // F-83 V1.1 — exponential (doubling) grow instead of linear.
-            // Linear `featureChunkSize=1024` triggers a grow + eval barrier
-            // EVERY prefill chunk (since each chunk adds 1024 tokens), which
-            // serializes the GPU pipeline. Doubling reduces grow events to
-            // O(log N) — at 128K that's 7 grow events instead of 128.
+            // F-83 V1.1 → V1.4 — HYBRID grow strategy.
+            //
+            // Prefill (L>1, adds many tokens per call): doubling. Reduces
+            // grow events to O(log N) over the whole prefill — at 128K
+            // that's 7 grows instead of 128.
+            //
+            // Decode (L=1) or any small write: LINEAR `featureChunkSize`.
+            // At 256K context, doubling from cap=256K → 512K would alloc
+            // another 6 GB just to make room for 1 extra row. That's the
+            // OOM trigger when the post-prefill state is already near the
+            // 64 GB box ceiling (sparse-only 256K run jetsam'd here).
+            //
+            // Heuristic: if the increment is "small" (< current cap / 4)
+            // grow linearly by featureChunkSize-multiples; otherwise
+            // double. Amortized cost stays O(log N) during prefill, and
+            // decode pays a fixed featureChunkSize bytes per refill.
             let currentCap = perTokenFeatures!.dim(1)
-            var newCap = currentCap
-            while newCap < newSeqLen { newCap *= 2 }
+            let increment = newSeqLen - currentCap
+            let newCap: Int
+            if increment * 4 < currentCap {
+                // small grow — pad up by featureChunkSize multiples
+                let padding = ((increment + Self.featureChunkSize - 1)
+                    / Self.featureChunkSize) * Self.featureChunkSize
+                newCap = currentCap + padding
+            } else {
+                // bulk grow — keep doubling
+                var c = currentCap
+                while c < newSeqLen { c *= 2 }
+                newCap = c
+            }
             let additional = newCap - currentCap
             let pad = MLXArray.zeros(
                 [nKVHeads, additional, featureDim], dtype: perTokenFeatures!.dtype
             )
             perTokenFeatures = concatenated([perTokenFeatures!, pad], axis: 1)
-            // Materialize after grow to break graph chain (still needed —
-            // without it lazy graph holds every prior chunk's intermediate
-            // and GPU memory grows monotonically).
             eval(perTokenFeatures!)
         }
         // In-place write the new rows.
