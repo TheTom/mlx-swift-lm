@@ -4358,6 +4358,57 @@ struct RetrievalAttentionTests {
             cacheStateSnapshot("\(tag)-decode-pre-start", cache)
             var ms: [Double] = []
             var next = startNext
+
+            // F-83 sprint iter #6 — pipelined decode loop (matches mlx-lm
+            // Python's `generate.py` step pattern). `asyncEval(next)`
+            // kicks off the GPU compute for THIS step's argmax+token
+            // while the host queues the NEXT step's model graph. Then
+            // measure per-step time as the wall-clock between successive
+            // argmax materializations — GPU stays busy continuously.
+            // Toggle: F83_PIPELINE=1 (default off).
+            let usePipelined = ProcessInfo.processInfo.environment["F83_PIPELINE"] == "1"
+            if usePipelined {
+                // Warmup: run 2 steps with sync eval to populate caches/JIT.
+                for s in 0..<2 {
+                    let out = model(next, cache: cache)
+                    eval(out)
+                    next = out[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                    eval(next)
+                    logLine("[F-83-perf-256K] \(tag) decode warmup s=\(s)")
+                }
+                // Steady state — pipelined: queue model, queue argmax,
+                // asyncEval, then measure wall between cross-step
+                // materializations. Each measurement = one full pipeline
+                // step including GPU work, just without idle host gaps.
+                var prevTok = next
+                // Pre-queue one step so the GPU starts before measurement.
+                var queuedTok: MLXArray = {
+                    let o = model(prevTok, cache: cache)
+                    let t = o[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                    asyncEval(t)
+                    return t
+                }()
+                // No per-step logLine inside the timing loop to avoid
+                // file-IO contamination of t0..t1.
+                for s in 0..<nDecode {
+                    let t0 = Date()
+                    let out = model(queuedTok, cache: cache)
+                    let nextQueued = out[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                    asyncEval(nextQueued)
+                    eval(queuedTok)
+                    let t1 = Date().timeIntervalSince(t0) * 1000
+                    ms.append(t1)
+                    queuedTok = nextQueued
+                    _ = s
+                }
+                for (s, m) in ms.enumerated() {
+                    logLine("[F-83-perf-256K] \(tag) decode step=\(s) (pipelined) ms=\(String(format: "%.1f", m))")
+                }
+                _ = prevTok
+                eval(prevTok)
+                return ms
+            }
+
             for s in 0..<(nDecode + 2) {
                 logLine("[F-83-perf-256K] \(tag) decode step=\(s) STARTING")
                 memSnapshot("\(tag)-decode-step\(s)-pre")
@@ -4381,12 +4432,17 @@ struct RetrievalAttentionTests {
                     out = model(next, cache: cache)
                     eval(out)
                 }
+                // F-83 sprint iter #1 — capture t1 IMMEDIATELY after eval.
+                // sysmemSnapshot forks /usr/bin/vm_stat which adds 2-5 ms of
+                // process-fork cost per step. Including it in the timing
+                // inflated decode latency vs vanilla mlx-lm Python (which
+                // has no such hook). Snapshots now happen AFTER t1 capture.
+                let t1 = Date().timeIntervalSince(t0) * 1000
+                ms.append(t1)
                 logLine("[F-83-perf-256K] \(tag) decode step=\(s) model returned (lazy), about to eval")
                 memSnapshot("\(tag)-decode-step\(s)-post-model")
                 sysmemSnapshot("\(tag)-decode-step\(s)-post-model")
                 cacheStateSnapshot("\(tag)-decode-step\(s)-post-model", cache)
-                let t1 = Date().timeIntervalSince(t0) * 1000
-                ms.append(t1)
                 logLine("[F-83-perf-256K] \(tag) decode step=\(s) eval done")
                 memSnapshot("\(tag)-decode-step\(s)-post-eval")
                 sysmemSnapshot("\(tag)-decode-step\(s)-post-eval")

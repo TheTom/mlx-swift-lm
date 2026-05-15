@@ -116,9 +116,14 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
         }
-        return weights.filter {
+        weights = weights.filter {
             !$0.key.contains("self_attn.rotary_emb.inv_freq")
         }
+        // F-83 decode sprint iter #5 — concat gate_proj + up_proj into
+        // a fused gate_up_proj. Saves one matmul dispatch per layer per
+        // decode step (~48 dispatches × ~80 µs = ~4 ms at 16K on M5 Max).
+        weights = Qwen2.fuseGateUpWeights(weights)
+        return weights
     }
 }
 

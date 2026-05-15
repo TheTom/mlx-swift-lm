@@ -144,20 +144,51 @@ public enum Qwen2 {
         }
 
     public class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "gate_proj") var gate: Linear
+        // Fused gate+up projection. Two separate Linears (gate_proj +
+        // up_proj) both consume the same input x and produce hidden-dim
+        // outputs. Concatenating their weights along the output axis at
+        // sanitize-time collapses two matmul dispatches into one, then
+        // we split the result before swiglu. Saves ~48 dispatches per
+        // decode step on Qwen2-14B (one per layer). The fused weight is
+        // produced by `Qwen2Model.sanitize` when both gate_proj and
+        // up_proj are present in the checkpoint.
+        @ModuleInfo(key: "gate_up_proj") var gateUp: Linear
         @ModuleInfo(key: "down_proj") var down: Linear
-        @ModuleInfo(key: "up_proj") var up: Linear
 
         public init(dimensions: Int, hiddenDimensions: Int) {
-            self._gate.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
+            self._gateUp.wrappedValue = Linear(dimensions, 2 * hiddenDimensions, bias: false)
             self._down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-            self._up.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
             super.init()
         }
 
         public func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(Qwen2.compiledSwiglu(gate(x), up(x)))
+            let parts = MLX.split(gateUp(x), parts: 2, axis: -1)
+            return down(Qwen2.compiledSwiglu(parts[0], parts[1]))
         }
+    }
+
+    /// Concatenate `mlp.gate_proj.*` and `mlp.up_proj.*` weights into
+    /// `mlp.gate_up_proj.*` so the two matmuls collapse into one at
+    /// runtime. Handles both fp16 unquantized (single `weight` key) and
+    /// quantized (`weight`/`scales`/`biases`) layouts. Idempotent — if
+    /// the checkpoint already has fused keys, leaves them alone.
+    public static func fuseGateUpWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var out = weights
+        // Find all gate_proj keys; each implies a peer up_proj.
+        let gateKeys = weights.keys
+            .filter { $0.contains(".mlp.gate_proj.") }
+        for gateKey in gateKeys {
+            let upKey = gateKey.replacingOccurrences(of: ".gate_proj.", with: ".up_proj.")
+            let fusedKey = gateKey.replacingOccurrences(of: ".gate_proj.", with: ".gate_up_proj.")
+            guard let gateArr = out[gateKey], let upArr = out[upKey] else { continue }
+            // Concatenate along the output (row) axis = 0. Works for
+            // `weight` (packed int4 [out, in/8]), `scales` and `biases`
+            // ([out, in/group_size]).
+            out[fusedKey] = concatenated([gateArr, upArr], axis: 0)
+            out.removeValue(forKey: gateKey)
+            out.removeValue(forKey: upKey)
+        }
+        return out
     }
 
     // MARK: - DecoderLayer
