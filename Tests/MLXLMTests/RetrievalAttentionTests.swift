@@ -4167,25 +4167,39 @@ struct RetrievalAttentionTests {
         func runChunkedPrefill(
             cache: [KVCache], tag: String
         ) -> (prefillSec: Double, lastLogits: MLXArray) {
+            // Mirror f79Quality_256K's proven pattern: slice off processed
+            // tokens each chunk (frees old reference), asyncEval cache
+            // state only (NOT logits — those are huge and only the LAST
+            // one matters), clearCache between paths.
             let nChunks = prefillLen / chunkSize
             let t0 = Date()
+            var y = prefillTokens  // [1, prefillLen]
             var lastOut: MLXArray = MLXArray.zeros([0])
-            for i in 0..<nChunks {
-                let start = i * chunkSize
-                let end = start + chunkSize
-                let chunk = prefillTokens[0..., start..<end]
-                let out = model(chunk, cache: cache)
-                eval(out)
-                lastOut = out
-                if i == 0 || (i + 1) % 16 == 0 || i == nChunks - 1 {
+            var i = 0
+            while y.dim(1) > 0 {
+                let sz = Swift.min(chunkSize, y.dim(1))
+                let isLast = (sz == y.dim(1)) && (i == nChunks - 1)
+                let out = model(y[0..., ..<sz], cache: cache)
+                if isLast {
+                    eval(out)
+                    lastOut = out
+                } else {
+                    var arrays: [MLXArray] = []
+                    for c in cache { arrays.append(contentsOf: c.innerState()) }
+                    asyncEval(arrays)
+                }
+                y = y[0..., sz...]
+                i += 1
+                if i == 1 || i % 16 == 0 || i == nChunks {
                     let elapsed = Date().timeIntervalSince(t0)
-                    let rate = Double(i + 1) / elapsed
-                    let eta = (rate > 0) ? Double(nChunks - i - 1) / rate : 0
-                    logLine("[F-83-perf-256K] \(tag) chunk=\(i+1)/\(nChunks) "
+                    let rate = Double(i) / elapsed
+                    let eta = (rate > 0) ? Double(nChunks - i) / rate : 0
+                    logLine("[F-83-perf-256K] \(tag) chunk=\(i)/\(nChunks) "
                         + "elapsed=\(String(format: "%.1f", elapsed))s "
                         + "eta=\(String(format: "%.1f", eta))s")
                 }
             }
+            eval(cache.flatMap { $0.state })
             let elapsed = Date().timeIntervalSince(t0)
             logLine("[F-83-perf-256K] \(tag) prefill TOTAL=\(String(format: "%.1f", elapsed))s")
             return (elapsed, lastOut[0, -1, 0...].asType(.float32))
