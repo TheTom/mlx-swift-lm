@@ -8,13 +8,15 @@
 
 ### 128K context (`F83_PREFILL_LEN=131072`)
 
-| Variant | Prefill | Speedup | Decode | Cosine | hasNaN |
+| Variant | Prefill | Speedup | Decode | Cosine | Notes |
 |---|---|---|---|---|---|
-| Dense baseline | 397.9 s | 1.0x | 94.2 ms | — | false |
-| **V1.0** (top-K=512 adaptive, per-head + CPU dedupe) | 424.1 s | 0.95x | 193.1 ms | NaN (fp16 overflow in dense) | true |
-| **V1.0.1** (top-K=16 fixed, per-head + CPU dedupe) | 329.4 s | 1.21x | 200.4 ms | 0.9855 | false |
-| **V1.1** (top-K=16 cross-head union + GPU-only positions + exponential grow) | 239.0 s | **1.53x** | 142.9 ms | 0.9637 | false |
-| V1.2 (top-K=32 cross-head, recover coverage) | TBD | TBD | TBD | TBD | TBD |
+| Dense baseline (chunked) | 350-398 s | 1.0x | 94 ms | — | varies ±15% between runs |
+| **V1.0** (top-K=512 adaptive, per-head + CPU dedupe) | 424 s | 0.95x | 193 ms | NaN | adaptive top-K = ~4x sparsity, no real win |
+| **V1.0.1** (top-K=16 fixed, per-head + CPU dedupe) | 329 s | 1.21x | 200 ms | 0.985 | NSA-style top-K, dispatch bound |
+| **V1.1** (cross-head union + GPU-only positions + exp grow) | 239 s | 1.53x | 143 ms | 0.964 | killed CPU dedupe sync |
+| V1.2 (top-K=32 cross-head) | 250 s | 1.48x | 190 ms | 0.965 | reverted — extra K cost > coverage gain |
+| chunkSize=2048 alone | 200 s | 1.77x | 197 ms | 0.966 | per-chunk overhead amortizes over 2x queries |
+| **V1.3 = chunk2K + IndexCache** | **174 s** | **2.01x** | **169 ms** | **0.967** | first 2x! cross-layer selector reuse |
 
 V1.0 → V1.1 deltas:
 - 90s prefill savings (44% sparse-side reduction) — from killing per-chunk
