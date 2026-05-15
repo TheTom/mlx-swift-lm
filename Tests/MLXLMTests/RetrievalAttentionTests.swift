@@ -4201,6 +4201,23 @@ struct RetrievalAttentionTests {
         let clearEveryN = ProcessInfo.processInfo.environment["F83_CLEAR_EVERY"]
             .flatMap(Int.init) ?? 0
 
+        // F-83 sidecar — when non-nil, the bench harness invokes the
+        // Qwen2Model raContexts overload so attention dispatches through
+        // RetrievalAttentionEngine instead of the wrapper KV cache. The
+        // helpers `runChunkedPrefill` / `runDecode` close over this var
+        // and re-read it per call so the caller can switch paths between
+        // dense and sparse without rewriting helper bodies. Aligned to
+        // `cache` (per-layer); nil entries mark dense-band layers.
+        var currentRaContexts: [RetrievalAttentionContext?]? = nil
+
+        @inline(__always)
+        func callModel(_ x: MLXArray, cache: [KVCache]?) -> MLXArray {
+            if let rcs = currentRaContexts {
+                return model(x, cache: cache, raContexts: rcs)
+            }
+            return model(x, cache: cache)
+        }
+
         func runChunkedPrefill(
             cache: [KVCache], tag: String
         ) -> (prefillSec: Double, lastLogits: MLXArray) {
@@ -4218,7 +4235,7 @@ struct RetrievalAttentionTests {
                     cacheStateSnapshot("\(tag)-chunk\(i)-pre-model", cache)
                     sysmemSnapshot("\(tag)-chunk\(i)-pre-model")
                 }
-                let out = model(y[0..., ..<sz], cache: cache)
+                let out = callModel(y[0..., ..<sz], cache: cache)
                 if shouldSnap {
                     memSnapshot("\(tag)-chunk\(i)-post-model")
                 }
@@ -4370,7 +4387,7 @@ struct RetrievalAttentionTests {
             if usePipelined {
                 // Warmup: run 2 steps with sync eval to populate caches/JIT.
                 for s in 0..<2 {
-                    let out = model(next, cache: cache)
+                    let out = callModel(next, cache: cache)
                     eval(out)
                     next = out[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
                     eval(next)
@@ -4390,7 +4407,7 @@ struct RetrievalAttentionTests {
                     let tt0 = Date()
                     var tok = prevTok
                     for _ in 0..<nDecode {
-                        let out = model(tok, cache: cache)
+                        let out = callModel(tok, cache: cache)
                         tok = out[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
                     }
                     eval(tok)
@@ -4411,7 +4428,7 @@ struct RetrievalAttentionTests {
                 // file-IO contamination of t0..t1.
                 for s in 0..<nDecode {
                     let t0 = Date()
-                    let out = model(queuedTok, cache: cache)
+                    let out = callModel(queuedTok, cache: cache)
                     let nextQueued = out[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
                     asyncEval(nextQueued)
                     eval(queuedTok)
@@ -4454,7 +4471,7 @@ struct RetrievalAttentionTests {
                         return o
                     }
                 } else {
-                    out = model(next, cache: cache)
+                    out = callModel(next, cache: cache)
                     eval(out)
                 }
                 // F-83 sprint iter #1 — capture t1 IMMEDIATELY after eval.
@@ -4598,23 +4615,44 @@ struct RetrievalAttentionTests {
                 + "slidingWindow=\(raCfgSparse.slidingWindow) "
                 + "minContext=\(raCfgSparse.sparsePrefillMinContext) "
                 + "step=\(stepOverride)")
-            let sparseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
-                if tqValueBits > 0 {
-                    return RetrievalAttentionKVCache(
+            // F-83 SIDECAR path — `F83_SIDECAR=1` runs sparse with BARE
+            // `StandardKVCache` + parallel `RetrievalAttentionContext`
+            // list, dispatching through `RetrievalAttentionEngine` via
+            // the new `raContexts:` overload on `Qwen2Model`. This skips
+            // the 57 ms `RetrievalAttentionKVCache` wrapper tax measured
+            // at 128K decode (commit 4a4865a). Goal: sparse decode <
+            // dense decode at 128K, beating Python.
+            let useSidecar = ProcessInfo.processInfo.environment["F83_SIDECAR"] == "1"
+            let sparseCache: [KVCache]
+            if useSidecar {
+                sparseCache = (0..<cfg.hiddenLayers).map { _ in
+                    StandardKVCache(eviction: .unbounded, step: stepOverride)
+                        as KVCache
+                }
+                currentRaContexts = (0..<cfg.hiddenLayers).map { i in
+                    RetrievalAttentionContext(
                         layerIdx: i, totalLayers: cfg.hiddenLayers,
-                        raConfig: raCfgSparse,
-                        ropeBase: cfg.ropeTheta,
-                        valueBits: tqValueBits,
-                        tqStep: stepOverride)
-                } else {
-                    return RetrievalAttentionKVCache(
-                        layerIdx: i, totalLayers: cfg.hiddenLayers,
-                        raConfig: raCfgSparse,
-                        ropeBase: cfg.ropeTheta,
-                        step: stepOverride)
+                        raConfig: raCfgSparse, ropeBase: cfg.ropeTheta)
+                }
+            } else {
+                sparseCache = (0..<cfg.hiddenLayers).map { i in
+                    if tqValueBits > 0 {
+                        return RetrievalAttentionKVCache(
+                            layerIdx: i, totalLayers: cfg.hiddenLayers,
+                            raConfig: raCfgSparse,
+                            ropeBase: cfg.ropeTheta,
+                            valueBits: tqValueBits,
+                            tqStep: stepOverride)
+                    } else {
+                        return RetrievalAttentionKVCache(
+                            layerIdx: i, totalLayers: cfg.hiddenLayers,
+                            raConfig: raCfgSparse,
+                            ropeBase: cfg.ropeTheta,
+                            step: stepOverride)
+                    }
                 }
             }
-            logLine("[F-83-perf-256K] sparse cache: \(tqValueBits > 0 ? "TurboQuant V=\(tqValueBits)bit rawK fp16, tqStep=\(stepOverride)" : "Standard step=\(stepOverride)")")
+            logLine("[F-83-perf-256K] sparse cache: \(useSidecar ? "SIDECAR (bare StandardKV + RAContext list) step=\(stepOverride)" : (tqValueBits > 0 ? "TurboQuant V=\(tqValueBits)bit rawK fp16, tqStep=\(stepOverride)" : "Standard step=\(stepOverride)"))")
             sparse = runChunkedPrefill(cache: sparseCache, tag: "sparse")
             memSnapshot("sparse-after-prefill")
             if skipDecode {

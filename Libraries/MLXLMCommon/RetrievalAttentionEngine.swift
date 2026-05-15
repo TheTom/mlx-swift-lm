@@ -38,11 +38,39 @@ public func retrievalAttentionStep(
         ctx.prefillUpdate(keys: keys)
     }
 
-    // v1: plain SDPA. Sparse decode path will land alongside this once
-    // the F-73 / F-79 helpers are migrated off the wrapper. The dense
-    // path here exists primarily to prove out the architecture's perf
-    // parity with the bare StandardKVCache → ~78 ms/step at 128K vs the
-    // wrapper's ~135 ms.
+    // Decode-step (L == 1) sparse routing through F-73 fused-mask path:
+    // run the selector against the sidecar context's selector index,
+    // build a [1,1,1,T] additive mask on GPU, then call MLXFast SDPA
+    // with that mask. Skips the 57 ms `RetrievalAttentionKVCache`
+    // wrapper tax that V14/V16 measured. Falls through to plain SDPA
+    // when: layer is dense-band, cache hasn't grown past the threshold,
+    // sinks are required (not yet wired into the masked path), or the
+    // selector index isn't populated yet (no L>1 chunks have run).
+    let L = queries.dim(2)
+    let T = cachedKeys.dim(2)
+    let preBudget = retrievalAttentionPreDedupeBudget(config: ctx.raConfig)
+    let threshold = max(preBudget, ctx.raConfig.sparseMinContext)
+    let canGather = L == 1 && ctx.isSparseEligible && T > threshold
+    if canGather && sinks == nil
+        && ctx.raConfig.useFusedMaskBuild
+        && !ctx.raConfig.bypassSelectorDecode
+        && ctx.batchedIndex != nil
+    {
+        let qFlat = queries[0, 0..., 0, 0...]
+        let raMask = ctx.buildAttentionMaskFusedKernel(
+            q: qFlat, dtype: cachedKeys.dtype, T: T, offset: cache.offset
+        )
+        return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+            MLXFast.scaledDotProductAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                scale: scale, mask: .array(raMask), sinks: sinks
+            )
+        }
+    }
+
+    // Default: plain dense SDPA. Used for dense-band layers, short
+    // contexts, sinks-using models, or when sparse path opts itself
+    // out via `bypassSelectorDecode`.
     return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
         MLXFast.scaledDotProductAttention(
             queries: queries, keys: cachedKeys, values: cachedValues,

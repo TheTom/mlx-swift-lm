@@ -95,4 +95,72 @@ public final class RetrievalAttentionContext {
             batchedIndex!.update(newKeys: keysF32)
         }
     }
+
+    /// F-73 fused-mask-build for decode. Mirrors
+    /// `RetrievalAttentionKVCache.buildAttentionMaskFusedKernel` but
+    /// works against the sidecar context — used by the new
+    /// `retrievalAttentionStep` engine path so sparse decode doesn't pay
+    /// the 57 ms wrapper tax. F-79 amortization is preserved.
+    ///
+    /// - Parameters:
+    ///   - q: `[nHeads, dHead]` — current query, post-RoPE.
+    ///   - dtype: output mask dtype (matches K/V dtype).
+    ///   - T: total prior-context length (`cachedKeys.dim(2)`).
+    ///   - offset: cache.offset, used for F-79 amortization gating.
+    /// - Returns: `[1, 1, 1, T]` additive mask (0 at attended positions,
+    ///   -inf elsewhere). Pass to MLXFast SDPA as `mask: .array(...)`.
+    public func buildAttentionMaskFusedKernel(
+        q: MLXArray, dtype: DType, T: Int, offset: Int
+    ) -> MLXArray {
+        precondition(q.shape.count == 2, "expected [nHeads, dHead]")
+        guard let index = batchedIndex else {
+            fatalError("buildAttentionMaskFusedKernel: selector index not initialized; "
+                + "context.prefillUpdate must run on at least one L>1 chunk first")
+        }
+        let nQHeads = q.dim(0)
+        precondition(
+            nQHeads % index.nKVHeads == 0,
+            "Q heads (\(nQHeads)) must be a multiple of KV heads (\(index.nKVHeads))")
+        let groupSize = nQHeads / index.nKVHeads
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray(
+                (0..<index.nKVHeads).map { Int32($0 * groupSize) }
+            )
+            eval(cachedHeadIdx!)
+        }
+
+        // F-79 amortization — reuse top-K from prior call across
+        // `selectorAmortization` consecutive decode steps; only refresh
+        // when offset has advanced past the window. Mask itself rebuilds
+        // every step so the sliding window stays current.
+        let amort = max(1, raConfig.selectorAmortization)
+        let needRefresh = (cachedFineStarts == nil)
+            || (offset - lastRefreshOffset) >= amort
+        let fineStarts: MLXArray
+        let coarseStarts: MLXArray
+        if needRefresh {
+            let qStacked = q.take(cachedHeadIdx!, axis: 0).asType(.float32)
+            let projQ = index.projectQueriesBatched(qStacked)
+            let (f, c) = index.topKBlockStartsAllHeadsCombinedGPU(projectedQ: projQ)
+            cachedFineStarts = f
+            cachedCoarseStarts = c
+            lastRefreshOffset = offset
+            fineStarts = f
+            coarseStarts = c
+        } else {
+            fineStarts = cachedFineStarts!
+            coarseStarts = cachedCoarseStarts!
+        }
+
+        return retrievalAttentionBuildMaskFused(
+            fineStarts: fineStarts,
+            coarseStarts: coarseStarts,
+            T: T,
+            staticInit: raConfig.staticInit,
+            slidingWindow: raConfig.slidingWindow,
+            fineBS: raConfig.fineBlockSize,
+            coarseBS: raConfig.coarseBlockSize,
+            outputDtype: dtype
+        )
+    }
 }
