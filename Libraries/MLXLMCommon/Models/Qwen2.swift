@@ -131,6 +131,18 @@ public enum Qwen2 {
 
     // MARK: - MLP
 
+    /// Fused swiglu — silu(gate) * up as a single compiled Metal kernel.
+    /// Mirrors `mlx-lm`'s `@partial(mx.compile, shapeless=True)` swiglu in
+    /// `mlx_lm/models/activations.py`. At decode time on Qwen2-14B at 16K,
+    /// the unfused form (silu(gate(x)) * up(x)) costs two kernel
+    /// dispatches per layer (one for silu, one for elementwise mul) — at
+    /// ~80-100 µs each per layer × 48 layers, that's ~8 ms/step. Fusing
+    /// matches Python's path.
+    private static let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { gate, up in
+            silu(gate) * up
+        }
+
     public class MLP: Module, UnaryLayer {
         @ModuleInfo(key: "gate_proj") var gate: Linear
         @ModuleInfo(key: "down_proj") var down: Linear
@@ -144,7 +156,7 @@ public enum Qwen2 {
         }
 
         public func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(silu(gate(x)) * up(x))
+            down(Qwen2.compiledSwiglu(gate(x), up(x)))
         }
     }
 
@@ -171,6 +183,31 @@ public enum Qwen2 {
         public func callAsFunction(
             _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
         ) -> MLXArray {
+            // F83_PROFILE_DECODE=1 — force eval per phase to attribute GPU
+            // time. Breaks lazy fusion, so absolute numbers are inflated
+            // vs steady-state, but the RELATIVE breakdown shows where
+            // dispatches go. Single-layer profile from layer 0 first
+            // iteration is enough to isolate hot phases.
+            if ProcessInfo.processInfo.environment["F83_PROFILE_DECODE"] == "1" {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let n1 = inputLayerNorm(x); eval(n1)
+                let t1 = CFAbsoluteTimeGetCurrent()
+                let r = attention(n1, mask: mask, cache: cache); eval(r)
+                let t2 = CFAbsoluteTimeGetCurrent()
+                let h = x + r; eval(h)
+                let t3 = CFAbsoluteTimeGetCurrent()
+                let n2 = postAttentionLayerNorm(h); eval(n2)
+                let t4 = CFAbsoluteTimeGetCurrent()
+                let m = mlp(n2); eval(m)
+                let t5 = CFAbsoluteTimeGetCurrent()
+                let out = h + m; eval(out)
+                let t6 = CFAbsoluteTimeGetCurrent()
+                let toMs = { (a: CFAbsoluteTime, b: CFAbsoluteTime) in (b - a) * 1000 }
+                FileHandle.standardError.write(Data(
+                    "[QWEN2-PROFILE] in_norm=\(String(format: "%.3f", toMs(t0,t1)))ms attn=\(String(format: "%.3f", toMs(t1,t2)))ms res1=\(String(format: "%.3f", toMs(t2,t3)))ms post_norm=\(String(format: "%.3f", toMs(t3,t4)))ms mlp=\(String(format: "%.3f", toMs(t4,t5)))ms res2=\(String(format: "%.3f", toMs(t5,t6)))ms total=\(String(format: "%.3f", toMs(t0,t6)))ms\n"
+                        .utf8))
+                return out
+            }
             let r = attention(inputLayerNorm(x), mask: mask, cache: cache)
             let h = x + r
             return h + mlp(postAttentionLayerNorm(h))

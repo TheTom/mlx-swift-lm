@@ -4347,6 +4347,11 @@ struct RetrievalAttentionTests {
                 + "layer0.inner.K.shape=\(innerShape)")
         }
 
+        // F83_DECODE_STREAM=1 mirror of mlx-lm Python's `generation_stream`.
+        // Lazily-built dedicated GPU stream. Single allocation per bench;
+        // reused across all decode steps and both dense/sparse paths.
+        let decodeStream = MLX.Stream(MLX.Device.gpu)
+
         func runDecode(cache: [KVCache], tag: String) -> [Double] {
             memSnapshot("\(tag)-decode-pre-start")
             sysmemSnapshot("\(tag)-decode-pre-start")
@@ -4359,12 +4364,27 @@ struct RetrievalAttentionTests {
                 sysmemSnapshot("\(tag)-decode-step\(s)-pre")
                 cacheStateSnapshot("\(tag)-decode-step\(s)-pre", cache)
                 let t0 = Date()
-                let out = model(next, cache: cache)
+                // F83_DECODE_STREAM=1 wraps the decode step in a dedicated
+                // GPU stream — Python `mlx-lm` uses `with mx.stream(generation_stream)`
+                // for every decode step. Isolates kernel dispatch from
+                // default-stream housekeeping. Research-agent estimate
+                // 4-6 ms/step at 128K decode for Qwen14B.
+                let useDecodeStream = ProcessInfo.processInfo.environment["F83_DECODE_STREAM"] == "1"
+                let out: MLXArray
+                if useDecodeStream {
+                    out = MLX.Stream.withStream(decodeStream) {
+                        let o = model(next, cache: cache)
+                        eval(o)
+                        return o
+                    }
+                } else {
+                    out = model(next, cache: cache)
+                    eval(out)
+                }
                 logLine("[F-83-perf-256K] \(tag) decode step=\(s) model returned (lazy), about to eval")
                 memSnapshot("\(tag)-decode-step\(s)-post-model")
                 sysmemSnapshot("\(tag)-decode-step\(s)-post-model")
                 cacheStateSnapshot("\(tag)-decode-step\(s)-post-model", cache)
-                eval(out)
                 let t1 = Date().timeIntervalSince(t0) * 1000
                 ms.append(t1)
                 logLine("[F-83-perf-256K] \(tag) decode step=\(s) eval done")
@@ -4469,6 +4489,16 @@ struct RetrievalAttentionTests {
             var raCfgSparse = RetrievalAttentionConfig()
             raCfgSparse.sparsePrefillEnabled = true
             raCfgSparse.bypassSelectorDecode = bypassSelectorDecode
+            // F-83 north-star — `F83_PER_HEAD_GATHER=1` switches the decode
+            // sparse path from F-73 fused-mask-build (which still reads all
+            // T positions through masked SDPA) to F-70 per-KV-head gather
+            // (each head reads its own ~2080 positions; SDPA shape collapses
+            // to [nKVH, groupSize, 1, K_padded]). Bandwidth/compute drops
+            // ~60x for the attention call at 128K.
+            if ProcessInfo.processInfo.environment["F83_PER_HEAD_GATHER"] == "1" {
+                raCfgSparse.usePerKVHeadGather = true
+                raCfgSparse.useFusedMaskBuild = false
+            }
             if let g = ProcessInfo.processInfo.environment["F83_GROUP_SIZE"]
                 .flatMap(Int.init) {
                 raCfgSparse.sparsePrefillSelectorGroupSize = g
