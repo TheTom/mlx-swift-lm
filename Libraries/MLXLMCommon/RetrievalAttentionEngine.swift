@@ -52,19 +52,29 @@ public func retrievalAttentionStep(
     let threshold = max(preBudget, ctx.raConfig.sparseMinContext)
     let canGather = L == 1 && ctx.isSparseEligible && T > threshold
     if canGather && sinks == nil
-        && ctx.raConfig.useFusedMaskBuild
         && !ctx.raConfig.bypassSelectorDecode
         && ctx.batchedIndex != nil
     {
         let qFlat = queries[0, 0..., 0, 0...]
-        let raMask = ctx.buildAttentionMaskFusedKernel(
-            q: qFlat, dtype: cachedKeys.dtype, T: T, offset: cache.offset
-        )
-        return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
-            MLXFast.scaledDotProductAttention(
+        // F-70 per-KV-head gather is the path that ACTUALLY reduces
+        // K/V bandwidth: SDPA shape collapses from [1,nQH,1,T] (~131K
+        // K positions @128K) to [1,nQH,1,K_padded] (~2k positions).
+        // F-73 mask path only saves compute via -inf skip but still
+        // loads all K/V.
+        if ctx.raConfig.usePerKVHeadGather {
+            return ctx.perKVHeadGatherAndAttend(
                 queries: queries, keys: cachedKeys, values: cachedValues,
-                scale: scale, mask: .array(raMask), sinks: sinks
-            )
+                qHeads: qFlat, scale: scale)
+        }
+        if ctx.raConfig.useFusedMaskBuild {
+            let raMask = ctx.buildAttentionMaskFusedKernel(
+                q: qFlat, dtype: cachedKeys.dtype, T: T, offset: cache.offset)
+            return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: cachedKeys, values: cachedValues,
+                    scale: scale, mask: .array(raMask), sinks: sinks
+                )
+            }
         }
     }
 

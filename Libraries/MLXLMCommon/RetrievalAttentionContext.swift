@@ -163,4 +163,68 @@ public final class RetrievalAttentionContext {
             outputDtype: dtype
         )
     }
+
+    /// F-70 per-KV-head sorted-gather + batched SDPA. The whole point:
+    /// SDPA shape collapses from `[1, nQH, 1, T]` (full cache) to
+    /// `[1, nQH, 1, K_padded]` where `K_padded ≈ static + sliding +
+    /// top-K-fine + top-K-coarse ≈ 2k` at 128K. Reads ~2% of K/V
+    /// instead of all of it — the actual sparse bandwidth win F-73's
+    /// mask path doesn't realize.
+    ///
+    /// Mirrors `RetrievalAttentionKVCache.perKVHeadGatherAndAttend`
+    /// against the sidecar context. Caller passes the cached K/V from
+    /// `cache.update`.
+    public func perKVHeadGatherAndAttend(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        qHeads: MLXArray,
+        scale: Float
+    ) -> MLXArray {
+        precondition(qHeads.shape.count == 2, "expected [nHeads, dHead]")
+        precondition(keys.shape.count == 4, "expected [B, nKVH, T, D]")
+        guard let index = batchedIndex else {
+            fatalError("perKVHeadGatherAndAttend: selector index not initialized")
+        }
+        let T = keys.dim(2)
+        let nKVH = keys.dim(1)
+        let nQH = queries.dim(1)
+        precondition(nQH % nKVH == 0)
+        let groupSize = nQH / nKVH
+
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray((0..<nKVH).map { Int32($0 * groupSize) })
+            eval(cachedHeadIdx!)
+        }
+        let qStacked = qHeads.take(cachedHeadIdx!, axis: 0).asType(.float32)
+        let projQ = index.projectQueriesBatched(qStacked)
+
+        let (gather, kPadded) = index.perKVHeadGatherGPU(
+            projectedQ: projQ, seqLen: T)
+
+        let gatherForTake = gather.expandedDimensions(axes: [0, 3])
+        let gatheredK = takeAlong(keys, gatherForTake, axis: 2)
+        let gatheredV = takeAlong(values, gatherForTake, axis: 2)
+
+        let prev = gather[0..., 0 ..< (kPadded - 1)]
+        let curr = gather[0..., 1 ..< kPadded]
+        let dupInner = (curr .== prev)
+        let leadFalse = MLXArray.zeros([nKVH, 1], dtype: .bool)
+        let dupMask = concatenated([leadFalse, dupInner], axis: 1)
+        let zeroLike = MLXArray(Float(0)).asType(keys.dtype)
+        let negInfLike = MLXArray(-Float.infinity).asType(keys.dtype)
+        let baseMask = MLX.where(dupMask, negInfLike, zeroLike)
+            .reshaped(1, nKVH, 1, 1, kPadded)
+        let expanded = broadcast(
+            baseMask, to: [1, nKVH, groupSize, 1, kPadded])
+        let addMask = expanded.reshaped(1, nKVH * groupSize, 1, kPadded)
+
+        return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+            MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: gatheredK, values: gatheredV,
+                scale: scale, mask: .array(addMask), sinks: nil
+            )
+        }
+    }
 }
