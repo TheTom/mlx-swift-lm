@@ -19,6 +19,25 @@
   pre-allocated inner KV step, sparse decode lands at 102.3 ms ≈ dense's
   99.7 ms (2.6% slower, within run-to-run noise).
 
+## RA cache wrapper bisect at 128K (V13-V16) — the wrapper itself is the cost
+
+| Run | Cache | Decode median | Decode tok/s | Notes |
+|---|---|---|---|---|
+| **V15** | **BARE StandardKVCache** | **78.5 ms** | **12.74** | steady 78-81 ms across all 9 steady steps |
+| V11 | RA wrap, useFusedMaskBuild=true (default) | 99.7 ms | 10.03 | F-73 mask path; -inf gates positions |
+| V12 | RA wrap, sparse prefill on | 102.3 ms | 9.78 | same F-73 path at decode |
+| V14 | RA wrap, bypassSelectorDecode=true (case .retrievalSparse → plain SDPA) | 137.0 ms | 7.30 | steady 134-137 ms |
+| V16 | RA wrap, storageKind=.raw dynamic (case .raw → plain SDPA via cache.update on wrapper) | 140.4 ms | 7.12 | steady 134-143 ms |
+
+Findings:
+- V14 vs V16: dispatcher arm doesn't matter — both `.retrievalSparse` and `.raw` arms produce ~135 ms when the cache is a `RetrievalAttentionKVCache`. **The dispatcher route hypothesis is wrong.**
+- V15 vs V14/V16: removing the RA wrapper entirely drops decode from ~135 ms to 78.5 ms (-57 ms). **The wrapper class itself is the cost**, not the dispatcher branch.
+- V11 (F-73 mask path) being 99 ms is FASTER than V14/V16 plain SDPA (137 ms) on the wrapped cache — sdpa_vector kernel skips K/V loads on -inf masked positions, recovering some of the wrapper tax. Without the mask gate (bypass=true), the wrapper tax is fully exposed.
+
+What's in the wrapper that costs 57 ms? `RetrievalAttentionKVCache.update` at L=1 does: `inner.update(K,V)`, then early-returns when `!isSparseEligible` (most layers) OR returns after `ensureIndex` no-op + L=1 guard. Pure Swift, no extra GPU work. The cost must be in lazy-graph structure (different DAG shape post-prefill due to selector ops sitting in the graph), MLX kernel specialization keyed on cache type, or memory layout fragmentation from selector allocations interleaved with K/V buffers.
+
+Decision: refactor — kill the wrapper. The K/V cache becomes `StandardKVCache` (or `TurboQuantizedKVCache`). The selector state moves to a parallel `RetrievalAttentionContext` held per-layer. Sparse paths become free functions on `(cache, ctx)`. See `F83_REFACTOR_PLAN.md`.
+
 ## mlx-lm Python baseline at 128K — apples-to-apples (KNOWN REGRESSION)
 
 Vanilla mlx-lm Python (0.31.2) on the same Qwen2.5-14B-1M-4bit weights,

@@ -4397,20 +4397,56 @@ struct RetrievalAttentionTests {
         let stepDefault = prefillLen + nDecode + 1024
         let stepOverride = ProcessInfo.processInfo.environment["F83_STEP"]
             .flatMap(Int.init) ?? stepDefault
+        // F-83 TurboQuant+ composition. When `F83_TQ_V_BITS > 0` the inner
+        // cache becomes a TurboQuantizedKVCache in rawKeyMode (K stays FP16
+        // so the RA selector still works), with V compressed at the given
+        // bitwidth. tqStep is pinned to stepOverride so the TQ buffer
+        // pre-allocates the same way the StandardKVCache does — V10 at 256K
+        // proved per-chunk realloc costs ~45 GB at 256K.
+        let tqValueBits = ProcessInfo.processInfo.environment["F83_TQ_V_BITS"]
+            .flatMap(Int.init) ?? 0
         var dense: (prefillSec: Double, lastLogits: MLXArray) =
             (-1, MLXArray.zeros([0]))
         var denseDecMedian: Double = -1
+        // F-83 north-star: dense decode should match vanilla mlx-lm Python
+        // (70.5 ms/step at 128K). `F83_BYPASS_SELECTOR_DECODE=1` falls
+        // through to dense MLXFast SDPA at decode, skipping the F-73 mask
+        // build that AttentionUtils routes sparse-eligible layers through
+        // even when sparsePrefillEnabled=false. Diagnostic toggle for the
+        // 30 ms/step regression.
+        let bypassSelectorDecode = ProcessInfo.processInfo.environment["F83_BYPASS_SELECTOR_DECODE"] == "1"
+        // F-83 diagnostic — F83_BARE=1 swaps the dense-path cache from
+        // RetrievalAttentionKVCache to a vanilla StandardKVCache.
+        // Mirrors what mlx-lm Python uses, with zero RA-wrapper overhead.
+        // If this matches Python's 70.5 ms decode, the regression lives in
+        // the RA cache wrapper / dispatch. If still slow, it's deeper
+        // (model attention path, SDPA dispatch, binding).
+        let useBareCache = ProcessInfo.processInfo.environment["F83_BARE"] == "1"
         if runDense_ {
             logLine("[F-83-perf-256K] === DENSE CHUNKED PREFILL ===")
             var raCfgDense = RetrievalAttentionConfig()
             raCfgDense.sparsePrefillEnabled = false
+            raCfgDense.bypassSelectorDecode = bypassSelectorDecode
             let denseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
-                RetrievalAttentionKVCache(
-                    layerIdx: i, totalLayers: cfg.hiddenLayers,
-                    raConfig: raCfgDense,
-                    ropeBase: cfg.ropeTheta,
-                    step: stepOverride)
+                if useBareCache {
+                    return StandardKVCache(eviction: .unbounded, step: stepOverride) as KVCache
+                }
+                if tqValueBits > 0 {
+                    return RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raCfgDense,
+                        ropeBase: cfg.ropeTheta,
+                        valueBits: tqValueBits,
+                        tqStep: stepOverride)
+                } else {
+                    return RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raCfgDense,
+                        ropeBase: cfg.ropeTheta,
+                        step: stepOverride)
+                }
             }
+            logLine("[F-83-perf-256K] dense cache: \(useBareCache ? "BARE StandardKVCache step=\(stepOverride)" : (tqValueBits > 0 ? "TurboQuant V=\(tqValueBits)bit rawK fp16, tqStep=\(stepOverride)" : "RA wrap StandardKVCache step=\(stepOverride)"))")
             dense = runChunkedPrefill(cache: denseCache, tag: "dense")
             if skipDecode {
                 logLine("[F-83-perf-256K] dense decode SKIPPED (F83_SKIP_DECODE=1)")
@@ -4432,6 +4468,7 @@ struct RetrievalAttentionTests {
             F83SelectorReuseCache.clear()
             var raCfgSparse = RetrievalAttentionConfig()
             raCfgSparse.sparsePrefillEnabled = true
+            raCfgSparse.bypassSelectorDecode = bypassSelectorDecode
             if let g = ProcessInfo.processInfo.environment["F83_GROUP_SIZE"]
                 .flatMap(Int.init) {
                 raCfgSparse.sparsePrefillSelectorGroupSize = g
@@ -4451,12 +4488,22 @@ struct RetrievalAttentionTests {
                 + "minContext=\(raCfgSparse.sparsePrefillMinContext) "
                 + "step=\(stepOverride)")
             let sparseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
-                RetrievalAttentionKVCache(
-                    layerIdx: i, totalLayers: cfg.hiddenLayers,
-                    raConfig: raCfgSparse,
-                    ropeBase: cfg.ropeTheta,
-                    step: stepOverride)
+                if tqValueBits > 0 {
+                    return RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raCfgSparse,
+                        ropeBase: cfg.ropeTheta,
+                        valueBits: tqValueBits,
+                        tqStep: stepOverride)
+                } else {
+                    return RetrievalAttentionKVCache(
+                        layerIdx: i, totalLayers: cfg.hiddenLayers,
+                        raConfig: raCfgSparse,
+                        ropeBase: cfg.ropeTheta,
+                        step: stepOverride)
+                }
             }
+            logLine("[F-83-perf-256K] sparse cache: \(tqValueBits > 0 ? "TurboQuant V=\(tqValueBits)bit rawK fp16, tqStep=\(stepOverride)" : "Standard step=\(stepOverride)")")
             sparse = runChunkedPrefill(cache: sparseCache, tag: "sparse")
             memSnapshot("sparse-after-prefill")
             if skipDecode {
