@@ -4234,111 +4234,127 @@ struct RetrievalAttentionTests {
             return ms
         }
 
+        // F83_PATH=both|dense|sparse — run a single side for memory-constrained
+        // benches (256K can't fit both dense + sparse 30 GB caches together
+        // on a 64 GB box). Default `both`.
+        let pathMode = ProcessInfo.processInfo.environment["F83_PATH"] ?? "both"
+        let runDense_ = pathMode == "both" || pathMode == "dense"
+        let runSparse_ = pathMode == "both" || pathMode == "sparse"
+        logLine("[F-83-perf-256K] path mode: \(pathMode) (dense=\(runDense_) sparse=\(runSparse_))")
+
         // Dense baseline.
-        logLine("[F-83-perf-256K] === DENSE CHUNKED PREFILL ===")
         F83SelectorReuseCache.clear()
         let stepOverride = ProcessInfo.processInfo.environment["F83_STEP"]
             .flatMap(Int.init) ?? 256
-        var raCfgDense = RetrievalAttentionConfig()
-        raCfgDense.sparsePrefillEnabled = false
-        let denseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
-            RetrievalAttentionKVCache(
-                layerIdx: i, totalLayers: cfg.hiddenLayers,
-                raConfig: raCfgDense,
-                ropeBase: cfg.ropeTheta,
-                step: stepOverride)
-        }
-        let dense = runChunkedPrefill(cache: denseCache, tag: "dense")
-        let denseDecMedian: Double
-        if skipDecode {
-            denseDecMedian = -1
-            logLine("[F-83-perf-256K] dense decode SKIPPED (F83_SKIP_DECODE=1)")
-        } else {
-            let denseDecMs = runDecode(cache: denseCache, tag: "dense")
-            denseDecMedian = denseDecMs.suffix(nDecode).sorted()[nDecode / 2]
-            logLine("[F-83-perf-256K] dense decode median (last \(nDecode))=\(String(format: "%.1f", denseDecMedian))ms")
+        var dense: (prefillSec: Double, lastLogits: MLXArray) =
+            (-1, MLXArray.zeros([0]))
+        var denseDecMedian: Double = -1
+        if runDense_ {
+            logLine("[F-83-perf-256K] === DENSE CHUNKED PREFILL ===")
+            var raCfgDense = RetrievalAttentionConfig()
+            raCfgDense.sparsePrefillEnabled = false
+            let denseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raCfgDense,
+                    ropeBase: cfg.ropeTheta,
+                    step: stepOverride)
+            }
+            dense = runChunkedPrefill(cache: denseCache, tag: "dense")
+            if skipDecode {
+                logLine("[F-83-perf-256K] dense decode SKIPPED (F83_SKIP_DECODE=1)")
+            } else {
+                let denseDecMs = runDecode(cache: denseCache, tag: "dense")
+                denseDecMedian = denseDecMs.suffix(nDecode).sorted()[nDecode / 2]
+                logLine("[F-83-perf-256K] dense decode median (last \(nDecode))=\(String(format: "%.1f", denseDecMedian))ms")
+            }
         }
 
         MLX.GPU.clearCache()
 
         // Sparse path.
-        logLine("[F-83-perf-256K] === SPARSE CHUNKED PREFILL ===")
-        F83SelectorReuseCache.clear()
-        var raCfgSparse = RetrievalAttentionConfig()
-        raCfgSparse.sparsePrefillEnabled = true
-        // Allow env-driven sweep of the IndexCache group size and the
-        // sliding window — both shift the sparse SDPA K dim and the
-        // selector run frequency.
-        if let g = ProcessInfo.processInfo.environment["F83_GROUP_SIZE"]
-            .flatMap(Int.init) {
-            raCfgSparse.sparsePrefillSelectorGroupSize = g
+        var sparse: (prefillSec: Double, lastLogits: MLXArray) =
+            (-1, MLXArray.zeros([0]))
+        var sparseDecMedian: Double = -1
+        if runSparse_ {
+            logLine("[F-83-perf-256K] === SPARSE CHUNKED PREFILL ===")
+            F83SelectorReuseCache.clear()
+            var raCfgSparse = RetrievalAttentionConfig()
+            raCfgSparse.sparsePrefillEnabled = true
+            if let g = ProcessInfo.processInfo.environment["F83_GROUP_SIZE"]
+                .flatMap(Int.init) {
+                raCfgSparse.sparsePrefillSelectorGroupSize = g
+            }
+            if let sw = ProcessInfo.processInfo.environment["F83_SLIDING_WINDOW"]
+                .flatMap(Int.init) {
+                raCfgSparse.slidingWindow = sw
+            }
+            if let ftk = ProcessInfo.processInfo.environment["F83_FINE_TOPK"]
+                .flatMap(Int.init) {
+                raCfgSparse.sparsePrefillFineTopK = ftk
+            }
+            logLine("[F-83-perf-256K] sparse cfg: chunkSize=\(chunkSize) "
+                + "fineTopK=\(raCfgSparse.sparsePrefillFineTopK) "
+                + "groupSize=\(raCfgSparse.sparsePrefillSelectorGroupSize) "
+                + "slidingWindow=\(raCfgSparse.slidingWindow) "
+                + "minContext=\(raCfgSparse.sparsePrefillMinContext) "
+                + "step=\(stepOverride)")
+            let sparseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
+                RetrievalAttentionKVCache(
+                    layerIdx: i, totalLayers: cfg.hiddenLayers,
+                    raConfig: raCfgSparse,
+                    ropeBase: cfg.ropeTheta,
+                    step: stepOverride)
+            }
+            sparse = runChunkedPrefill(cache: sparseCache, tag: "sparse")
+            if skipDecode {
+                logLine("[F-83-perf-256K] sparse decode SKIPPED (F83_SKIP_DECODE=1)")
+            } else {
+                let sparseDecMs = runDecode(cache: sparseCache, tag: "sparse")
+                sparseDecMedian = sparseDecMs.suffix(nDecode).sorted()[nDecode / 2]
+                logLine("[F-83-perf-256K] sparse decode median (last \(nDecode))=\(String(format: "%.1f", sparseDecMedian))ms")
+            }
         }
-        if let sw = ProcessInfo.processInfo.environment["F83_SLIDING_WINDOW"]
-            .flatMap(Int.init) {
-            raCfgSparse.slidingWindow = sw
-        }
-        if let ftk = ProcessInfo.processInfo.environment["F83_FINE_TOPK"]
-            .flatMap(Int.init) {
-            raCfgSparse.sparsePrefillFineTopK = ftk
-        }
-        logLine("[F-83-perf-256K] sparse cfg: chunkSize=\(chunkSize) "
-            + "fineTopK=\(raCfgSparse.sparsePrefillFineTopK) "
-            + "groupSize=\(raCfgSparse.sparsePrefillSelectorGroupSize) "
-            + "slidingWindow=\(raCfgSparse.slidingWindow) "
-            + "minContext=\(raCfgSparse.sparsePrefillMinContext) "
-            + "step=\(stepOverride)")
-        let sparseCache: [KVCache] = (0..<cfg.hiddenLayers).map { i in
-            RetrievalAttentionKVCache(
-                layerIdx: i, totalLayers: cfg.hiddenLayers,
-                raConfig: raCfgSparse,
-                ropeBase: cfg.ropeTheta,
-                step: stepOverride)
-        }
-        let sparse = runChunkedPrefill(cache: sparseCache, tag: "sparse")
-        let sparseDecMedian: Double
-        if skipDecode {
-            sparseDecMedian = -1
-            logLine("[F-83-perf-256K] sparse decode SKIPPED (F83_SKIP_DECODE=1)")
+
+        // Final-token logit cosine (only when both paths ran).
+        if runDense_ && runSparse_ {
+            func sanitize(_ a: MLXArray) -> (MLXArray, Float, Float, Bool) {
+                let f = a.asType(.float32)
+                let hasNan = isNaN(f).any().asArray(Bool.self)[0]
+                let mn = f.min().asArray(Float.self)[0]
+                let mx = f.max().asArray(Float.self)[0]
+                let clean = MLX.where(isFinite(f), f, MLXArray(Float(0)))
+                return (clean, mn, mx, hasNan)
+            }
+            let (d, dMin, dMax, dHasNan) = sanitize(dense.lastLogits)
+            let (r, sMin, sMax, sHasNan) = sanitize(sparse.lastLogits)
+            logLine("[F-83-perf-256K] dense logit range=[\(dMin), \(dMax)] hasNaN=\(dHasNan)")
+            logLine("[F-83-perf-256K] sparse logit range=[\(sMin), \(sMax)] hasNaN=\(sHasNan)")
+            let dot = (d * r).sum().asArray(Float.self)[0]
+            let dn = sqrt((d * d).sum()).asArray(Float.self)[0]
+            let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
+            let cos = dot / (dn * rn + Float(1e-12))
+            let speedup = dense.prefillSec / sparse.prefillSec
+            logLine("[F-83-perf-256K] === SUMMARY ===")
+            logLine("[F-83-perf-256K] T=256K dense_prefill=\(String(format: "%.1f", dense.prefillSec))s "
+                + "sparse_prefill=\(String(format: "%.1f", sparse.prefillSec))s "
+                + "speedup=\(String(format: "%.2fx", speedup))")
+            logLine("[F-83-perf-256K] decode_dense=\(String(format: "%.1f", denseDecMedian))ms "
+                + "decode_sparse=\(String(format: "%.1f", sparseDecMedian))ms")
+            logLine("[F-83-perf-256K] final-logit cosine sparse-vs-dense=\(String(format: "%.5f", cos))")
         } else {
-            let sparseDecMs = runDecode(cache: sparseCache, tag: "sparse")
-            sparseDecMedian = sparseDecMs.suffix(nDecode).sorted()[nDecode / 2]
-            logLine("[F-83-perf-256K] sparse decode median (last \(nDecode))=\(String(format: "%.1f", sparseDecMedian))ms")
+            logLine("[F-83-perf-256K] === SUMMARY (single-path) ===")
+            if runDense_ {
+                logLine("[F-83-perf-256K] dense_prefill=\(String(format: "%.1f", dense.prefillSec))s "
+                    + "decode=\(String(format: "%.1f", denseDecMedian))ms")
+            }
+            if runSparse_ {
+                logLine("[F-83-perf-256K] sparse_prefill=\(String(format: "%.1f", sparse.prefillSec))s "
+                    + "decode=\(String(format: "%.1f", sparseDecMedian))ms")
+            }
         }
-
-        // Final-token logit cosine for quality regression catch.
-        // NaN-defensive: at long context with random tokens, FP16
-        // activations can overflow. Cast to FP32, replace ±inf/NaN
-        // with 0, log min/max for diagnosis.
-        func sanitize(_ a: MLXArray) -> (MLXArray, Float, Float, Bool) {
-            let f = a.asType(.float32)
-            let hasNan = isNaN(f).any().asArray(Bool.self)[0]
-            let mn = f.min().asArray(Float.self)[0]
-            let mx = f.max().asArray(Float.self)[0]
-            // Replace nan/inf with 0 so cosine math doesn't blow up.
-            let clean = MLX.where(isFinite(f), f, MLXArray(Float(0)))
-            return (clean, mn, mx, hasNan)
-        }
-        let (d, dMin, dMax, dHasNan) = sanitize(dense.lastLogits)
-        let (r, sMin, sMax, sHasNan) = sanitize(sparse.lastLogits)
-        logLine("[F-83-perf-256K] dense logit range=[\(dMin), \(dMax)] hasNaN=\(dHasNan)")
-        logLine("[F-83-perf-256K] sparse logit range=[\(sMin), \(sMax)] hasNaN=\(sHasNan)")
-        let dot = (d * r).sum().asArray(Float.self)[0]
-        let dn = sqrt((d * d).sum()).asArray(Float.self)[0]
-        let rn = sqrt((r * r).sum()).asArray(Float.self)[0]
-        let cos = dot / (dn * rn + Float(1e-12))
-
-        let speedup = dense.prefillSec / sparse.prefillSec
-        logLine("[F-83-perf-256K] === SUMMARY ===")
-        logLine("[F-83-perf-256K] T=256K dense_prefill=\(String(format: "%.1f", dense.prefillSec))s "
-            + "sparse_prefill=\(String(format: "%.1f", sparse.prefillSec))s "
-            + "speedup=\(String(format: "%.2fx", speedup))")
-        logLine("[F-83-perf-256K] decode_dense=\(String(format: "%.1f", denseDecMedian))ms "
-            + "decode_sparse=\(String(format: "%.1f", sparseDecMedian))ms")
-        logLine("[F-83-perf-256K] final-logit cosine sparse-vs-dense=\(String(format: "%.5f", cos))")
         logLine("[F-83-perf-256K] finished at \(Date())")
-        // No hard expects — this is the perf bench, results go to the log.
-        // Tests are #expect 1==1 to keep the suite green so the data stays.
-        #expect(speedup > 0)
+        #expect(true)
     }
 
     // F-79 cross-architecture validation on Qwen3-0.6B-4bit.
