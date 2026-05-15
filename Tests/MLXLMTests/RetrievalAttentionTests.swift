@@ -4164,14 +4164,18 @@ struct RetrievalAttentionTests {
         // contexts.
         let skipDecode = ProcessInfo.processInfo.environment["F83_SKIP_DECODE"] == "1"
         let nDecode = 8
-        // Raise MLX's memory limit and the wired-buffer limit. M5 Max
-        // has 64 GB unified memory; default MLX caps are conservative.
-        _ = MLX.GPU.set(memoryLimit: 62 * 1024 * 1024 * 1024)  // 62 GB
-        let memLimitEnv = ProcessInfo.processInfo.environment["F83_MEM_LIMIT_GB"]
-            .flatMap(Int.init)
-        if let m = memLimitEnv {
-            _ = MLX.GPU.set(memoryLimit: m * 1024 * 1024 * 1024)
-        }
+        // F-83 V1.5 — lower memoryLimit to activate MLX's built-in back-
+        // pressure during chunked asyncEval prefill. Default
+        // memory_limit = 1.5 × recommendedMaxWorkingSetSize (~96 GB on
+        // 64 GB box), which is HIGHER than physical → no back-pressure
+        // ever fires and Metal command-buffer completion handlers pin
+        // unbounded buffers via shared_ptr (Cmlx eval.cpp:48-58). Drop
+        // to 40 GB so transforms.cpp:264-278's wait_for_one loop bounds
+        // the in-flight queue. Active memory plateaus near the limit.
+        let memLimitGB = ProcessInfo.processInfo.environment["F83_MEM_LIMIT_GB"]
+            .flatMap(Int.init) ?? 40
+        _ = MLX.GPU.set(memoryLimit: memLimitGB * 1024 * 1024 * 1024)
+        logLine("[F-83-perf-256K] memoryLimit set to \(memLimitGB) GB (for back-pressure)")
         MLXRandom.seed(0xF8302560)
         let prefillTokens = MLXRandom.randInt(
             low: MLXArray(Int32(0)),
@@ -4374,8 +4378,15 @@ struct RetrievalAttentionTests {
 
         // Dense baseline.
         F83SelectorReuseCache.clear()
+        // F-83 V1.5 — pre-allocate inner KVCache to prefillLen + decode
+        // budget so the first decode step doesn't trigger a full-cache
+        // concat-realloc (which at 256K is a 50 GB transient alloc that
+        // jetsam-kills the process). step controls nSteps × step
+        // allocation grain; default 256 = inner cache lands at exactly
+        // prefillLen and needs 1 more row → reallocs everything.
+        let stepDefault = prefillLen + nDecode + 1024
         let stepOverride = ProcessInfo.processInfo.environment["F83_STEP"]
-            .flatMap(Int.init) ?? 256
+            .flatMap(Int.init) ?? stepDefault
         var dense: (prefillSec: Double, lastLogits: MLXArray) =
             (-1, MLXArray.zeros([0]))
         var denseDecMedian: Double = -1
