@@ -1016,27 +1016,19 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         let chunkV = cachedValues[0..., 0..., priorLen..., 0...]
         let combinedK = concatenated([gK, chunkK], axis: 2)
         let combinedV = concatenated([gV, chunkV], axis: 2)
-        let P = positions.dim(0)
 
-        // Mask shape: [1, 1, L, P+L]. Prior portion (cols [0..P)): all 0
-        // (attend — every position is < chunk_start so causally valid for
-        // every query in the chunk). Chunk portion (cols [P..P+L)): causal
-        // — row l attends to col c iff c-P ≤ l.
-        let neginf: Float = -.infinity
-        let priorMask = MLXArray.zeros([L, P], dtype: queries.dtype)
-        let iRow = MLXArray(0..<Int32(L)).reshaped(L, 1)
-        let iCol = MLXArray(0..<Int32(L)).reshaped(1, L)
-        let chunkMask = MLX.where(
-            iCol .<= iRow,
-            MLXArray(Float(0)),
-            MLXArray(neginf)
-        ).asType(queries.dtype)
-        let combinedMask = concatenated([priorMask, chunkMask], axis: 1)
-            .reshaped(1, 1, L, P + L)
-
+        // F-83 V1.4 — use `.causal` symbolic mask mode instead of
+        // materializing a [1, 1, L, P+L] additive mask. MLXFast.SDPA's
+        // `.causal` applies causal with offset = S - L internally:
+        // S = P + L, so offset = P → row q attends to cols 0..q+P-1.
+        // That's exactly our pattern: all P prior cols attend (each is
+        // < chunk_start, causally valid for every query l), and cols
+        // [P..P+L) follow the standard chunk-internal lower-triangle.
+        // Eliminates 6+ MLX ops per layer per chunk (zeros + range x2 +
+        // compare + where + concat + reshape) that V1.3 still paid.
         return MLXFast.scaledDotProductAttention(
             queries: queries, keys: combinedK, values: combinedV,
-            scale: scale, mask: .array(combinedMask)
+            scale: scale, mask: .causal
         )
     }
 
