@@ -3796,6 +3796,137 @@ struct RetrievalAttentionTests {
         }
     }
 
+    // F-83 M1 — union batched-Q top-K matches the decode-path selector
+    // when L=1. The PRD's load-bearing claim is "union top-K per chunk
+    // per KV head collapses to 1 argpartition per chunk." This test
+    // proves the L=1 case is a strict generalization: identical scores
+    // produce identical top-K block starts. Compares as sets — tie
+    // ordering can differ between the fused Metal kernel and the MLX
+    // argpartition fallback.
+    @Test func f83_unionTopKMatchesDecodeAtL1() throws {
+        let nKVH = 4
+        let dHead = 64
+        let T = 8192  // 128 fine blocks at fineBlockSize=64
+        // Default config has lambdaPos=0 → usesTrigFeatures=false. Pure
+        // content path is the cleanest L=1 parity check.
+        let cfg = RetrievalAttentionConfig()
+        let idx = BatchedRetrievalAttentionIndex(
+            config: cfg, dHead: dHead, nKVHeads: nKVH,
+            ropeBase: 10_000.0, layerIdx: 4)
+
+        MLXRandom.seed(0xF830001)
+        let keys = MLXRandom.normal([nKVH, T, dHead]).asType(.float32)
+        eval(keys)
+        idx.update(newKeys: keys)
+
+        let q1d = MLXRandom.normal([nKVH, dHead]).asType(.float32)
+        eval(q1d)
+        let qL = q1d.reshaped(nKVH, 1, dHead)
+
+        // Decode-path selector.
+        let qProjDecode = idx.projectQueriesBatched(q1d)
+        let decodeOut = idx.topKBlockStartsAllHeadsCombinedGPU(
+            projectedQ: qProjDecode)
+        let decodeFine = decodeOut.fine.asArray(Int32.self)
+        let decodeCoarse = decodeOut.coarse.asArray(Int32.self)
+
+        // Union-path selector at L=1.
+        let qProjUnion = idx.projectQueriesBatchedL(qL)
+        let unionOut = idx.topKBlockStartsUnionBatchedQGPU(
+            projectedQ: qProjUnion)
+        let unionFine = unionOut.fine.asArray(Int32.self)
+        let unionCoarse = unionOut.coarse.asArray(Int32.self)
+
+        let kFine = decodeOut.fine.dim(1)
+        let kCoarse = decodeOut.coarse.dim(1)
+        #expect(unionOut.fine.shape == decodeOut.fine.shape,
+            "fine shape \(unionOut.fine.shape) != decode \(decodeOut.fine.shape)")
+        #expect(unionOut.coarse.shape == decodeOut.coarse.shape,
+            "coarse shape \(unionOut.coarse.shape) != decode \(decodeOut.coarse.shape)")
+
+        for h in 0..<nKVH {
+            let dF = Set(decodeFine[h*kFine..<(h+1)*kFine])
+            let uF = Set(unionFine[h*kFine..<(h+1)*kFine])
+            let inter = dF.intersection(uF).count
+            #expect(inter == kFine,
+                "head \(h) fine top-K diverges: decode \\ union = \(dF.subtracting(uF)), union \\ decode = \(uF.subtracting(dF))")
+            if kCoarse > 0 && cfg.coarseRescueEnabled {
+                let dC = Set(decodeCoarse[h*kCoarse..<(h+1)*kCoarse])
+                let uC = Set(unionCoarse[h*kCoarse..<(h+1)*kCoarse])
+                #expect(dC.intersection(uC).count == kCoarse,
+                    "head \(h) coarse top-K diverges")
+            }
+        }
+        print("[F-83-M1-parity] L=1 union top-K matches decode-path on \(nKVH) heads (kFine=\(kFine), kCoarse=\(kCoarse))")
+    }
+
+    // F-83 M1 — at L>1, the union top-K must equal "argmax-K over
+    // max-pooled-across-L scores." Computed independently from the
+    // raw block features + projected queries, then compared to the
+    // selector's output. Catches off-by-one axis mistakes and L
+    // collapse direction bugs.
+    @Test func f83_unionTopKSemanticsAtLGreaterThan1() throws {
+        let nKVH = 4
+        let dHead = 64
+        let T = 8192
+        let L = 16
+        let cfg = RetrievalAttentionConfig()
+        let idx = BatchedRetrievalAttentionIndex(
+            config: cfg, dHead: dHead, nKVHeads: nKVH,
+            ropeBase: 10_000.0, layerIdx: 4)
+        MLXRandom.seed(0xF830002)
+        let keys = MLXRandom.normal([nKVH, T, dHead]).asType(.float32)
+        eval(keys)
+        idx.update(newKeys: keys)
+        let q = MLXRandom.normal([nKVH, L, dHead]).asType(.float32)
+        eval(q)
+
+        // Selector output.
+        let qProj = idx.projectQueriesBatchedL(q)
+        eval(qProj)
+        let out = idx.topKBlockStartsUnionBatchedQGPU(projectedQ: qProj)
+        let fineCpu = out.fine.asArray(Int32.self)
+        let kFine = out.fine.dim(1)
+
+        // Independent reference: for each query independently, project
+        // it through the L=1 API and accumulate per-block max scores.
+        // Then take top-K. This is the literal definition of "union
+        // top-K across L."
+        guard let features = idx.fineBlockFeatures else {
+            Issue.record("fine block features missing")
+            return
+        }
+        let featCpu = features.asArray(Float.self)
+        let dProj = features.dim(2)
+        let nBlocks = features.dim(1)
+        let qProjCpu = qProj.asArray(Float.self)
+
+        for h in 0..<nKVH {
+            var maxScores = [Float](repeating: -.greatestFiniteMagnitude, count: nBlocks)
+            for l in 0..<L {
+                let qBase = (h * L + l) * dProj
+                for b in 0..<nBlocks {
+                    let fBase = (h * nBlocks + b) * dProj
+                    var s: Float = 0
+                    for d in 0..<dProj {
+                        s += featCpu[fBase + d] * qProjCpu[qBase + d]
+                    }
+                    if s > maxScores[b] { maxScores[b] = s }
+                }
+            }
+            let topK = maxScores.enumerated()
+                .sorted { $0.element > $1.element }
+                .prefix(kFine)
+                .map { Int32($0.offset * cfg.fineBlockSize) }
+            let refSet = Set(topK)
+            let outSet = Set(fineCpu[h*kFine..<(h+1)*kFine])
+            let inter = refSet.intersection(outSet).count
+            #expect(inter == kFine,
+                "head \(h): selector top-K diverges from reference union-max top-K. ref \\ out=\(refSet.subtracting(outSet)), out \\ ref=\(outSet.subtracting(refSet))")
+        }
+        print("[F-83-M1-semantics] L=\(L) union top-K matches manual max-pool reference on \(nKVH) heads (kFine=\(kFine))")
+    }
+
     // F-79 cross-architecture validation on Qwen3-0.6B-4bit.
     // Confirms the selector-amortization technique generalizes beyond
     // Qwen2.5-14B-1M. Smaller model + different arch + same amort=16

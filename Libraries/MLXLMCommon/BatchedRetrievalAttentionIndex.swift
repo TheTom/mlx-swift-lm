@@ -620,4 +620,134 @@ public final class BatchedRetrievalAttentionIndex {
         let topKIdx = partitioned[0..., (nBlocks - k)...]
         return topKIdx * Int32(blockSize)
     }
+
+    // MARK: - F-83 sparse-prefill API (M1: batched-Q union top-K)
+
+    /// Project a chunk of queries (L > 1) for the selector.
+    ///
+    /// - Parameter q: `[nKVHeads, L, dHead]` post-RoPE queries.
+    /// - Returns: `[nKVHeads, L, effectiveSelectorDim]`.
+    ///
+    /// Trig features use relativePosition=0 broadcast over L — matches
+    /// the decode path's convention (the trig branch is positional bias
+    /// in the *block* features; queries already had RoPE applied).
+    public func projectQueriesBatchedL(_ q: MLXArray) -> MLXArray {
+        precondition(q.shape.count == 3, "expected [nKVHeads, L, dHead], got \(q.shape)")
+        precondition(q.dim(0) == nKVHeads && q.dim(2) == dHead,
+            "expected [\(nKVHeads), L, \(dHead)], got \(q.shape)")
+        let L = q.dim(1)
+        if jlMatrix == nil {
+            jlMatrix = retrievalAttentionJLProjection(dHead: dHead, config: config)
+            jlMatrixT = jlMatrix!.transposed(1, 0)
+            eval(jlMatrix!, jlMatrixT!)
+        }
+        let WT = jlMatrixT!
+        // [nh, L, dHead] @ [dHead, contentDim] = [nh, L, contentDim]
+        let contentQ = matmul(q.asType(.float32), WT)
+        guard config.usesTrigFeatures else { return contentQ }
+        let trig1 = retrievalAttentionTrigFeatures(
+            relativePositions: MLXArray([Int32(0)]), base: ropeBase, config: config
+        ).reshaped(1, 1, config.trigDim)
+        let trigQ = broadcast(trig1, to: [nKVHeads, L, config.trigDim])
+        return concatenated([contentQ, trigQ], axis: -1)
+    }
+
+    /// Union top-K block starts across a chunk of L queries per KV head.
+    ///
+    /// For each KV head, a block's score is the *max* over the L queries
+    /// of `feature · projectedQ_l`. Top-K is taken on that max-pooled
+    /// score. This matches the NSA GQA pattern: queries within a chunk
+    /// in the same KV head all select the same blocks. Saves L× selector
+    /// cost vs per-query at the cost of selecting positions that "any
+    /// query wanted" rather than "this query wanted".
+    ///
+    /// - Parameter projectedQ: `[nKVHeads, L, effectiveSelectorDim]` —
+    ///   typically from `projectQueriesBatchedL`.
+    /// - Returns: `(fine: [nKVHeads, K_fine], coarse: [nKVHeads, K_coarse])`
+    ///   GPU tensors of block start positions (token indices). Shape
+    ///   matches `topKBlockStartsAllHeadsCombinedGPU` so the downstream
+    ///   mask/bitmap builder can ingest either.
+    public func topKBlockStartsUnionBatchedQGPU(
+        projectedQ: MLXArray
+    ) -> (fine: MLXArray, coarse: MLXArray) {
+        guard let fineFeatures = fineBlockFeatures else {
+            return (MLXArray.zeros([nKVHeads, 1], dtype: .int32),
+                    MLXArray.zeros([nKVHeads, 1], dtype: .int32))
+        }
+        let fineN = fineFeatures.dim(1)
+        let kFine = min(config.effectiveFineTopK(seqLen: seqLen), fineN)
+        guard kFine > 0 else {
+            return (MLXArray.zeros([nKVHeads, 1], dtype: .int32),
+                    MLXArray.zeros([nKVHeads, 1], dtype: .int32))
+        }
+        let fineStarts = unionTopKBlockStarts(
+            features: fineFeatures, projectedQ: projectedQ,
+            k: kFine, blockSize: config.fineBlockSize
+        )
+        let coarse: MLXArray
+        if config.coarseRescueEnabled, let coarseFeatures = coarseBlockFeatures {
+            let kCoarse = min(config.coarseTopK, coarseFeatures.dim(1))
+            if kCoarse > 0 {
+                coarse = unionTopKBlockStarts(
+                    features: coarseFeatures, projectedQ: projectedQ,
+                    k: kCoarse, blockSize: config.coarseBlockSize
+                )
+            } else {
+                coarse = MLXArray.zeros([nKVHeads, 1], dtype: .int32)
+            }
+        } else {
+            coarse = MLXArray.zeros([nKVHeads, 1], dtype: .int32)
+        }
+        return (fine: fineStarts, coarse: coarse)
+    }
+
+    /// Internal: per-block max score across L queries → top-K block starts.
+    /// Honors the same lambda blend as `scoreBlocksBatched`.
+    private func unionTopKBlockStarts(
+        features: MLXArray,   // [H, B, D_eff]
+        projectedQ: MLXArray, // [H, L, D_eff]
+        k: Int, blockSize: Int
+    ) -> MLXArray {
+        let nBlocks = features.dim(1)
+        let take = min(k, nBlocks)
+        // perQ[h, b, l] = features[h, b, :] · projectedQ[h, l, :]
+        // Computed via batched matmul on the last dim. We deliberately
+        // do NOT materialize an [H, L, B, D] elementwise tensor — for
+        // H=8, L=1024, B=4096, D=64 that would be 8 GB.
+        let unionScores: MLXArray
+        if !config.usesTrigFeatures {
+            // [H, B, D] @ [H, D, L] = [H, B, L]
+            let perQ = matmul(features, projectedQ.transposed(0, 2, 1))
+            unionScores = perQ.max(axis: -1)  // [H, B]
+        } else {
+            let cD = config.contentDim
+            let lambdaPos = config.lambdaPos
+            let contentF = features[0..., 0..., ..<cD]
+            let trigF = features[0..., 0..., cD...]
+            let contentQ = projectedQ[0..., 0..., ..<cD]
+            let trigQ = projectedQ[0..., 0..., cD...]
+            let tPart = matmul(trigF, trigQ.transposed(0, 2, 1))   // [H, B, L]
+            let perQ: MLXArray
+            if lambdaPos == 1.0 {
+                perQ = tPart
+            } else {
+                let cPart = matmul(contentF, contentQ.transposed(0, 2, 1))
+                perQ = (1 - lambdaPos) * cPart + lambdaPos * tPart
+            }
+            unionScores = perQ.max(axis: -1)
+        }
+        // Argpartition top-K — same shape contract as the decode-path
+        // `computeTopKBlockStarts` MLX fallback so downstream code can
+        // ingest either output identically.
+        let pivotKth = nBlocks - take
+        let partitioned: MLXArray
+        if pivotKth <= 0 {
+            let rangeArr = MLXArray(0..<Int32(nBlocks)).reshaped(1, nBlocks)
+            partitioned = broadcast(rangeArr, to: [nKVHeads, nBlocks])
+        } else {
+            partitioned = argPartition(unionScores, kth: pivotKth, axis: -1)
+        }
+        let topKIdx = partitioned[0..., (nBlocks - take)...]
+        return topKIdx * Int32(blockSize)
+    }
 }
