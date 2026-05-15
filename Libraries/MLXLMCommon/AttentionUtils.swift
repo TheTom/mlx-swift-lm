@@ -128,8 +128,21 @@ public func attentionWithCacheUpdate(
     cache: KVCache?,
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
-    sinks: MLXArray? = nil
+    sinks: MLXArray? = nil,
+    raContext: RetrievalAttentionContext? = nil
 ) -> MLXArray {
+    // Sidecar retrieval-attention path. When a context is supplied AND the
+    // cache is a plain StandardKVCache (case `.raw`), the dispatcher hands
+    // off to `retrievalAttentionStep` which carries selector state through
+    // the context instead of forcing all callers onto a wrapper KV cache.
+    // Path is exercised by F-83 benches; default-nil keeps every other
+    // caller on the existing dispatch.
+    if let ctx = raContext, let std = cache as? StandardKVCache {
+        return retrievalAttentionStep(
+            queries: queries, keys: keys, values: values,
+            cache: std, ctx: ctx, scale: scale, mask: mask, sinks: sinks
+        )
+    }
     guard let cache else {
         // Cache-less path (rare). Wrap the SDPA call so it shows up in traces
         // alongside cache-backed paths for comparability.
