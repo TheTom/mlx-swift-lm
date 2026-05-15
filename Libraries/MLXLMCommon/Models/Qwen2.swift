@@ -143,6 +143,16 @@ public enum Qwen2 {
             silu(gate) * up
         }
 
+    /// F-83 sprint iter #12 — cached env reads. `ProcessInfo.processInfo.
+    /// environment[...]` measured at ~13 µs / call (codex review). Doing
+    /// it twice per layer × 48 layers = 96 lookups/step ≈ 1.3 ms of
+    /// avoidable Swift-side overhead. Hoist to static lets resolved once
+    /// at process load.
+    private static let envFusedGateAct: Bool =
+        ProcessInfo.processInfo.environment["F83_FUSED_GATE_ACT"] == "1"
+    private static let envProfileDecode: Bool =
+        ProcessInfo.processInfo.environment["F83_PROFILE_DECODE"] == "1"
+
     public class MLP: Module, UnaryLayer {
         // Fused gate+up projection. Two separate Linears (gate_proj +
         // up_proj) both consume the same input x and produce hidden-dim
@@ -172,7 +182,7 @@ public enum Qwen2 {
             // compiled-swiglu). The split+swiglu path appears to already be
             // fused by MLX's lazy graph through the compile() pattern.
             // Kept the env opt-in for future experimentation.
-            if ProcessInfo.processInfo.environment["F83_FUSED_GATE_ACT"] == "1" {
+            if Qwen2.envFusedGateAct {
                 let gateUpOut = gateUp(x)
                 let activated = MLX.MLXFast.fusedGateActivation(
                     gateUpOut, hiddenDims: hiddenDim, activation: .silu)
@@ -235,7 +245,7 @@ public enum Qwen2 {
             // vs steady-state, but the RELATIVE breakdown shows where
             // dispatches go. Single-layer profile from layer 0 first
             // iteration is enough to isolate hot phases.
-            if ProcessInfo.processInfo.environment["F83_PROFILE_DECODE"] == "1" {
+            if Qwen2.envProfileDecode {
                 let t0 = CFAbsoluteTimeGetCurrent()
                 let n1 = inputLayerNorm(x); eval(n1)
                 let t1 = CFAbsoluteTimeGetCurrent()

@@ -4381,6 +4381,25 @@ struct RetrievalAttentionTests {
                 // materializations. Each measurement = one full pipeline
                 // step including GPU work, just without idle host gaps.
                 var prevTok = next
+                // F-83 sprint iter #10 — pure throughput mode. Queue all
+                // nDecode steps in one lazy graph, then a single eval at the
+                // end. Total / nDecode = per-step GPU throughput without any
+                // per-step measurement overhead. Matches the cleanest possible
+                // Python `for _ in range(N): model(...); eval(prev)` test.
+                if ProcessInfo.processInfo.environment["F83_THROUGHPUT"] == "1" {
+                    let tt0 = Date()
+                    var tok = prevTok
+                    for _ in 0..<nDecode {
+                        let out = model(tok, cache: cache)
+                        tok = out[0, -1, 0...].argMax().asType(.int32).reshaped(1, 1)
+                    }
+                    eval(tok)
+                    let total = Date().timeIntervalSince(tt0) * 1000
+                    let perStep = total / Double(nDecode)
+                    for _ in 0..<nDecode { ms.append(perStep) }
+                    logLine("[F-83-perf-256K] \(tag) decode THROUGHPUT total=\(String(format: "%.1f", total))ms perStep=\(String(format: "%.2f", perStep))ms")
+                    return ms
+                }
                 // Pre-queue one step so the GPU starts before measurement.
                 var queuedTok: MLXArray = {
                     let o = model(prevTok, cache: cache)

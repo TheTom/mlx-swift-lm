@@ -340,6 +340,14 @@ public func createSSMMask(h: MLXArray, cache: SSMStateCache?) -> MLXArray? {
     return nil
 }
 
+/// Env knobs resolved ONCE at process load. Per-call `ProcessInfo.environment[...]`
+/// costs ~13 µs (codex measurement); doing it inside the per-layer decode loop
+/// added ~625 µs/step on Qwen2-14B (48 layers).
+internal enum KVCacheEnv {
+    static let trackLastReturned: Bool =
+        ProcessInfo.processInfo.environment["MLX_KV_TRACK_LAST"] == "1"
+}
+
 /// Standard raw-FP16/BF16 KV cache with two eviction strategies:
 /// `.unbounded` grows linearly (the legacy `StandardKVCache` shape), `.window` rotates
 /// in-place with optional sink tokens (the legacy `StandardKVCache` shape).
@@ -503,8 +511,17 @@ public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
         let returnedKeys = self.keys![.ellipsis, ..<self.offset, 0...]
         let returnedValues = self.values![.ellipsis, ..<self.offset, 0...]
 
-        self.lastReturnedKeys = returnedKeys
-        self.lastReturnedValues = returnedValues
+        // F-83 sprint iter #11/#12 — guard the lastReturnedKeys/Values
+        // stash behind an env knob, RESOLVED ONCE at process load (codex
+        // review flagged per-call `ProcessInfo.environment[...]` at ~13 µs
+        // each × 48 layers/step = ~625 µs of avoidable Swift overhead).
+        // Only Gemma 4's KV-sharing donor layers consume the stash; for
+        // every other model it's two ARC retains/decode step wasted.
+        // Set `MLX_KV_TRACK_LAST=1` to re-enable for Gemma 4 KV-sharing.
+        if KVCacheEnv.trackLastReturned {
+            self.lastReturnedKeys = returnedKeys
+            self.lastReturnedValues = returnedValues
+        }
 
         return (returnedKeys, returnedValues)
     }
