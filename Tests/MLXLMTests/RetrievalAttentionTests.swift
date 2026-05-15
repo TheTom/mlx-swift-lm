@@ -4423,8 +4423,14 @@ struct RetrievalAttentionTests {
                 for (s, m) in ms.enumerated() {
                     logLine("[F-83-perf-256K] \(tag) decode step=\(s) (pipelined) ms=\(String(format: "%.1f", m))")
                 }
+                // F-83 sprint iter #14 — codex review caught this: the
+                // final eval was on `prevTok` (stale, pre-loop reference)
+                // instead of `queuedTok` (the final still-async token).
+                // Doesn't move the median; flushes the last async work
+                // before the function returns so the next bench cell starts
+                // clean.
+                eval(queuedTok)
                 _ = prevTok
-                eval(prevTok)
                 return ms
             }
 
