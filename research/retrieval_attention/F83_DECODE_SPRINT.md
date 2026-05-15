@@ -55,3 +55,52 @@ Swift blow past Python at 128K+.
 - `MLX.MLXFast.rmsNormQuantizedGEMV` — fused norm + matmul for input_norm → Q proj. Saves 1 dispatch per layer. But K, V still need separate norm-and-proj. Untested.
 - Custom Metal kernel for the entire DecoderLayer forward. Multi-day effort.
 - Quantized KV cache (turbo4 V) — reduces bandwidth. Untested at decode in this sprint.
+
+## Path A sidecar refactor — landed
+
+The wrapper-tax fix codex recommended. Now in tree:
+
+- `RetrievalAttentionContext` (new): owns selector state (`batchedIndex`,
+  `cachedHeadIdx`, `cachedFineStarts/CoarseStarts`, `lastRefreshOffset`,
+  `raConfig`, `layerIdx`, etc.).
+- `RetrievalAttentionEngine.retrievalAttentionStep`: F-73 mask path
+  AND F-70 per-KV-head gather, both routed via `(cache, ctx)` instead
+  of the `RetrievalAttentionKVCache` wrapper.
+- `attentionWithCacheUpdate` accepts a default-nil `raContext:` arg.
+- `Qwen2.Attention/DecoderLayer/ModelInner` thread `raContext:` end-to-end.
+- `Qwen2Model.callAsFunction(_:cache:raContexts:)` overload for the
+  sidecar-driven bench path.
+- Bench harness gates everything behind `F83_SIDECAR=1`.
+
+### 128K decode results post-sidecar
+
+| Path | Decode ms | Notes |
+|---|---|---|
+| Python dense pipelined        | 67.3 | baseline |
+| Swift dense BARE pipelined    | **67.6** | parity (0.4%) |
+| Swift sparse SIDECAR+F73mask  | 89.4 | -13 ms vs wrapper, still loses to dense |
+| Swift sparse SIDECAR+perHead  | 198 | no F-79 amortization yet — gather rebuild every step |
+| Swift sparse WRAPPER (V12, legacy) | 102 | -- |
+
+The sidecar saves the 13 ms wrapper tax cleanly on sparse. But sparse
+still loses to dense at 128K because F-73's mask path only skips
+compute via `-inf` — sdpa_vector still loads all K/V. The truly
+bandwidth-reducing path (`perKVHeadGather`, ~2k positions vs all
+131K) needs F-79 amortization ported to beat dense.
+
+### Sprint commits
+
+- `159cb37` refactor(F-83): thread raContext through Qwen2 — Path A wiring + reads
+- `9eef87f` refactor(F-83): sidecar RA engine — F-73 mask via bare cache + raContext
+- `80053d9` refactor(F-83): port perKVHeadGatherAndAttend to sidecar (no amort yet)
+
+### Codex's MLX runtime observation
+
+Codex flagged that Python's mlx-lm loads from `/Users/tom/dev/mlx` (HEAD
+`42a7a71c`, branch `fix/add-temporaries-fork-primitives`) while Swift
+uses vendored `Source/Cmlx/mlx` at `77d6214a` (branch `vllm-swift-stable`).
+Different forks. Both have Tom's `max_ops_per_buffer=500` Max/Ultra
+default and the same fused kernels in `mlx-generated/metal/`. The
+remaining individual-op differences (`42a7a71c` is a use-after-free
+fix for TurboQuant temporaries, not a perf change) don't explain
+material delta. The 0.4% gap at 128K is well inside measurement noise.
