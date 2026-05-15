@@ -877,59 +877,58 @@ public final class RetrievalAttentionKVCache: BaseKVCache, CustomDebugStringConv
         // queries[0] → [nH, L, D]; take strided reps per KV group → [nKVH, L, D]
         let qStacked = queries[0].take(cachedHeadIdx!, axis: 0).asType(.float32)
         let qProj = index.projectQueriesBatchedL(qStacked)
-        // F-83 PRD revision 3: use fixed top-K (NSA-style) for prefill,
-        // not the decode adaptive top-K which scales seqLen/256 → too
-        // many blocks at long context (1024 fine blocks at 256K = only
-        // 4x sparsity, vs the PRD's targeted 80x).
-        let prefillFineTopK = raConfig.sparsePrefillFineTopK > 0
-            ? raConfig.sparsePrefillFineTopK : nil
-        let prefillCoarseTopK = raConfig.sparsePrefillCoarseTopK > 0
-            ? raConfig.sparsePrefillCoarseTopK : nil
-        let (fineStarts, coarseStarts) = index.topKBlockStartsUnionBatchedQGPU(
-            projectedQ: qProj,
-            fineTopKOverride: prefillFineTopK,
-            coarseTopKOverride: prefillCoarseTopK)
-
-        // Build the union of static + sliding + fine + coarse positions.
-        // Cross-head combined (the F-69 pattern). Duplicates are tolerated
-        // (sorted into adjacency, SDPA softmax handles them as no-op).
+        // F-83 V1.1 — GPU-only top-K: cross-head union (one block list,
+        // not per-head) WITH static/sliding exclusion via score-mask, so
+        // the resulting block starts can never overlap the static or
+        // sliding regions. With fine blocks disjoint from each other
+        // (argpart returns unique block indices), no duplicates can arise
+        // anywhere in the gather position list — the CPU sync the V1
+        // path needed for `Set`-dedupe is gone.
         let cfg = raConfig
-        let staticEnd = min(cfg.staticInit, priorLen)
-        let staticPositions: MLXArray = staticEnd > 0
+        let fineBS = cfg.fineBlockSize
+        let staticEnd = Swift.min(cfg.staticInit, priorLen)
+        let slidingStart = Swift.max(0, priorLen - cfg.slidingWindow)
+        let prefillFineTopK = cfg.sparsePrefillFineTopK > 0
+            ? cfg.sparsePrefillFineTopK
+            : cfg.effectiveFineTopK(seqLen: index.seqLen)
+        let fineStartsClean = index.crossHeadUnionTopKExcludingRangesGPU(
+            projectedQ: qProj,
+            k: prefillFineTopK,
+            blockSize: fineBS,
+            staticEnd: staticEnd,
+            slidingStart: slidingStart
+        )
+
+        // Build positions list — static + sliding + fine, no duplicates
+        // by construction. CRITICAL: when sliding overlaps static
+        // (slidingStart <= staticEnd, i.e. priorLen is short enough that
+        // the sliding window reaches back to within the static prefix),
+        // we drop static entirely — sliding already covers it. Otherwise
+        // we'd duplicate positions 0..slidingStart-1 in the gather list.
+        let includeStatic = staticEnd > 0 && slidingStart >= staticEnd
+        let staticPositions: MLXArray = includeStatic
             ? MLXArray(Int32(0) ..< Int32(staticEnd))
             : MLXArray.zeros([0], dtype: .int32)
-        let slidingStart = max(0, priorLen - cfg.slidingWindow)
         let slidingPositions: MLXArray = slidingStart < priorLen
             ? MLXArray(Int32(slidingStart) ..< Int32(priorLen))
             : MLXArray.zeros([0], dtype: .int32)
-        let fineBS = cfg.fineBlockSize
-        let coarseBS = cfg.coarseBlockSize
-        let kFine = fineStarts.dim(1)
-        let kCoarse = coarseStarts.dim(1)
-        let fineOffsets = MLXArray(0..<Int32(fineBS)).reshaped(1, 1, fineBS)
-        let coarseOffsets = MLXArray(0..<Int32(coarseBS)).reshaped(1, 1, coarseBS)
-        let finePos = (fineStarts.expandedDimensions(axis: -1) + fineOffsets)
-            .reshaped(nKVH * kFine * fineBS)
-        let coarsePos = (coarseStarts.expandedDimensions(axis: -1) + coarseOffsets)
-            .reshaped(nKVH * kCoarse * coarseBS)
-        let allPositions = concatenated(
-            [staticPositions, slidingPositions, finePos, coarsePos], axis: 0
-        )
-        // Clip to [0, priorLen-1] so chunk's own keys are never re-attended
-        // here (they go through the within-chunk causal path).
-        let clipped = clip(
-            allPositions.asType(.int32),
-            min: Int32(0), max: Int32(priorLen - 1)
-        )
-        // DEDUPE positions. Duplicate K rows in the SDPA input double the
-        // softmax weight at that token and silently break correctness
-        // (we measured cosine drop to 0.04 with duplicates at small prior
-        // where static+sliding overlap fully). CPU dedupe pulls ~6K
-        // int32s per layer per chunk — one sync per chunk, negligible
-        // vs the gather + SDPA wall-clock at long context.
-        let clippedCpu = clipped.asArray(Int32.self)
-        let uniqueSorted = Array(Set(clippedCpu)).sorted()
-        let positions = MLXArray(uniqueSorted)
+        let kFine = fineStartsClean.dim(0)
+        let positions: MLXArray
+        if kFine > 0 {
+            // [kFine, fineBS] = fineStartsClean[:, None] + 0..fineBS
+            let fineOffsets = MLXArray(0..<Int32(fineBS)).reshaped(1, fineBS)
+            let finePos = (fineStartsClean.reshaped(kFine, 1) + fineOffsets)
+                .reshaped(kFine * fineBS)
+            // Order: static (low) → fine (mid) → sliding (high). All
+            // strictly ascending and disjoint, so the combined list is
+            // already sorted. Clip is a defensive no-op.
+            let combined = concatenated(
+                [staticPositions, finePos, slidingPositions], axis: 0)
+            positions = clip(combined, min: Int32(0), max: Int32(priorLen - 1))
+        } else {
+            positions = concatenated(
+                [staticPositions, slidingPositions], axis: 0)
+        }
 
         // Gather prior K/V at `positions`. Keep within-chunk K/V at the tail.
         let priorK = cachedKeys[0..., 0..., ..<priorLen, 0...]

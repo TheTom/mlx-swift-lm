@@ -147,15 +147,22 @@ public final class BatchedRetrievalAttentionIndex {
                 [nKVHeads, initialCap, featureDim], dtype: selectorNew.dtype
             )
         } else if perTokenFeatures!.dim(1) < newSeqLen {
-            // Grow buffer in chunkSize-multiples.
-            let neededTotal = ((newSeqLen + Self.featureChunkSize - 1)
-                / Self.featureChunkSize) * Self.featureChunkSize
-            let additional = neededTotal - perTokenFeatures!.dim(1)
+            // F-83 V1.1 — exponential (doubling) grow instead of linear.
+            // Linear `featureChunkSize=1024` triggers a grow + eval barrier
+            // EVERY prefill chunk (since each chunk adds 1024 tokens), which
+            // serializes the GPU pipeline. Doubling reduces grow events to
+            // O(log N) — at 128K that's 7 grow events instead of 128.
+            let currentCap = perTokenFeatures!.dim(1)
+            var newCap = currentCap
+            while newCap < newSeqLen { newCap *= 2 }
+            let additional = newCap - currentCap
             let pad = MLXArray.zeros(
                 [nKVHeads, additional, featureDim], dtype: perTokenFeatures!.dtype
             )
             perTokenFeatures = concatenated([perTokenFeatures!, pad], axis: 1)
-            // Materialize after grow to break graph chain.
+            // Materialize after grow to break graph chain (still needed —
+            // without it lazy graph holds every prior chunk's intermediate
+            // and GPU memory grows monotonically).
             eval(perTokenFeatures!)
         }
         // In-place write the new rows.
@@ -222,8 +229,12 @@ public final class BatchedRetrievalAttentionIndex {
         if cap >= needed && (isFine ? fineBlockBuffer : coarseBlockBuffer) != nil {
             return
         }
+        // F-83 V1.1 — doubling growth (matches the exponential strategy
+        // in perTokenFeatures). At 128K context fineBlocks = 2048 and
+        // coarseBlocks = 128 — both grow log(N) times instead of N/256.
         let chunkSize = Self.blockBufferChunkSize
-        let newCap = max(chunkSize, ((needed + chunkSize - 1) / chunkSize) * chunkSize)
+        var newCap = max(cap, chunkSize)
+        while newCap < needed { newCap *= 2 }
         let dtype = perTokenFeatures?.dtype ?? .float32
         let newBuf = MLXArray.zeros([nKVHeads, newCap, featureDim], dtype: dtype)
         // Copy old contents into new buffer at [0..<cap].
@@ -701,6 +712,85 @@ public final class BatchedRetrievalAttentionIndex {
             coarse = MLXArray.zeros([nKVHeads, 1], dtype: .int32)
         }
         return (fine: fineStarts, coarse: coarse)
+    }
+
+    /// F-83 V1.1 — cross-head + cross-L union top-K, with score-mask
+    /// exclusion of static-prefix and sliding-window block ranges.
+    ///
+    /// Returns a single `[K]` block-start list (NOT [H, K]) — eliminates
+    /// the cross-head duplicate sources that forced the V1 CPU dedupe.
+    /// The score is `max over (h, l) of features[h, b, :] · projectedQ[h, l, :]`,
+    /// i.e., a block scores high if ANY (head, query) pair wants it.
+    ///
+    /// The returned block starts are guaranteed to be outside the
+    /// `[0, staticEnd)` and `[slidingStart, priorLen)` ranges, so when
+    /// the caller concats static-prefix + sliding-window + fine positions
+    /// into the gather list, no duplicates can arise.
+    ///
+    /// - Parameters:
+    ///   - projectedQ: `[H, L, D_eff]`
+    ///   - k: fine top-K (e.g. 16 per PRD revision 3)
+    ///   - blockSize: fine block size
+    ///   - staticEnd: exclude blocks fully inside `[0, staticEnd)`
+    ///   - slidingStart: exclude blocks fully inside `[slidingStart, ∞)`
+    /// - Returns: `[K]` int32 block-start positions, all in
+    ///   `[staticAlignedEnd, slidingAlignedStart)`.
+    public func crossHeadUnionTopKExcludingRangesGPU(
+        projectedQ: MLXArray,
+        k: Int,
+        blockSize: Int,
+        staticEnd: Int,
+        slidingStart: Int
+    ) -> MLXArray {
+        let features: MLXArray
+        if blockSize == config.fineBlockSize {
+            guard let f = fineBlockFeatures else {
+                return MLXArray.zeros([0], dtype: .int32)
+            }
+            features = f
+        } else if blockSize == config.coarseBlockSize {
+            guard let f = coarseBlockFeatures else {
+                return MLXArray.zeros([0], dtype: .int32)
+            }
+            features = f
+        } else {
+            fatalError("unsupported blockSize \(blockSize)")
+        }
+        let nBlocks = features.dim(1)
+        let staticBlocks = (staticEnd + blockSize - 1) / blockSize  // CEIL
+        let slidBlock = slidingStart / blockSize                    // FLOOR
+        // Available range = [staticBlocks, slidBlock). If empty (sliding
+        // reaches into static or they touch), there are no fine blocks
+        // to pick — return empty and let the caller cover everything
+        // via static+sliding.
+        let availableBlocks = Swift.max(0, slidBlock - staticBlocks)
+        let take = Swift.min(k, availableBlocks)
+        if take <= 0 {
+            return MLXArray.zeros([0], dtype: .int32)
+        }
+        // Score per (H, B, L) via batched matmul, then max-pool over (L, H).
+        let perHQL = matmul(features, projectedQ.transposed(0, 2, 1))
+        let unionH = perHQL.max(axis: -1)        // [H, B]
+        let scores = unionH.max(axis: 0)          // [B]
+        // Mask scores in static/sliding ranges to -inf so top-K never picks them.
+        let blockIdx = MLXArray(0..<Int32(nBlocks))
+        let isStatic = blockIdx .< Int32(staticBlocks)
+        let isSliding = blockIdx .>= Int32(slidBlock)
+        let isCovered = isStatic .|| isSliding
+        let neginf = MLXArray(-Float.infinity)
+        let maskedScores = MLX.where(isCovered, neginf, scores)
+        // argpartition top-K — `take` is now bounded by availableBlocks
+        // so even when masked-all-but-some, we never pick a -inf-scored
+        // index that would lie in the static/sliding range.
+        let pivot = nBlocks - take
+        let partitioned: MLXArray
+        if pivot <= 0 {
+            partitioned = MLXArray(0..<Int32(nBlocks))
+        } else {
+            partitioned = argPartition(maskedScores, kth: pivot, axis: -1)
+        }
+        let topKIdx = partitioned[(nBlocks - take)...]
+        return (topKIdx * Int32(blockSize)).asType(.int32)
     }
 
     /// Internal: per-block max score across L queries → top-K block starts.
