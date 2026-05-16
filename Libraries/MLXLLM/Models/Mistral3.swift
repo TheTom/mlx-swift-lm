@@ -187,6 +187,28 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    /// Batched decode: B requests with per-request per-layer caches.
+    public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+        let out = model.batchedForward(inputs, caches: caches)
+        if let lmHead {
+            return lmHead(out)
+        } else {
+            return model.embedTokens.asLinear(out)
+        }
+    }
+
+    /// Fully batched decode with shared per-layer `BatchedKVCache`.
+    public func fullyBatchedDecode(
+        _ inputs: MLXArray, caches: [BatchedKVCache]
+    ) -> MLXArray {
+        let out = model.fullyBatchedForward(inputs, caches: caches)
+        if let lmHead {
+            return lmHead(out)
+        } else {
+            return model.embedTokens.asLinear(out)
+        }
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var processedWeights = weights
 
