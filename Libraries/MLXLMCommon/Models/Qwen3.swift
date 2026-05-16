@@ -74,8 +74,18 @@ public enum Qwen3 {
             super.init()
         }
 
+        /// Fused silu(gate) * up — matches mlx-lm's `@partial(mx.compile, shapeless=True)`
+        /// swiglu in mlx_lm/models/activations.py. Cuts the activation +
+        /// elementwise multiply from two kernel dispatches per layer to one.
+        /// Per-decoder-block savings show up at small models (Qwen3-0.6B/4B)
+        /// where CPU op-encode dominates step time.
+        private static let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
+            compile(shapeless: true) { gate, up in
+                silu(gate) * up
+            }
+
         public func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(silu(gate(x)) * up(x))
+            down(MLP.compiledSwiglu(gate(x), up(x)))
         }
     }
 }

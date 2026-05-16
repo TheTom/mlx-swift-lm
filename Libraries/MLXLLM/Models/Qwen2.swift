@@ -123,6 +123,37 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    /// Batched decode: B requests with separate per-layer caches.
+    /// Pairs with `Qwen2.ModelInner.batchedForward` so vllm-swift's
+    /// `vsm_engine_decode_all` can amortize weight bandwidth across
+    /// concurrent requests instead of looping per-stream.
+    /// inputs: [B, 1] token IDs. caches: B arrays of per-layer KVCache.
+    public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+        var out = model.batchedForward(inputs, caches: caches)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = model.embedTokens.asLinear(out)
+        }
+        return out
+    }
+
+    /// Fully batched decode with shared per-layer `BatchedKVCache`. The
+    /// fastest concurrent-decode path — zero per-request loops in the
+    /// hot path. vllm-swift's `vsm_engine_decode_all` routes here when
+    /// `engine.batchedCaches` is populated (after `vsm_engine_init_batched`).
+    public func fullyBatchedDecode(
+        _ inputs: MLXArray, caches: [BatchedKVCache]
+    ) -> MLXArray {
+        var out = model.fullyBatchedForward(inputs, caches: caches)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = model.embedTokens.asLinear(out)
+        }
+        return out
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
         if configuration.tieWordEmbeddings {

@@ -109,9 +109,78 @@ public enum Qwen2 {
         ) -> MLXArray {
             let (B, L) = (x.dim(0), x.dim(1))
 
-            var queries = wq(x)
-            var keys = wk(x)
-            var values = wv(x)
+            // F-83 night iter #5: fine-grained per-op profile inside Attention.
+            // Forces eval per op; absolute inflated, relative useful.
+            if Qwen2.envProfileAttnFine {
+                let t0 = CFAbsoluteTimeGetCurrent()
+                let q0 = wq(x); eval(q0)
+                let t1 = CFAbsoluteTimeGetCurrent()
+                let k0 = wk(x); eval(k0)
+                let t2 = CFAbsoluteTimeGetCurrent()
+                let v0 = wv(x); eval(v0)
+                let t3 = CFAbsoluteTimeGetCurrent()
+                let qR = q0.reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3); eval(qR)
+                let kR = k0.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3); eval(kR)
+                let vR = v0.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3); eval(vR)
+                let t4 = CFAbsoluteTimeGetCurrent()
+                let qRoPE = applyRotaryPosition(rope, to: qR, cache: cache); eval(qRoPE)
+                let kRoPE = applyRotaryPosition(rope, to: kR, cache: cache); eval(kRoPE)
+                let t5 = CFAbsoluteTimeGetCurrent()
+                let attnOut = attentionWithCacheUpdate(
+                    queries: qRoPE, keys: kRoPE, values: vR,
+                    cache: cache, scale: scale, mask: mask,
+                    raContext: raContext
+                )
+                eval(attnOut)
+                let t6 = CFAbsoluteTimeGetCurrent()
+                let oOut = wo(attnOut.transposed(0, 2, 1, 3).reshaped(B, L, -1)); eval(oOut)
+                let t7 = CFAbsoluteTimeGetCurrent()
+                let toMs = { (a: CFAbsoluteTime, b: CFAbsoluteTime) in (b - a) * 1000 }
+                FileHandle.standardError.write(Data(
+                    "[ATTN-FINE] q=\(String(format: "%.3f", toMs(t0,t1))) k=\(String(format: "%.3f", toMs(t1,t2))) v=\(String(format: "%.3f", toMs(t2,t3))) shape=\(String(format: "%.3f", toMs(t3,t4))) rope=\(String(format: "%.3f", toMs(t4,t5))) attn=\(String(format: "%.3f", toMs(t5,t6))) o=\(String(format: "%.3f", toMs(t6,t7))) total=\(String(format: "%.3f", toMs(t0,t7)))\n"
+                        .utf8))
+                return oOut
+            }
+
+            var queries: MLXArray
+            var keys: MLXArray
+            var values: MLXArray
+
+            // F-83 fused batched-QKV path: L=1 decode, 4-bit quantized,
+            // half/bfloat. Saves 2 dispatches/layer vs 3 separate
+            // quantized matmuls. The kernel only does matmul — Linear's
+            // additive bias (Qwen2 q/k/v_proj all have bias=true) is
+            // applied after by adding wq.bias / wk.bias / wv.bias to the
+            // split outputs. Falls through to legacy 3-call path otherwise.
+            if Qwen2.envFusedQKV, L == 1, B == 1,
+                let qq = wq as? QuantizedLinear,
+                let kk = wk as? QuantizedLinear,
+                let vv = wv as? QuantizedLinear,
+                qq.bits == 4, kk.bits == 4, vv.bits == 4,
+                qq.groupSize == kk.groupSize, kk.groupSize == vv.groupSize,
+                let qB = qq.biases, let kB = kk.biases, let vB = vv.biases,
+                (x.dtype == .float16 || x.dtype == .bfloat16)
+            {
+                let qkv = MLXFast.batchedQKVQuantizedGEMV(
+                    x,
+                    wQ: qq.weight, scalesQ: qq.scales, biasesQ: qB,
+                    wK: kk.weight, scalesK: kk.scales, biasesK: kB,
+                    wV: vv.weight, scalesV: vv.scales, biasesV: vB,
+                    groupSize: qq.groupSize)
+                // qkv shape: [1, 1, n_q + n_k + n_v] for B=L=1.
+                let nQ = heads * headDim
+                let nK = kvHeads * headDim
+                queries = qkv[0..., 0..., 0 ..< nQ]
+                keys = qkv[0..., 0..., nQ ..< (nQ + nK)]
+                values = qkv[0..., 0..., (nQ + nK)...]
+                if let qBias = qq.bias { queries = queries + qBias }
+                if let kBias = kk.bias { keys = keys + kBias }
+                if let vBias = vv.bias { values = values + vBias }
+            } else {
+                queries = wq(x)
+                keys = wk(x)
+                values = wv(x)
+            }
 
             queries = queries.reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
             keys = keys.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
@@ -128,6 +197,160 @@ public enum Qwen2 {
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
             return wo(output)
+        }
+
+        /// Batched attention: B requests with per-request KV caches.
+        /// Projections + output proj are batched (one matmul each); RoPE +
+        /// cache update + SDPA stay per-request (each cache has its own T).
+        /// Ports the Qwen3 `batchedForward` pattern for the Qwen2 family so
+        /// vllm-swift's `decode_all` gets weight-bandwidth amortization
+        /// across concurrent requests instead of falling through to
+        /// per-request sequential stepAsync. Pairs with `Qwen2Model.batchedDecode`.
+        public func batchedForward(
+            _ x: MLXArray, caches: [KVCache?]
+        ) -> MLXArray {
+            let B = x.dim(0)
+            let L = x.dim(1)
+
+            // Batched Q/K/V projections (Linear includes bias).
+            var queries = wq(x)
+            var keys = wk(x)
+            var values = wv(x)
+
+            queries = queries.reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
+            keys = keys.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+            values = values.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+
+            // Steady-state batched decode usually has all streams at the
+            // same offset (all started together, advance 1 token / step).
+            // When that holds, apply RoPE ONCE to the batched [B, heads, 1, dim]
+            // tensor instead of B small per-request calls — saves the worst
+            // overhead in the inner loop (50µs × B × num_layers).
+            let firstOffset = caches[0]?.offset ?? 0
+            let allSameOffset = (1 ..< B).allSatisfy {
+                (caches[$0]?.offset ?? 0) == firstOffset
+            }
+
+            let qSlices: [MLXArray]
+            let kSlices: [MLXArray]
+            let vSlices: [MLXArray]
+            if allSameOffset {
+                let qRoped = rope(queries, offset: firstOffset)
+                let kRoped = rope(keys, offset: firstOffset)
+                qSlices = split(qRoped, parts: B, axis: 0)
+                kSlices = split(kRoped, parts: B, axis: 0)
+                vSlices = split(values, parts: B, axis: 0)
+            } else {
+                qSlices = split(queries, parts: B, axis: 0)
+                kSlices = split(keys, parts: B, axis: 0)
+                vSlices = split(values, parts: B, axis: 0)
+            }
+
+            var rotQ = [MLXArray]()
+            var allKeys = [MLXArray]()
+            var allVals = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            allKeys.reserveCapacity(B)
+            allVals.reserveCapacity(B)
+
+            var allSameLen = true
+            var firstLen = -1
+
+            for i in 0 ..< B {
+                let cache_i = caches[i]
+                let qR: MLXArray
+                let kR: MLXArray
+                if allSameOffset {
+                    qR = qSlices[i]  // already RoPE-applied
+                    kR = kSlices[i]
+                } else {
+                    let offset = cache_i?.offset ?? 0
+                    qR = rope(qSlices[i], offset: offset)
+                    kR = rope(kSlices[i], offset: offset)
+                }
+                let (aK, aV) = cache_i?.update(keys: kR, values: vSlices[i])
+                    ?? (kR, vSlices[i])
+                rotQ.append(qR)
+                allKeys.append(aK)
+                allVals.append(aV)
+
+                let sLen = aK.dim(2)
+                if firstLen < 0 { firstLen = sLen }
+                if sLen != firstLen { allSameLen = false }
+            }
+
+            let output: MLXArray
+            if allSameLen && B > 1 {
+                let bQ = concatenated(rotQ, axis: 0)
+                let bK = concatenated(allKeys, axis: 0)
+                let bV = concatenated(allVals, axis: 0)
+                output = MLXFast.scaledDotProductAttention(
+                    queries: bQ, keys: bK, values: bV,
+                    scale: scale, mask: .none
+                )
+            } else {
+                var outputs = [MLXArray]()
+                outputs.reserveCapacity(B)
+                for i in 0 ..< B {
+                    let attn = MLXFast.scaledDotProductAttention(
+                        queries: rotQ[i], keys: allKeys[i], values: allVals[i],
+                        scale: scale, mask: .none
+                    )
+                    outputs.append(attn)
+                }
+                output = concatenated(outputs, axis: 0)
+            }
+
+            return wo(
+                output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            )
+        }
+
+        /// Fully batched attention with `BatchedKVCache` — zero per-request
+        /// loops in the common all-same-offset case. Single batched cache
+        /// update, single batched SDPA against the shared cache. Mirrors
+        /// `Qwen3Attention.fullyBatchedForward` (lines 188–233 of MLXLLM
+        /// Qwen3.swift) but without the Qwen3 q/k-norm — Qwen2 has none.
+        /// Pairs with `Qwen2Model.fullyBatchedDecode`.
+        public func fullyBatchedForward(
+            _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+            mask: MLXArray
+        ) -> MLXArray {
+            let B = x.dim(0)
+            let L = x.dim(1)
+
+            // Batched Q/K/V projections (Linear includes bias=true).
+            var queries = wq(x).reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
+            var keys = wk(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+            let values = wv(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+
+            // RoPE + cache update.
+            let allSameOffset = cache.offsets[0 ..< cache.active]
+                .allSatisfy { $0 == cache.offsets[0] }
+            if allSameOffset {
+                let offset = cache.offsets[0]
+                queries = rope(queries, offset: offset)
+                keys = rope(keys, offset: offset)
+                cache.update(newKeys: keys, newValues: values)
+            } else {
+                let qSlices = split(queries, parts: B, axis: 0)
+                let kSlices = split(keys, parts: B, axis: 0)
+                var rotQ = [MLXArray]()
+                var rotK = [MLXArray]()
+                rotQ.reserveCapacity(B)
+                rotK.reserveCapacity(B)
+                for i in 0 ..< B {
+                    let off = cache.offsets[i]
+                    rotQ.append(rope(qSlices[i], offset: off))
+                    rotK.append(rope(kSlices[i], offset: off))
+                }
+                queries = concatenated(rotQ, axis: 0)
+                keys = concatenated(rotK, axis: 0)
+                cache.update(newKeys: keys, newValues: values)
+            }
+
+            let output = cache.attention(queries: queries, scale: scale, mask: mask)
+            return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
         }
     }
 
@@ -154,6 +377,24 @@ public enum Qwen2 {
         ProcessInfo.processInfo.environment["F83_FUSED_GATE_ACT"] == "1"
     private static let envProfileDecode: Bool =
         ProcessInfo.processInfo.environment["F83_PROFILE_DECODE"] == "1"
+    /// F-83 night iter #5: fine-grained per-op profile inside Attention.
+    /// Sums times across all 48 layers per step; prints one summary line
+    /// per decode step. Forces eval() per op so absolute numbers are
+    /// inflated; relative breakdown identifies the largest dispatch.
+    static let envProfileAttnFine: Bool =
+        ProcessInfo.processInfo.environment["F83_PROFILE_ATTN_FINE"] == "1"
+    // F-83 fused kernels gate: default OFF until verified. Enable with
+    // F83_FUSED_QKV=1 and F83_FUSED_NORM_GU=1.
+    static let envFusedQKV: Bool =
+        ProcessInfo.processInfo.environment["F83_FUSED_QKV"] == "1"
+    static let envFusedNormGU: Bool =
+        ProcessInfo.processInfo.environment["F83_FUSED_NORM_GU"] == "1"
+    static let envCompiledMLP: Bool =
+        ProcessInfo.processInfo.environment["F83_COMPILED_MLP"] == "1"
+    /// F-83 W2: fused dual-QGEMV(gate+up) + SwiGLU custom kernel.
+    /// Replaces split + compiled silu*mul tail with one Metal dispatch.
+    static let envFusedQSwiGLU: Bool =
+        ProcessInfo.processInfo.environment["F83_FUSED_QSWIGLU"] == "1"
 
     public class MLP: Module, UnaryLayer {
         // Fused gate+up projection. Two separate Linears (gate_proj +
@@ -174,21 +415,47 @@ public enum Qwen2 {
             super.init()
         }
 
-        // Hidden dim is needed by the fused-gate-activation kernel — cached
-        // once at init since it never changes.
         let hiddenDim: Int
 
+        // F-83: wrap swiglu + down in a compiled closure (Gemma4
+        // pattern). Split stays outside — `Split.output_shapes`
+        // can't infer under `shapeless: true`. Win is CPU-side
+        // tape-replay cost.
+        private lazy var compiledTail: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+            compile(inputs: [self], outputs: [], shapeless: true) { [self] gate, up in
+                self.down(Qwen2.compiledSwiglu(gate, up))
+            }
+        }()
+
         public func callAsFunction(_ x: MLXArray) -> MLXArray {
-            // F-83 sprint iter #9 found that MLX.MLXFast.fusedGateActivation
-            // didn't move the needle on Qwen2 16K decode (within noise vs
-            // compiled-swiglu). The split+swiglu path appears to already be
-            // fused by MLX's lazy graph through the compile() pattern.
-            // Kept the env opt-in for future experimentation.
+            // F-83 W2: fused dual-QGEMV(gate+up) + SwiGLU. Only valid for
+            // 4-bit quantized gate_up_proj. Falls through on any mismatch.
+            if Qwen2.envFusedQSwiGLU,
+                let q = gateUp as? QuantizedLinear,
+                q.bits == 4,
+                let biases = q.biases
+            {
+                let K = q.weight.dim(1) * (32 / q.bits)
+                let activated = F83FusedSwiGLU.callAsFunction(
+                    x: x,
+                    gateUpWeight: q.weight,
+                    gateUpScales: q.scales,
+                    gateUpBiases: biases,
+                    intermediate: hiddenDim,
+                    hiddenIn: K,
+                    groupSize: q.groupSize
+                )
+                return down(activated)
+            }
             if Qwen2.envFusedGateAct {
                 let gateUpOut = gateUp(x)
                 let activated = MLX.MLXFast.fusedGateActivation(
                     gateUpOut, hiddenDims: hiddenDim, activation: .silu)
                 return down(activated)
+            }
+            if Qwen2.envCompiledMLP {
+                let parts = MLX.split(gateUp(x), parts: 2, axis: -1)
+                return compiledTail(parts[0], parts[1])
             }
             let parts = MLX.split(gateUp(x), parts: 2, axis: -1)
             return down(Qwen2.compiledSwiglu(parts[0], parts[1]))
@@ -270,6 +537,49 @@ public enum Qwen2 {
             }
             let r = attention(inputLayerNorm(x), mask: mask, cache: cache, raContext: raContext)
             let h = x + r
+            // F-83 fused post_norm + gate_up_proj: L=1 decode, quantized
+            // gateUp (Qwen2 MLP has bias=false). Saves 1 dispatch/layer
+            // (collapses RMSNorm + quantized matmul into one kernel).
+            let L = h.dim(1)
+            if Qwen2.envFusedNormGU, L == 1, h.dim(0) == 1,
+                let qgu = mlp.gateUp as? QuantizedLinear,
+                qgu.bits == 4, qgu.bias == nil,
+                let qguBiases = qgu.biases,
+                (h.dtype == .float16 || h.dtype == .bfloat16)
+            {
+                let fused = MLXFast.rmsNormQuantizedGEMV(
+                    h,
+                    normWeight: postAttentionLayerNorm.weight,
+                    w: qgu.weight, scales: qgu.scales, biases: qguBiases,
+                    eps: postAttentionLayerNorm.eps,
+                    groupSize: qgu.groupSize)
+                let parts = MLX.split(fused, parts: 2, axis: -1)
+                let activated = Qwen2.compiledSwiglu(parts[0], parts[1])
+                return h + mlp.down(activated)
+            }
+            return h + mlp(postAttentionLayerNorm(h))
+        }
+
+        /// Batched forward: batched norms + MLP, per-request attention via
+        /// `Attention.batchedForward`. Pairs with `ModelInner.batchedForward`
+        /// for vllm-swift concurrent decode.
+        public func batchedForward(
+            _ x: MLXArray, caches: [KVCache?]
+        ) -> MLXArray {
+            let normed = inputLayerNorm(x)
+            let r = attention.batchedForward(normed, caches: caches)
+            let h = x + r
+            return h + mlp(postAttentionLayerNorm(h))
+        }
+
+        /// Fully batched forward with shared `BatchedKVCache` — zero loops.
+        public func fullyBatchedForward(
+            _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int, mask: MLXArray
+        ) -> MLXArray {
+            let normed = inputLayerNorm(x)
+            let r = attention.fullyBatchedForward(
+                normed, cache: cache, layerIndex: layerIndex, mask: mask)
+            let h = x + r
             return h + mlp(postAttentionLayerNorm(h))
         }
     }
@@ -309,6 +619,54 @@ public enum Qwen2 {
             let mask = createAttentionMask(h: h, cache: cache?.first)
             for (i, layer) in layers.enumerated() {
                 h = layer(h, mask: mask, cache: cache?[i], raContext: raContexts?[i])
+            }
+            return norm(h)
+        }
+
+        /// Batched forward: B requests with separate per-layer caches.
+        /// `caches`: outer is per-request, inner is per-layer.
+        /// Each layer fans the per-request caches into `DecoderLayer.batchedForward`.
+        public func batchedForward(
+            _ inputs: MLXArray, caches: [[KVCache]]
+        ) -> MLXArray {
+            var h = embedTokens(inputs)
+            for (i, layer) in layers.enumerated() {
+                let layerCaches = caches.map { $0[i] as KVCache? }
+                h = layer.batchedForward(h, caches: layerCaches)
+            }
+            return norm(h)
+        }
+
+        /// Fully batched forward: shared per-layer `BatchedKVCache`. The
+        /// mask is pre-built once from the (post-update) offsets and reused
+        /// across all layers. Mirrors `Qwen3ModelInner.fullyBatchedForward`.
+        public func fullyBatchedForward(
+            _ inputs: MLXArray, caches: [BatchedKVCache]
+        ) -> MLXArray {
+            var h = embedTokens(inputs)
+
+            let B = caches[0].active
+            let cacheDtype = caches[0].keys.dtype
+            let allSame = caches[0].offsets[0 ..< B]
+                .allSatisfy { $0 == caches[0].offsets[0] }
+            let maxPostOffset = (caches[0].offsets[0 ..< B].max() ?? 0) + 1
+            let mask: MLXArray
+            if allSame {
+                mask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+            } else {
+                let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(caches[0].offsets[0 ..< B].map { $0 + 1 })
+                    .reshaped(B, 1)
+                let valid = positions .< offsetsArr
+                mask = MLX.where(
+                    valid,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            }
+
+            for (i, layer) in layers.enumerated() {
+                h = layer.fullyBatchedForward(h, cache: caches[i], layerIndex: i, mask: mask)
             }
             return norm(h)
         }
