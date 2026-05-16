@@ -1181,6 +1181,16 @@ extension Qwen35TextModel: BatchedHybridLLM {
         // back to 2048. This matches BatchedKVCache.init's default.
         let maxSeq = parameters?.maxKVSize ?? 2048
 
+        // SSM state stored in bf16 (matches Python mlx-lm's
+        // `mx.zeros(..., dtype=q.dtype)` which is bf16 for these checkpoints).
+        // The GDN Metal kernel accumulates in fp32 registers internally
+        // regardless of StT, so the only precision loss is at the per-step
+        // round-trip boundary — Python proves that's acceptable for quality.
+        // Storing bf16 halves recState bandwidth on the hottest decode path
+        // (Qwen3.6-27B: 48 GDN layers × ~200 MB fp32 → ~100 MB bf16 per step
+        // at B=64). Override via VSM_GDN_REC_FP32=1 to restore fp32 for A/B.
+        let recDtype: DType = (ProcessInfo.processInfo.environment["VSM_GDN_REC_FP32"] == "1")
+            ? .float32 : .bfloat16
         let layers: [BatchedHybridCache.BatchedLayerCache] = model.layers.map { layer in
             if layer.isLinear {
                 return .gdn(BatchedMambaCache(
@@ -1189,7 +1199,8 @@ extension Qwen35TextModel: BatchedHybridLLM {
                     convDim: convDim,
                     Hv: cfg.linearNumValueHeads,
                     Dv: cfg.linearValueHeadDim,
-                    Dk: cfg.linearKeyHeadDim
+                    Dk: cfg.linearKeyHeadDim,
+                    recDtype: recDtype
                 ))
             } else {
                 let kvCache: BatchedKVCache

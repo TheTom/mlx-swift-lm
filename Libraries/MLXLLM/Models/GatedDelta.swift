@@ -388,16 +388,22 @@ func gatedDeltaUpdate(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
 
-    // State kept in fp32 (matches Python mlx-lm). Previously Swift used q.dtype
-    // (bf16) for state, which lost precision across the T-step recurrence and
-    // was the reason the Metal kernel was flagged "correctness bug at T>1"
-    // (~0.25 max diff). With fp32 state, the kernel path is correct AND much
-    // faster: one Metal dispatch for all T timesteps instead of a Swift-side
-    // T-loop.
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
-    if state.dtype != .float32 {
-        state = state.asType(.float32)
-    }
+    // Default state dtype = fp32 (matches Python mlx-lm's `mx.zeros((...),
+    // dtype=q.dtype)` semantics when callers want max precision; previously
+    // Swift used q.dtype/bf16 which lost precision across the T-step recurrence
+    // and triggered a "correctness bug at T>1" (~0.25 max diff).
+    //
+    // The kernel always accumulates in fp32 internally regardless of StT
+    // (see `rms_norm_rope.metal` / `gated_delta_step` — `float state[n_per_t]`
+    // load/store with explicit casts). So callers may pass a bf16 state buffer
+    // and the kernel will load bf16→fp32, run the full T-step recurrence in
+    // fp32 registers, then store fp32→bf16 once. That round-trip loses ~10
+    // bits per call boundary, which is fine for single-step decode where
+    // Python also uses bf16 state. Don't force-cast the caller's choice — let
+    // `BatchedMambaCache(recDtype: .bfloat16)` keep its bf16 storage so the
+    // fully-batched decode path halves SSM-state bandwidth on the hottest
+    // path (e.g. Qwen3.6-27B's 48 GDN layers at B=64).
+    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
 
     return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
 }
