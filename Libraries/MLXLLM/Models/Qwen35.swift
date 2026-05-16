@@ -403,14 +403,13 @@ final class Qwen35GatedDeltaNet: Module {
         } else {
             // Python: q = inv_scale^2 * rms_norm(q, None, 1e-6)
             //         k = inv_scale     * rms_norm(k, None, 1e-6)
-            // `None` weight == apply norm without scaling; mlx-swift
-            // requires an MLXArray, so allocate ones once per call (cheap
-            // — single small alloc that the lazy graph hoists/reuses).
+            // mlx-swift's `MLXArray.mlxNone` is the no-weight sentinel
+            // (same pattern Qwen3Next uses at Qwen3Next.swift:407-410).
             let invScale = Float(1.0) / Float(headKDim).squareRoot()
-            let onesK = MLXArray.ones([headKDim], dtype: q.dtype)
             let qNormed = (invScale * invScale)
-                * MLXFast.rmsNorm(q, weight: onesK, eps: 1e-6)
-            let kNormed = invScale * MLXFast.rmsNorm(k, weight: onesK, eps: 1e-6)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed = invScale
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
             (out, newRecState) = gatedDeltaUpdate(
                 q: qNormed, k: kNormed, v: v,
                 a: a, b: b, aLog: aLog, dtBias: dtBias,
