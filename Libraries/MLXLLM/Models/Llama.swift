@@ -66,6 +66,144 @@ class LlamaAttention: Module {
 
         return wo(output)
     }
+
+    /// Batched attention: B requests with per-request KV caches.
+    /// Mirrors Qwen2.Attention.batchedForward. Llama uses standard
+    /// q/k/v_proj (bias optional via args.attentionBias), no q/k norm,
+    /// RoPELayer (Llama3RoPE / RoPE) that conforms to `RoPELayer`.
+    public func batchedForward(
+        _ x: MLXArray, caches: [KVCache?]
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        var queries = wq(x)
+        var keys = wk(x)
+        var values = wv(x)
+
+        queries = queries.reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+
+        let firstOffset = caches[0]?.offset ?? 0
+        let allSameOffset = (1 ..< B).allSatisfy {
+            (caches[$0]?.offset ?? 0) == firstOffset
+        }
+
+        let qSlices: [MLXArray]
+        let kSlices: [MLXArray]
+        let vSlices: [MLXArray]
+        if allSameOffset {
+            let qRoped = rope(queries, offset: firstOffset)
+            let kRoped = rope(keys, offset: firstOffset)
+            qSlices = split(qRoped, parts: B, axis: 0)
+            kSlices = split(kRoped, parts: B, axis: 0)
+            vSlices = split(values, parts: B, axis: 0)
+        } else {
+            qSlices = split(queries, parts: B, axis: 0)
+            kSlices = split(keys, parts: B, axis: 0)
+            vSlices = split(values, parts: B, axis: 0)
+        }
+
+        var rotQ = [MLXArray]()
+        var allKeys = [MLXArray]()
+        var allVals = [MLXArray]()
+        rotQ.reserveCapacity(B)
+        allKeys.reserveCapacity(B)
+        allVals.reserveCapacity(B)
+
+        var allSameLen = true
+        var firstLen = -1
+
+        for i in 0 ..< B {
+            let cache_i = caches[i]
+            let qR: MLXArray
+            let kR: MLXArray
+            if allSameOffset {
+                qR = qSlices[i]
+                kR = kSlices[i]
+            } else {
+                let offset = cache_i?.offset ?? 0
+                qR = rope(qSlices[i], offset: offset)
+                kR = rope(kSlices[i], offset: offset)
+            }
+            let (aK, aV) = cache_i?.update(keys: kR, values: vSlices[i])
+                ?? (kR, vSlices[i])
+            rotQ.append(qR)
+            allKeys.append(aK)
+            allVals.append(aV)
+
+            let sLen = aK.dim(2)
+            if firstLen < 0 { firstLen = sLen }
+            if sLen != firstLen { allSameLen = false }
+        }
+
+        let output: MLXArray
+        if allSameLen && B > 1 {
+            let bQ = concatenated(rotQ, axis: 0)
+            let bK = concatenated(allKeys, axis: 0)
+            let bV = concatenated(allVals, axis: 0)
+            output = MLXFast.scaledDotProductAttention(
+                queries: bQ, keys: bK, values: bV,
+                scale: scale, mask: .none
+            )
+        } else {
+            var outputs = [MLXArray]()
+            outputs.reserveCapacity(B)
+            for i in 0 ..< B {
+                let attn = MLXFast.scaledDotProductAttention(
+                    queries: rotQ[i], keys: allKeys[i], values: allVals[i],
+                    scale: scale, mask: .none
+                )
+                outputs.append(attn)
+            }
+            output = concatenated(outputs, axis: 0)
+        }
+
+        return wo(
+            output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        )
+    }
+
+    /// Fully batched attention with shared `BatchedKVCache`.
+    public func fullyBatchedForward(
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+        mask: MLXArray
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        var queries = wq(x).reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
+        var keys = wk(x).reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        let values = wv(x).reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+
+        let allSameOffset = cache.offsets[0 ..< cache.active]
+            .allSatisfy { $0 == cache.offsets[0] }
+        if allSameOffset {
+            let offset = cache.offsets[0]
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            let qSlices = split(queries, parts: B, axis: 0)
+            let kSlices = split(keys, parts: B, axis: 0)
+            var rotQ = [MLXArray]()
+            var rotK = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            rotK.reserveCapacity(B)
+            for i in 0 ..< B {
+                let off = cache.offsets[i]
+                rotQ.append(rope(qSlices[i], offset: off))
+                rotK.append(rope(kSlices[i], offset: off))
+            }
+            queries = concatenated(rotQ, axis: 0)
+            keys = concatenated(rotK, axis: 0)
+            cache.update(newKeys: keys, newValues: values)
+        }
+
+        let output = cache.attention(queries: queries, scale: scale, mask: mask)
+        return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
 }
 
 class LlamaMLP: Module, UnaryLayer {
@@ -110,6 +248,27 @@ class LlamaTransformerBlock: Module {
         r = mlp(postAttentionLayerNorm(h))
         let out = h + r
         return out
+    }
+
+    /// Batched forward: batched norms + MLP, per-request attention.
+    public func batchedForward(
+        _ x: MLXArray, caches: [KVCache?]
+    ) -> MLXArray {
+        let normed = inputLayerNorm(x)
+        let r = attention.batchedForward(normed, caches: caches)
+        let h = x + r
+        return h + mlp(postAttentionLayerNorm(h))
+    }
+
+    /// Fully batched forward with shared `BatchedKVCache`.
+    public func fullyBatchedForward(
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int, mask: MLXArray
+    ) -> MLXArray {
+        let normed = inputLayerNorm(x)
+        let r = attention.fullyBatchedForward(
+            normed, cache: cache, layerIndex: layerIndex, mask: mask)
+        let h = x + r
+        return h + mlp(postAttentionLayerNorm(h))
     }
 }
 
@@ -164,6 +323,50 @@ public class LlamaModelInner: Module {
         if needsFP32Upcast { normed = normed.asType(originalDtype) }
         return normed
     }
+
+    /// Batched forward: B requests with separate per-layer caches.
+    /// caches: [[KVCache]] — outer per-request, inner per-layer.
+    public func batchedForward(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+        var h = embedTokens(inputs)
+        for (i, layer) in layers.enumerated() {
+            let layerCaches = caches.map { $0[i] as KVCache? }
+            h = layer.batchedForward(h, caches: layerCaches)
+        }
+        return norm(h)
+    }
+
+    /// Fully batched forward: shared per-layer `BatchedKVCache`. The mask is
+    /// built once from the (post-update) offsets and reused across all layers.
+    public func fullyBatchedForward(
+        _ inputs: MLXArray, caches: [BatchedKVCache]
+    ) -> MLXArray {
+        var h = embedTokens(inputs)
+
+        let B = caches[0].active
+        let cacheDtype = caches[0].keys.dtype
+        let allSame = caches[0].offsets[0 ..< B]
+            .allSatisfy { $0 == caches[0].offsets[0] }
+        let maxPostOffset = (caches[0].offsets[0 ..< B].max() ?? 0) + 1
+        let mask: MLXArray
+        if allSame {
+            mask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+        } else {
+            let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+            let offsetsArr = MLXArray(caches[0].offsets[0 ..< B].map { $0 + 1 })
+                .reshaped(B, 1)
+            let valid = positions .< offsetsArr
+            mask = MLX.where(
+                valid,
+                MLXArray(Float(0)).asType(cacheDtype),
+                MLXArray(Float(-1e9)).asType(cacheDtype)
+            ).reshaped(B, 1, 1, maxPostOffset)
+        }
+
+        for (i, layer) in layers.enumerated() {
+            h = layer.fullyBatchedForward(h, cache: caches[i], layerIndex: i, mask: mask)
+        }
+        return norm(h)
+    }
 }
 
 /// Model for Llama and Mistral model types.
@@ -187,6 +390,29 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let out = model(inputs, cache: cache)
+        if let lmHead {
+            return lmHead(out)
+        } else {
+            return model.embedTokens.asLinear(out)
+        }
+    }
+
+    /// Batched decode: B requests with per-request per-layer caches.
+    /// inputs: [B, 1] token IDs. caches: B arrays of per-layer KVCache.
+    public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+        let out = model.batchedForward(inputs, caches: caches)
+        if let lmHead {
+            return lmHead(out)
+        } else {
+            return model.embedTokens.asLinear(out)
+        }
+    }
+
+    /// Fully batched decode with shared per-layer `BatchedKVCache`.
+    public func fullyBatchedDecode(
+        _ inputs: MLXArray, caches: [BatchedKVCache]
+    ) -> MLXArray {
+        let out = model.fullyBatchedForward(inputs, caches: caches)
         if let lmHead {
             return lmHead(out)
         } else {
