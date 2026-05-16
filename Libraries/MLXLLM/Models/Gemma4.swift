@@ -506,6 +506,274 @@ class Gemma4Attention: Module {
 
         return oProj(output)
     }
+
+    // MARK: - Batched forward (vllm-swift parallel decode)
+
+    /// Batched attention: B requests with per-request KV caches.
+    /// Mirrors Qwen2/Gemma3 pattern, with Gemma4-specific bits:
+    /// `attentionKEqV` (V=K on non-sliding layers), no fused-norm-rope path
+    /// (the framework kernel takes a [B,L,H,d] reshape that already handles B>1
+    /// but doesn't accept the per-request offsets we need when offsets diverge),
+    /// and inline q/k norm post-reshape.
+    /// Decode-only entry point — does not handle the KV-sharing useSharedKV path;
+    /// the caller (ModelInner.batchedForward) drives that separately.
+    public func batchedForward(
+        _ x: MLXArray, caches: [KVCache?]
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        var queries = qProj(x).reshaped(B, L, nHeads, -1)
+        var keys = kProj(x).reshaped(B, L, nKVHeads, -1)
+        var values: MLXArray
+        if attentionKEqV {
+            values = keys
+        } else {
+            values = vProj!(x).reshaped(B, L, nKVHeads, -1)
+        }
+
+        // Norms operate over the head dim (last axis) — broadcast over B/L/heads.
+        queries = qNorm(queries).transposed(0, 2, 1, 3)
+        keys = kNorm(keys).transposed(0, 2, 1, 3)
+        // v_norm: no learnable scale (matches inline call in dense forward).
+        values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
+        values = values.transposed(0, 2, 1, 3)
+
+        let firstOffset = caches[0]?.offset ?? 0
+        let allSameOffset = (1 ..< B).allSatisfy {
+            (caches[$0]?.offset ?? 0) == firstOffset
+        }
+
+        let qSlices: [MLXArray]
+        let kSlices: [MLXArray]
+        let vSlices: [MLXArray]
+        if allSameOffset {
+            let qRoped = rope(queries, offset: firstOffset)
+            let kRoped = rope(keys, offset: firstOffset)
+            qSlices = split(qRoped, parts: B, axis: 0)
+            kSlices = split(kRoped, parts: B, axis: 0)
+            vSlices = split(values, parts: B, axis: 0)
+        } else {
+            qSlices = split(queries, parts: B, axis: 0)
+            kSlices = split(keys, parts: B, axis: 0)
+            vSlices = split(values, parts: B, axis: 0)
+        }
+
+        var rotQ = [MLXArray]()
+        var allKeys = [MLXArray]()
+        var allVals = [MLXArray]()
+        rotQ.reserveCapacity(B)
+        allKeys.reserveCapacity(B)
+        allVals.reserveCapacity(B)
+
+        var allSameLen = true
+        var firstLen = -1
+
+        for i in 0 ..< B {
+            let cache_i = caches[i]
+            let qR: MLXArray
+            let kR: MLXArray
+            if allSameOffset {
+                qR = qSlices[i]
+                kR = kSlices[i]
+            } else {
+                let offset = cache_i?.offset ?? 0
+                qR = rope(qSlices[i], offset: offset)
+                kR = rope(kSlices[i], offset: offset)
+            }
+            let (aK, aV) = cache_i?.update(keys: kR, values: vSlices[i])
+                ?? (kR, vSlices[i])
+            rotQ.append(qR)
+            allKeys.append(aK)
+            allVals.append(aV)
+
+            let sLen = aK.dim(2)
+            if firstLen < 0 { firstLen = sLen }
+            if sLen != firstLen { allSameLen = false }
+        }
+
+        let output: MLXArray
+        if allSameLen && B > 1 {
+            let bQ = concatenated(rotQ, axis: 0)
+            let bK = concatenated(allKeys, axis: 0)
+            let bV = concatenated(allVals, axis: 0)
+            output = MLXFast.scaledDotProductAttention(
+                queries: bQ, keys: bK, values: bV,
+                scale: scale, mask: .none
+            )
+        } else {
+            var outputs = [MLXArray]()
+            outputs.reserveCapacity(B)
+            for i in 0 ..< B {
+                let attn = MLXFast.scaledDotProductAttention(
+                    queries: rotQ[i], keys: allKeys[i], values: allVals[i],
+                    scale: scale, mask: .none
+                )
+                outputs.append(attn)
+            }
+            output = concatenated(outputs, axis: 0)
+        }
+
+        return oProj(
+            output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        )
+    }
+
+    /// Batched attention for KV-shared layers (decode only).
+    /// Skips K/V projection — reads K/V from each request's donor-layer
+    /// `lastReturnedKeys/Values` (populated by donor's `cache.update()`).
+    /// `donorOffsets[i]` is the donor's pre-update cache offset, captured
+    /// before the donor ran — used as the Q rope offset to match donor's K.
+    public func batchedSharedKVForward(
+        _ x: MLXArray, donorKVs: [(MLXArray, MLXArray)?], donorOffsets: [Int]
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        var queries = qProj(x).reshaped(B, L, nHeads, -1)
+        queries = qNorm(queries).transposed(0, 2, 1, 3)
+
+        let qSlices = split(queries, parts: B, axis: 0)
+
+        var rotQ = [MLXArray]()
+        var allKeys = [MLXArray]()
+        var allVals = [MLXArray]()
+        rotQ.reserveCapacity(B)
+        allKeys.reserveCapacity(B)
+        allVals.reserveCapacity(B)
+
+        var allSameLen = true
+        var firstLen = -1
+
+        for i in 0 ..< B {
+            let qR = rope(qSlices[i], offset: donorOffsets[i])
+            guard let (k, v) = donorKVs[i] else {
+                // Defensive — donor must have produced K/V before this layer.
+                rotQ.append(qR)
+                allKeys.append(qR)
+                allVals.append(qR)
+                continue
+            }
+            rotQ.append(qR)
+            allKeys.append(k)
+            allVals.append(v)
+            let sLen = k.dim(2)
+            if firstLen < 0 { firstLen = sLen }
+            if sLen != firstLen { allSameLen = false }
+        }
+
+        let output: MLXArray
+        if allSameLen && B > 1 {
+            let bQ = concatenated(rotQ, axis: 0)
+            let bK = concatenated(allKeys, axis: 0)
+            let bV = concatenated(allVals, axis: 0)
+            output = MLXFast.scaledDotProductAttention(
+                queries: bQ, keys: bK, values: bV,
+                scale: scale, mask: .none
+            )
+        } else {
+            var outputs = [MLXArray]()
+            outputs.reserveCapacity(B)
+            for i in 0 ..< B {
+                let attn = MLXFast.scaledDotProductAttention(
+                    queries: rotQ[i], keys: allKeys[i], values: allVals[i],
+                    scale: scale, mask: .none
+                )
+                outputs.append(attn)
+            }
+            output = concatenated(outputs, axis: 0)
+        }
+
+        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
+
+    /// Fully batched attention with shared `BatchedKVCache`. Caller provides
+    /// the per-layer-type mask (sliding-window vs global). Same `attentionKEqV`
+    /// handling as the per-request batched path.
+    public func fullyBatchedForward(
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+        mask: MLXArray
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        var queries = qProj(x).reshaped(B, L, nHeads, -1)
+        var keys = kProj(x).reshaped(B, L, nKVHeads, -1)
+        var values: MLXArray
+        if attentionKEqV {
+            values = keys
+        } else {
+            values = vProj!(x).reshaped(B, L, nKVHeads, -1)
+        }
+
+        queries = qNorm(queries).transposed(0, 2, 1, 3)
+        keys = kNorm(keys).transposed(0, 2, 1, 3)
+        values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
+        values = values.transposed(0, 2, 1, 3)
+
+        let allSameOffset = cache.offsets[0 ..< cache.active]
+            .allSatisfy { $0 == cache.offsets[0] }
+        if allSameOffset {
+            let offset = cache.offsets[0]
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            let qSlices = split(queries, parts: B, axis: 0)
+            let kSlices = split(keys, parts: B, axis: 0)
+            var rotQ = [MLXArray]()
+            var rotK = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            rotK.reserveCapacity(B)
+            for i in 0 ..< B {
+                let off = cache.offsets[i]
+                rotQ.append(rope(qSlices[i], offset: off))
+                rotK.append(rope(kSlices[i], offset: off))
+            }
+            queries = concatenated(rotQ, axis: 0)
+            keys = concatenated(rotK, axis: 0)
+            cache.update(newKeys: keys, newValues: values)
+        }
+
+        let output = cache.attention(queries: queries, scale: scale, mask: mask)
+        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
+
+    /// Fully batched shared-KV attention. Reads K/V from the donor's
+    /// `BatchedKVCache` (already populated by donor layer this step) and runs
+    /// Q-only path. `donorCache` is the shared cache; we slice K/V up to the
+    /// current per-slot offsets.
+    public func fullyBatchedSharedKVForward(
+        _ x: MLXArray, donorCache: BatchedKVCache, donorPreUpdateOffsets: [Int],
+        mask: MLXArray
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        var queries = qProj(x).reshaped(B, L, nHeads, -1)
+        queries = qNorm(queries).transposed(0, 2, 1, 3)
+
+        // For RoPE: Q must rotate to the same positions the donor's K rotated to.
+        // Donor wrote the new K at donorPreUpdateOffsets[i] (its pre-update offset),
+        // so Q for slot i uses that same offset.
+        let allSameOffset = (1 ..< B).allSatisfy {
+            donorPreUpdateOffsets[$0] == donorPreUpdateOffsets[0]
+        }
+        if allSameOffset {
+            queries = rope(queries, offset: donorPreUpdateOffsets[0])
+        } else {
+            let qSlices = split(queries, parts: B, axis: 0)
+            var rotQ = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            for i in 0 ..< B {
+                rotQ.append(rope(qSlices[i], offset: donorPreUpdateOffsets[i]))
+            }
+            queries = concatenated(rotQ, axis: 0)
+        }
+
+        let output = donorCache.attention(queries: queries, scale: scale, mask: mask)
+        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
 }
 
 // MARK: - Compiled fused ops (matching Python mlx-lm)
@@ -780,6 +1048,115 @@ class Gemma4TransformerBlock: Module {
 
         return h
     }
+
+    // MARK: - Batched forward (vllm-swift parallel decode)
+
+    /// FFN block (shared MLP + optional MoE + post-norm/residual). Used by
+    /// both batched and fully-batched paths — operates element-wise per token,
+    /// so [B, 1, hidden] passes through unchanged. SwitchGLU/FusedGateUpSwitchGLU
+    /// are expert-batched internally so MoE works on any B.
+    private func ffnAndScale(_ h_in: MLXArray, perLayerInput: MLXArray?) -> MLXArray {
+        var h = h_in
+        if let experts, let router,
+           let postNorm1 = postFeedforwardLayerNorm1,
+           let preNorm2 = preFeedforwardLayerNorm2,
+           let postNorm2 = postFeedforwardLayerNorm2
+        {
+            let preFFNNorm = preFeedforwardLayerNorm(h)
+            var h1 = sharedMLP(preFFNNorm)
+            h1 = postNorm1(h1)
+
+            let routerLogits = router(h)
+            let (topKLogits, topKIndices) = gemma4TopK(routerLogits, k: topKExperts, axis: -1)
+            let stopIndices = MLX.stopGradient(topKIndices)
+            var expertWeights = softmax(topKLogits, axis: -1, precise: true)
+            expertWeights = expertWeights * router.perExpertScale[topKIndices]
+            let preFFNNorm2 = preNorm2(h)
+            var h2 = experts(preFFNNorm2, stopIndices)
+            h2 = h2 * expandedDimensions(expertWeights, axis: -1)
+            h2 = h2.sum(axis: -2)
+            h2 = postNorm2(h2)
+
+            let ffnOut = h1 + h2
+            h = MLXFast.rmsNormResidual(
+                ffnOut, residual: h,
+                weight: postFeedforwardLayerNorm.weight,
+                eps: postFeedforwardLayerNorm.eps)
+        } else {
+            let preFFNNorm = preFeedforwardLayerNorm(h)
+            let ffnOut = sharedMLP(preFFNNorm)
+            h = MLXFast.rmsNormResidual(
+                ffnOut, residual: h,
+                weight: postFeedforwardLayerNorm.weight,
+                eps: postFeedforwardLayerNorm.eps)
+        }
+
+        if let gate = perLayerInputGate,
+           let proj = perLayerProjection,
+           let norm = postPerLayerInputNorm,
+           let pli = perLayerInput
+        {
+            let residual = h
+            var g = compiledGeluMul(gate(h), pli)
+            g = proj(g)
+            g = norm(g)
+            h = residual + g
+        }
+
+        return h * layerScalar
+    }
+
+    /// Batched forward: batched norms + MLP, per-request attention via
+    /// `Gemma4Attention.batchedForward`. When `useSharedKV` is true the
+    /// caller (ModelInner.batchedForward) routes through the shared-KV path.
+    func batchedForward(
+        _ x: MLXArray, caches: [KVCache?], perLayerInput: MLXArray? = nil,
+        useSharedKV: Bool = false,
+        sharedDonorKVs: [(MLXArray, MLXArray)?]? = nil,
+        donorOffsets: [Int]? = nil
+    ) -> MLXArray {
+        let inputNorm = inputLayerNorm(x)
+        let attnOut: MLXArray
+        if useSharedKV, let sharedDonorKVs, let donorOffsets {
+            attnOut = selfAttention.batchedSharedKVForward(
+                inputNorm, donorKVs: sharedDonorKVs, donorOffsets: donorOffsets)
+        } else {
+            attnOut = selfAttention.batchedForward(inputNorm, caches: caches)
+        }
+        let h = MLXFast.rmsNormResidual(
+            attnOut, residual: x,
+            weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps)
+
+        return ffnAndScale(h, perLayerInput: perLayerInput)
+    }
+
+    /// Fully batched forward with shared `BatchedKVCache`. `cache` is the
+    /// per-layer batched cache; for shared-KV layers, `cache` IS the donor's
+    /// cache and `useSharedKV=true` so we skip the K/V projection.
+    func fullyBatchedForward(
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int, mask: MLXArray,
+        perLayerInput: MLXArray? = nil,
+        useSharedKV: Bool = false,
+        donorPreUpdateOffsets: [Int]? = nil
+    ) -> MLXArray {
+        let inputNorm = inputLayerNorm(x)
+        let attnOut: MLXArray
+        if useSharedKV, let donorPreUpdateOffsets {
+            attnOut = selfAttention.fullyBatchedSharedKVForward(
+                inputNorm, donorCache: cache,
+                donorPreUpdateOffsets: donorPreUpdateOffsets, mask: mask)
+        } else {
+            attnOut = selfAttention.fullyBatchedForward(
+                inputNorm, cache: cache, layerIndex: layerIndex, mask: mask)
+        }
+        let h = MLXFast.rmsNormResidual(
+            attnOut, residual: x,
+            weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps)
+
+        return ffnAndScale(h, perLayerInput: perLayerInput)
+    }
 }
 
 // MARK: - Inner Model
@@ -1003,6 +1380,173 @@ public class Gemma4ModelInner: Module {
 
         return norm(h)
     }
+
+    // MARK: - Batched forward (vllm-swift parallel decode)
+
+    /// Compute Per-Layer Embeddings for a batched input. Same math as the
+    /// single-request path; just operates on [B, L] tokens → [B, L, H, plDim].
+    private func computePerLayerInputs(_ inputs: MLXArray, h: MLXArray) -> MLXArray? {
+        guard hiddenSizePerLayerInput > 0,
+              let embedPL = embedTokensPerLayer else { return nil }
+        var pli = embedPL(inputs)
+        pli = pli * embedTokensPerLayerScale
+        pli = pli.reshaped(
+            pli.dim(0), pli.dim(1), config.hiddenLayers, hiddenSizePerLayerInput)
+        if let proj = perLayerModelProjection {
+            var plProj = proj(h)
+            plProj = plProj * perLayerProjectionScale
+            plProj = plProj.reshaped(
+                plProj.dim(0), plProj.dim(1), config.hiddenLayers, hiddenSizePerLayerInput)
+            if let norm = perLayerProjectionNorm {
+                plProj = norm(plProj)
+            }
+            pli = (plProj + pli) * perLayerInputScale
+        }
+        return pli
+    }
+
+    /// Batched forward: B requests with separate per-layer caches.
+    /// caches: [[KVCache]] — outer per-request, inner per-layer. KV-shared
+    /// layers consume donor's `lastReturnedKeys/Values` from each per-request
+    /// cache (requires `MLX_KV_TRACK_LAST=1` to be set — same as single path).
+    func batchedForward(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+        var h = embedTokens(inputs)
+        h = h * sqrt(Float(config.hiddenSize))
+        let B = inputs.dim(0)
+
+        let perLayerInputs = computePerLayerInputs(inputs, h: h)
+
+        // Per-request donor state for KV sharing.
+        var donorPreUpdateOffsetsPerLayer = Array(
+            repeating: Array(repeating: 0, count: B), count: layers.count)
+        var intermediateKVs: [[ (MLXArray, MLXArray)? ]] = Array(
+            repeating: Array(repeating: nil, count: B), count: layers.count)
+
+        for (i, layer) in layers.enumerated() {
+            let pli: MLXArray? = perLayerInputs.map { $0[0..., 0..., i, 0...] }
+            let donorIdx = previousKVs[i]
+            let isShared = donorIdx != i
+
+            if isShared {
+                let donorKVs = intermediateKVs[donorIdx]
+                let donorOffsets = donorPreUpdateOffsetsPerLayer[donorIdx]
+                h = layer.batchedForward(
+                    h, caches: Array(repeating: nil, count: B),
+                    perLayerInput: pli, useSharedKV: true,
+                    sharedDonorKVs: donorKVs, donorOffsets: donorOffsets)
+            } else {
+                // Snapshot per-request pre-update offsets so shared layers
+                // downstream can apply Q rope at matching positions.
+                for b in 0 ..< B {
+                    donorPreUpdateOffsetsPerLayer[i][b] = caches[b][i].offset
+                }
+                let layerCaches: [KVCache?] = caches.map { $0[i] }
+                h = layer.batchedForward(
+                    h, caches: layerCaches, perLayerInput: pli)
+                // Snapshot donor K/V for any downstream shared layer.
+                if config.numKvSharedLayers > 0 {
+                    for b in 0 ..< B {
+                        if let c = caches[b][i] as? StandardKVCache,
+                           let k = c.lastReturnedKeys, let v = c.lastReturnedValues
+                        {
+                            intermediateKVs[i][b] = (k, v)
+                        } else if let c = caches[b][i] as? TurboQuantizedKVCache,
+                                  let k = c.lastReturnedKeys, let v = c.lastReturnedValues
+                        {
+                            intermediateKVs[i][b] = (k, v)
+                        }
+                    }
+                }
+            }
+        }
+        return norm(h)
+    }
+
+    /// Fully batched forward with shared per-layer `BatchedKVCache`. Builds
+    /// dual masks (sliding-window vs global) once per pass; for KV-shared
+    /// layers reads from the donor's BatchedKVCache directly.
+    /// Caller must pass per-layer caches sized for that layer's kvHeads/headDim
+    /// (Gemma4 sliding/global differ). For shared-KV layers, `caches[i]`
+    /// should be the donor's cache (i.e. `caches[previousKVs[i]]`).
+    func fullyBatchedForward(
+        _ inputs: MLXArray, caches: [BatchedKVCache]
+    ) -> MLXArray {
+        var h = embedTokens(inputs)
+        h = h * sqrt(Float(config.hiddenSize))
+
+        let perLayerInputs = computePerLayerInputs(inputs, h: h)
+
+        let B = caches[0].active
+        let cacheDtype = caches[0].keys.dtype
+        let allSame = caches[0].offsets[0 ..< B]
+            .allSatisfy { $0 == caches[0].offsets[0] }
+        // For decode (L=1), positions covered after update is offsets+1.
+        let maxPostOffset = (caches[0].offsets[0 ..< B].max() ?? 0) + 1
+
+        // Global mask: all valid positions up to each request's offset.
+        let globalMask: MLXArray
+        if allSame {
+            globalMask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+        } else {
+            let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+            let offsetsArr = MLXArray(caches[0].offsets[0 ..< B].map { $0 + 1 })
+                .reshaped(B, 1)
+            let valid = positions .< offsetsArr
+            globalMask = MLX.where(
+                valid,
+                MLXArray(Float(0)).asType(cacheDtype),
+                MLXArray(Float(-1e9)).asType(cacheDtype)
+            ).reshaped(B, 1, 1, maxPostOffset)
+        }
+        // Sliding mask: positions older than (offset - slidingWindow + 1)
+        // are masked out.
+        let slidingMask: MLXArray = {
+            let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+            let offsetsArr = MLXArray(caches[0].offsets[0 ..< B].map { $0 + 1 })
+                .reshaped(B, 1)
+            let lowerBound = offsetsArr - Int32(config.slidingWindow)
+            let inWindow = MLX.logicalAnd(
+                positions .< offsetsArr,
+                positions .>= lowerBound)
+            return MLX.where(
+                inWindow,
+                MLXArray(Float(0)).asType(cacheDtype),
+                MLXArray(Float(-1e9)).asType(cacheDtype)
+            ).reshaped(B, 1, 1, maxPostOffset)
+        }()
+
+        // KV-shared layers need donor's pre-update offsets snapshotted before
+        // the donor's update runs (otherwise we'd see post-update offsets).
+        var donorPreUpdateOffsets = Array(
+            repeating: Array(repeating: 0, count: B), count: layers.count)
+
+        for (i, layer) in layers.enumerated() {
+            let isGlobal = layerTypes[i] == "full_attention"
+            let mask = isGlobal ? globalMask : slidingMask
+            let pli: MLXArray? = perLayerInputs.map { $0[0..., 0..., i, 0...] }
+            let donorIdx = previousKVs[i]
+            let isShared = donorIdx != i
+
+            if isShared {
+                let donorCache = caches[donorIdx]
+                h = layer.fullyBatchedForward(
+                    h, cache: donorCache, layerIndex: i, mask: mask,
+                    perLayerInput: pli, useSharedKV: true,
+                    donorPreUpdateOffsets: donorPreUpdateOffsets[donorIdx])
+            } else {
+                // Snapshot pre-update offsets for downstream shared layers.
+                if config.numKvSharedLayers > 0 {
+                    for b in 0 ..< B {
+                        donorPreUpdateOffsets[i][b] = caches[i].offsets[b]
+                    }
+                }
+                h = layer.fullyBatchedForward(
+                    h, cache: caches[i], layerIndex: i, mask: mask,
+                    perLayerInput: pli)
+            }
+        }
+        return norm(h)
+    }
 }
 
 // MARK: - Gemma4 Text Model
@@ -1093,6 +1637,60 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         return out
     }
+
+    /// Batched decode: B requests with per-request per-layer caches. Closes
+    /// the per-stream sequential fallback in vllm-swift's `vsm_engine_decode_all`
+    /// when running Gemma4 at B>1. Inputs: [B, 1] token IDs. Caches: B arrays
+    /// of per-layer KVCache (one full layer-count array per request).
+    public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+        var out = model.batchedForward(inputs, caches: caches)
+        if config.tieWordEmbeddings {
+            out = model.embedTokens.asLinear(out)
+        } else {
+            out = lmHead!(out)
+        }
+        if let softcap = config.finalLogitSoftcapping, softcap > 0 {
+            out = compiledLogitSoftcap(MLXArray(softcap), out)
+        }
+        return out
+    }
+
+    /// Fully batched decode with shared per-layer `BatchedKVCache`.
+    /// Inputs: [B, 1]. Caches: hiddenLayers entries — each layer's cache
+    /// must be allocated with that layer's per-layer kvHeads/headDim
+    /// (sliding vs global differ; see `self.kvHeads`). KV-shared layers
+    /// must be passed the *donor's* BatchedKVCache at their index.
+    public func fullyBatchedDecode(
+        _ inputs: MLXArray, caches: [BatchedKVCache]
+    ) -> MLXArray {
+        var out = model.fullyBatchedForward(inputs, caches: caches)
+        if config.tieWordEmbeddings {
+            out = model.embedTokens.asLinear(out)
+        } else {
+            out = lmHead!(out)
+        }
+        if let softcap = config.finalLogitSoftcapping, softcap > 0 {
+            out = compiledLogitSoftcap(MLXArray(softcap), out)
+        }
+        return out
+    }
+
+    /// Per-layer dims for vllm-swift `vsm_engine_init_batched` to allocate
+    /// correctly sized `BatchedKVCache` slots. Returns (kvHeads, headDim)
+    /// for each transformer layer in order.
+    public func batchedKVDims() -> [(kvHeads: Int, headDim: Int)] {
+        config.layerTypes.map { layerType in
+            layerType == "full_attention"
+                ? (config.globalKvHeads, config.globalHeadDim)
+                : (config.kvHeads, config.headDim)
+        }
+    }
+
+    /// Donor layer index per layer for KV sharing; `i` if the layer computes
+    /// its own K/V. Used by vllm-swift `vsm_engine_init_batched` to avoid
+    /// double-allocating caches for shared layers (and to know which donor
+    /// cache each shared layer should reference at decode time).
+    public var previousKVs: [Int] { model.previousKVs }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var processedWeights = weights
