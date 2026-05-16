@@ -254,6 +254,74 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
     ) -> MLXArray {
         mambaForward(x, mask: ssmMask, cache: cache as? SSMStateCache)
     }
+
+    /// Fully batched single-step decode against `BatchedMambaCache`. Mirrors
+    /// `mambaForward` for S==1 — slices conv + recurrent state for the
+    /// active prefix, runs Mamba2's `ssmUpdate` kernel batched, writes back.
+    /// Mirrors `Qwen35GatedDeltaNet.fullyBatchedForward` modulo the
+    /// Mamba2-vs-GDN split (different in_proj layout, different ssm kernel).
+    public func fullyBatchedForward(
+        _ inputs: MLXArray, cache: BatchedMambaCache
+    ) -> MLXArray {
+        let B = inputs.dim(0)
+        precondition(B == cache.active,
+                     "Mamba2 fullyBatchedForward: input B (\(B)) ≠ cache.active (\(cache.active))")
+
+        let projected = inProj(inputs)
+        let splits = split(
+            projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
+        let gate = splits[0]
+        let convInput = splits[1]
+        let dt = splits[2]
+
+        // Slice live conv state for the active prefix; concat with new input
+        // along time axis to form the [B, kernel-1 + S, convDim] window.
+        let (convStateSlice, recStateSlice) = cache.slice(active: B)
+        let padded = concatenated([convStateSlice, convInput], axis: 1)
+
+        // New conv state: trailing (kernel-1) tokens. .contiguous() breaks the
+        // lazy chain so prior convInput arrays don't get pinned (matches the
+        // rationale in callAsFunction above and Qwen35GatedDeltaNet).
+        let end = padded.dim(1)
+        let startIdx = max(0, end - (convKernelSize - 1))
+        let newConvState = padded[0..., startIdx ..< end, 0...].contiguous()
+
+        let convOutput = silu(conv1d(padded))
+        let convSplits = split(
+            convOutput,
+            indices: [intermediateSize, intermediateSize + numGroups * ssmStateSize],
+            axis: -1
+        )
+
+        var hidden = convSplits[0]
+        var Bm = convSplits[1]
+        var C = convSplits[2]
+
+        hidden = hidden.reshaped([hidden.dim(0), hidden.dim(1), numHeads, headDim])
+        Bm = Bm.reshaped([Bm.dim(0), Bm.dim(1), numGroups, ssmStateSize])
+        C = C.reshaped([C.dim(0), C.dim(1), numGroups, ssmStateSize])
+
+        let dtArray = dt.reshaped([dt.dim(0), dt.dim(1), numHeads])
+
+        let (y, newRecState) = ssmUpdate(
+            hiddenStates: hidden,
+            ALog: aLog,
+            B: Bm,
+            C: C,
+            D: D,
+            dt: dtArray,
+            dtBias: dtBias,
+            state: recStateSlice,
+            timeStepLimit: timeStepLimit,
+            mask: nil
+        )
+
+        // Commit both pieces of state.
+        cache.writeback(conv: newConvState, rec: newRecState)
+
+        let flattenedY = y.flattened(start: 2)
+        return outProj(norm(flattenedY, gate: gate))
+    }
 }
 
 // MARK: - Attention
@@ -328,6 +396,28 @@ private class NemotronHAttention: Module, NemotronHMixer {
         cache: KVCache?
     ) -> MLXArray {
         attentionForward(x, mask: attentionMask, cache: cache)
+    }
+
+    /// Fully batched single-step decode against `BatchedKVCache`. NemotronH
+    /// attention is the simplest of the batched ports — no RoPE, no Q gate,
+    /// no Q/K norms. Just project, batch-write to cache, batched SDPA.
+    public func fullyBatchedForward(
+        _ x: MLXArray, cache: BatchedKVCache, mask: MLXArray
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        let queries = wq(x).reshaped(B, L, numHeads, headDim).transposed(0, 2, 1, 3)
+        let keys = wk(x).reshaped(B, L, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
+        let values = wv(x).reshaped(B, L, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
+
+        // No RoPE — NemotronH attention is position-encoding-free.
+        cache.update(newKeys: keys, newValues: values)
+        let output = cache.attention(queries: queries, scale: scale, mask: mask)
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+
+        return wo(output)
     }
 }
 
@@ -599,6 +689,41 @@ private class NemotronHBlock: Module {
 
         return x + output
     }
+
+    /// Fully batched decode dispatching by block type. Mamba2 / attention
+    /// route through their `fullyBatchedForward` variants; MLP / MoE just
+    /// run the dense path over the `[B, 1]` tensor (no cache required, no
+    /// mask sensitivity). `layerCache` is `nil` for MLP / MoE blocks.
+    func fullyBatchedForward(
+        _ x: MLXArray,
+        layerCache: BatchedHybridCache.BatchedLayerCache?,
+        attnMask: MLXArray
+    ) -> MLXArray {
+        let hidden = norm(x)
+        let output: MLXArray
+
+        switch blockType {
+        case .mamba:
+            guard let layerCache, case let .gdn(mambaCache) = layerCache else {
+                fatalError("NemotronHBlock: mamba block expected .gdn cache")
+            }
+            output = (mixer as! NemotronHMamba2Mixer).fullyBatchedForward(
+                hidden, cache: mambaCache)
+        case .attention:
+            guard let layerCache, case let .attention(kvCache) = layerCache else {
+                fatalError("NemotronHBlock: attention block expected .attention cache")
+            }
+            output = (mixer as! NemotronHAttention).fullyBatchedForward(
+                hidden, cache: kvCache, mask: attnMask)
+        case .mlp:
+            // MLP is a UnaryLayer dense block — batched [B, 1] runs unchanged.
+            output = (mixer as! NemotronHMLP)(hidden)
+        case .moe:
+            output = (mixer as! NemotronHMoE)(hidden)
+        }
+
+        return x + output
+    }
 }
 
 // MARK: - Backbone (matches Python's NemotronHModel which is stored as self.backbone)
@@ -705,6 +830,74 @@ private class NemotronHBackbone: Module {
                 toEval.append(contentsOf: c.innerState())
                 asyncEval(toEval)
             }
+        }
+
+        return normF(hidden)
+    }
+
+    /// Fully batched single-step decode forward pass. Builds the shared
+    /// attention mask once from the first attention layer's `BatchedKVCache`
+    /// and reuses it across every attention layer. Mamba blocks don't take a
+    /// mask in single-step decode. MLP / MoE blocks have no cache entry — the
+    /// cache list only contains attention + mamba layers (matches the
+    /// per-request `newCache` layout). Walks the hybrid pattern and only
+    /// advances `cacheCounter` for cache-bearing block types, same as the
+    /// per-request `callAsFunction` path.
+    func fullyBatchedForward(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray {
+        var hidden = embeddings(inputs)
+
+        // Build the shared attention mask from the first attention layer's
+        // BatchedKVCache. Only used for attention blocks; mamba/MLP/MoE pass
+        // skip it.
+        var sampleAttnCache: BatchedKVCache?
+        for layer in caches.layers {
+            if case .attention(let c) = layer {
+                sampleAttnCache = c
+                break
+            }
+        }
+
+        let attnMask: MLXArray
+        if let c = sampleAttnCache {
+            let B = c.active
+            let cacheDtype = c.keys.dtype
+            let allSame = c.offsets[0..<B].allSatisfy { $0 == c.offsets[0] }
+            let maxPostOffset = (c.offsets[0..<B].max() ?? 0) + 1
+            if allSame {
+                attnMask = MLXArray.zeros(
+                    [B, 1, 1, maxPostOffset], dtype: cacheDtype)
+            } else {
+                let positions = MLXArray(0..<maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(c.offsets[0..<B].map { $0 + 1 }).reshaped(B, 1)
+                let valid = positions .< offsetsArr
+                attnMask = MLX.where(
+                    valid,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            }
+        } else {
+            attnMask = MLXArray.zeros([0, 1, 1, 0], dtype: hidden.dtype)
+        }
+
+        let modelDtype = hidden.dtype
+        var cacheCounter = 0
+        for layer in layers {
+            let layerCache: BatchedHybridCache.BatchedLayerCache?
+            if layer.blockType == .mamba || layer.blockType == .attention {
+                layerCache = caches.layers[cacheCounter]
+                cacheCounter += 1
+            } else {
+                layerCache = nil
+            }
+
+            hidden = layer.fullyBatchedForward(
+                hidden, layerCache: layerCache, attnMask: attnMask)
+            // Defensive cast — quantized ops can promote bf16 → fp32 inside
+            // the lazy graph (matches Qwen35TextModelInner pattern).
+            hidden = hidden.asType(modelDtype)
         }
 
         return normF(hidden)
@@ -872,6 +1065,79 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         { key in
             !key.contains("e_score_correction_bias") && !key.contains("A_log")
         }
+    }
+}
+
+// MARK: - BatchedHybridLLM (batched decode for NemotronH hybrid)
+
+extension NemotronHModel: BatchedHybridLLM {
+    /// Fully batched decode: `[B, 1]` tokens → `[B, 1, vocab]` logits.
+    /// The bridge dispatches here when it has a `BatchedHybridCache` in hand;
+    /// the per-request `iterator.cache` path is left intact for fallback.
+    /// Closes the 5× decode gap vs Python mlx_lm at B=64.
+    public func fullyBatchedDecode(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray {
+        var out = backbone.fullyBatchedForward(inputs, caches: caches)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = backbone.embeddings.asLinear(out)
+        }
+        return out
+    }
+
+    /// Build a fresh `BatchedHybridCache` sized for `maxBatch` requests.
+    /// Only mamba + attention blocks emit a cache (MLP / MoE blocks skip);
+    /// matches `newCache(parameters:)` layout so the bridge's per-layer copy
+    /// (init_batched_hybrid + prefill_batched_uniform hybrid path) lines up.
+    public func newBatchedHybridCache(
+        maxBatch: Int, parameters: GenerateParameters?,
+        turboKeyBits: Int?, turboValueBits: Int?
+    ) -> BatchedHybridCache {
+        let cfg = configuration
+        let attentionHeadDim = cfg.headDim ?? (cfg.hiddenSize / cfg.numAttentionHeads)
+        let kernelMinusOne = cfg.convKernel - 1
+        let intermediate = cfg.mambaNumHeads * cfg.mambaHeadDim
+        let convDim = intermediate + 2 * cfg.nGroups * cfg.ssmStateSize
+
+        // Sequence budget for the attention BatchedKVCache. 2048 is the
+        // BatchedKVCache default; expand when the run sets a larger maxKVSize.
+        let maxSeq = parameters?.maxKVSize ?? 2048
+
+        let pattern = Array(cfg.hybridOverridePattern)
+        var layers: [BatchedHybridCache.BatchedLayerCache] = []
+        for char in pattern {
+            switch NemotronHBlockType(from: char) {
+            case .mamba:
+                // Mamba2 recurrent state shape: [B, numHeads, headDim, ssmStateSize]
+                //   Hv = numHeads, Dv = headDim, Dk = ssmStateSize.
+                layers.append(.gdn(BatchedMambaCache(
+                    maxBatch: maxBatch,
+                    kernelMinusOne: kernelMinusOne,
+                    convDim: convDim,
+                    Hv: cfg.mambaNumHeads,
+                    Dv: cfg.mambaHeadDim,
+                    Dk: cfg.ssmStateSize
+                )))
+            case .attention:
+                let kvCache: BatchedKVCache
+                if let kb = turboKeyBits, let vb = turboValueBits {
+                    kvCache = BatchedKVCache(
+                        maxBatch: maxBatch, kvHeads: cfg.numKeyValueHeads,
+                        headDim: attentionHeadDim, maxSeq: maxSeq,
+                        turboKeyBits: kb, turboValueBits: vb)
+                } else {
+                    kvCache = BatchedKVCache(
+                        maxBatch: maxBatch, kvHeads: cfg.numKeyValueHeads,
+                        headDim: attentionHeadDim, maxSeq: maxSeq)
+                }
+                layers.append(.attention(kvCache))
+            case .mlp, .moe:
+                continue  // No cache emitted; matches newCache(parameters:)
+            }
+        }
+        return BatchedHybridCache(layers: layers)
     }
 }
 
