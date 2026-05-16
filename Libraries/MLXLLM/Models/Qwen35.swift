@@ -293,21 +293,30 @@ final class Qwen35GatedDeltaNet: Module {
         var out: MLXArray
 
         if S == 1, state != nil {
-            // Decode (T=1): fused kernel absorbs rmsNorm(q), rmsNorm(k),
-            // sigmoid(b) → beta, and g = exp(-exp(aLog) * softplus(a + dtBias))
-            // into a single Metal dispatch. Eliminates ~4-6 separate dispatches
-            // per GDN layer — dispatch overhead dominates at decode batch size.
-            (out, state) = fusedGatedDeltaUpdate(
-                qRaw: q,
-                kRaw: k,
-                v: v,
-                a: a,
-                b: b,
-                aLog: aLog,
-                dtBias: dtBias,
-                state: state,
-                mask: mask
-            )
+            // Decode (T=1). Default = non-fused: rmsNorm outside + plain
+            // gated_delta_step kernel. At Qwen3.6-27B dims (headKDim=128,
+            // numKHeads=16, numVHeads=48) the fused kernel's register
+            // pressure costs +27% throughput vs non-fused at B=64 (per
+            // fullyBatchedForward A/B at 27B). Same logic applies here.
+            // Set VSM_GDN_FUSED=1 to restore the legacy fused path.
+            let useFused = ProcessInfo.processInfo.environment["VSM_GDN_FUSED"] == "1"
+            if useFused {
+                (out, state) = fusedGatedDeltaUpdate(
+                    qRaw: q, kRaw: k, v: v,
+                    a: a, b: b, aLog: aLog, dtBias: dtBias,
+                    state: state, mask: mask)
+            } else {
+                let dtype = q.dtype
+                let invScale = pow(Float(headKDim), -0.5)
+                let qNormed = MLXArray(pow(invScale, 2)).asType(dtype)
+                    * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                let kNormed = MLXArray(invScale).asType(dtype)
+                    * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                (out, state) = gatedDeltaUpdate(
+                    q: qNormed, k: kNormed, v: v,
+                    a: a, b: b, aLog: aLog, dtBias: dtBias,
+                    state: state, mask: mask)
+            }
         } else {
             // Prefill (T>1): pre-compute norms as separate MLX ops.
             // The fused kernel's extra register pressure hurts GPU occupancy at
