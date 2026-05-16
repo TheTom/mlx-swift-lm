@@ -187,7 +187,35 @@ public class BatchedKVCache {
         }
 
         let allSameOffset = offsets[0..<B].allSatisfy { $0 == offsets[0] }
+        updateRaw(newKeys: newKeys, newValues: newValues,
+                  B: B, allSameOffset: allSameOffset)
+    }
 
+    /// Optimized variant when the caller already knows `allSameOffset`
+    /// (e.g. it was computed once at the top of the model forward and
+    /// threaded through all layers). Skips the per-layer
+    /// `offsets[0..<B].allSatisfy { ... }` allocation + closure call —
+    /// matters at small Qwen3 dense (0.6B / 4B) where per-step CPU
+    /// op-encode is the bottleneck.
+    public func updateFast(
+        newKeys: MLXArray, newValues: MLXArray, allSameOffset: Bool
+    ) {
+        let B = active
+        guard B > 0 else { return }
+        _cachedMask = nil
+        if isTurbo {
+            turboUpdate(newKeys: newKeys, newValues: newValues, B: B)
+            return
+        }
+        updateRaw(newKeys: newKeys, newValues: newValues,
+                  B: B, allSameOffset: allSameOffset)
+    }
+
+    @inline(__always)
+    private func updateRaw(
+        newKeys: MLXArray, newValues: MLXArray,
+        B: Int, allSameOffset: Bool
+    ) {
         if allSameOffset {
             let off = offsets[0]
             keys[..<B, 0..., off, 0...] = newKeys[0..., 0..., 0, 0...]

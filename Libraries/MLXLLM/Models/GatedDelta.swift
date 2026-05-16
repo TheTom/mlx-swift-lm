@@ -12,10 +12,20 @@ import MLXNN
 
 // MARK: - Compute G
 
+/// Compiled gating factor: collapses `exp(-exp(aLog) * softplus(a+dtBias))`
+/// from 4 dispatches into one fused kernel. Python mlx-lm uses
+/// `@partial(mx.compile, shapeless=True)` for the equivalent path
+/// (`mlx_lm/models/gated_delta.py::compute_g`). Per-decode-step savings:
+/// 64 GDN layers * 4 dispatches -> 64 dispatches.
+private let _compiledGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { aLog, a, dtBias in
+        exp(-exp(aLog) * softplus(a + dtBias))
+    }
+
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
     // Stay in model dtype (bf16) — no fp32 promotion needed.
     // The double-exp is numerically safe in bf16 for the typical aLog range (-1 to -8).
-    return exp(-exp(aLog) * softplus(a + dtBias))
+    return _compiledGatedDeltaG(aLog, a, dtBias)
 }
 
 // MARK: - Metal Kernel

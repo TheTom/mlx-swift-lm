@@ -177,6 +177,17 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_up_proj") var gateUpProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
+    /// Fused silu(gate) * up — matches Python mlx-lm's
+    /// `@partial(mx.compile, shapeless=True)` swiglu in
+    /// `mlx_lm/models/activations.py`. Collapses the silu + elementwise
+    /// multiply from two dispatches into one. Per-layer savings dominate
+    /// on Qwen3.5/3.6 dense hybrids where 64 of 80 layers (the GDN ones)
+    /// use this MLP and the MLP is the largest hot path at decode.
+    private static let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: true) { gate, up in
+            silu(gate) * up
+        }
+
     init(dimensions: Int, hiddenDimensions: Int) {
         _gateUpProj.wrappedValue = Linear(dimensions, 2 * hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
@@ -184,7 +195,7 @@ final class Qwen3NextMLP: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let parts = MLX.split(gateUpProj(x), parts: 2, axis: -1)
-        return downProj(silu(parts[0]) * parts[1])
+        return downProj(Qwen3NextMLP.compiledSwiglu(parts[0], parts[1]))
     }
 }
 

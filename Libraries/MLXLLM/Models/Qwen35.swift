@@ -519,8 +519,15 @@ final class Qwen35Attention: Module {
     /// `Qwen3NextAttention.fullyBatchedForward` — same gated-output Q split
     /// and sigmoid-multiplied output projection. Runs the same fast/slow path
     /// branching on whether all active slots share the same offset.
+    ///
+    /// The `maskMode` parameter lets the model-level caller pass `.none` when
+    /// every active slot shares a cache offset (all positions valid → mask
+    /// is degenerate). Saves the per-step mask-tensor build + per-layer mask
+    /// read (Gemma4 mask-elision pattern from commit ff30de2). Used by
+    /// `Qwen35TextModelInner.fullyBatchedForward`.
     public func fullyBatchedForward(
-        _ x: MLXArray, cache: BatchedKVCache, mask: MLXArray
+        _ x: MLXArray, cache: BatchedKVCache,
+        maskMode: MLXFast.ScaledDotProductAttentionMaskMode
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -565,7 +572,7 @@ final class Qwen35Attention: Module {
             cache.update(newKeys: keys, newValues: values)
         }
 
-        let output = cache.attention(queries: queries, scale: scale, mask: mask)
+        let output = cache.attention(queries: queries, scale: scale, maskMode: maskMode)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
 
@@ -702,10 +709,15 @@ final class Qwen35DecoderLayer: Module {
     /// Fully batched decode: dispatches by `isLinear` to the right batched
     /// attention or GDN path. Dense MLP / SparseMoeBlock already conform to
     /// `UnaryLayer` and run over the batched `[B, 1]` tensor without changes.
+    ///
+    /// `attnMaskMode` is the SDPA mask mode for attention layers (GDN layers
+    /// ignore it at S=1). Caller passes `.none` when all active slots share
+    /// the same cache offset — mask-elision saves a per-step mask alloc +
+    /// per-layer mask tensor read.
     func fullyBatchedForward(
         _ x: MLXArray,
         layerCache: BatchedHybridCache.BatchedLayerCache,
-        attnMask: MLXArray
+        attnMaskMode: MLXFast.ScaledDotProductAttentionMaskMode
     ) -> MLXArray {
         let r: MLXArray
         switch (isLinear, layerCache) {
@@ -717,7 +729,7 @@ final class Qwen35DecoderLayer: Module {
             r = needsCast ? rRaw.asType(.float32) : rRaw
         case (false, .attention(let kvCache)):
             r = selfAttn!.fullyBatchedForward(
-                inputLayerNorm(x), cache: kvCache, mask: attnMask)
+                inputLayerNorm(x), cache: kvCache, maskMode: attnMaskMode)
         default:
             fatalError("Qwen35DecoderLayer: layer/cache type mismatch (isLinear=\(isLinear))")
         }
@@ -900,36 +912,43 @@ public class Qwen35TextModelInner: Module {
             }
         }
 
-        let attnMask: MLXArray
+        // Mask elision (Gemma4 pattern, ff30de2). When every active slot
+        // shares the same cache offset, the per-step global mask is
+        // all-zeros — pass `.none` to SDPA and skip both the mask alloc
+        // and per-layer mask read. Python's `create_attention_mask` returns
+        // `None` for L=1 for the same reason. Saves up to 16 mask-tensor
+        // reads per step (one per attention layer; 64/4 = 16 attention
+        // layers on Qwen3.6-27B).
+        let attnMaskMode: MLXFast.ScaledDotProductAttentionMaskMode
         if let c = sampleAttnCache {
             let B = c.active
             let cacheDtype = c.keys.dtype
             let allSame = c.offsets[0..<B].allSatisfy { $0 == c.offsets[0] }
-            // Post-update max offset (each step advances by 1).
-            let maxPostOffset = (c.offsets[0..<B].max() ?? 0) + 1
             if allSame {
-                attnMask = MLXArray.zeros(
-                    [B, 1, 1, maxPostOffset], dtype: cacheDtype)
+                attnMaskMode = .none
             } else {
+                // Post-update max offset (each step advances by 1).
+                let maxPostOffset = (c.offsets[0..<B].max() ?? 0) + 1
                 let positions = MLXArray(0..<maxPostOffset).reshaped(1, maxPostOffset)
                 let offsetsArr = MLXArray(c.offsets[0..<B].map { $0 + 1 }).reshaped(B, 1)
                 let valid = positions .< offsetsArr
-                attnMask = MLX.where(
+                let m = MLX.where(
                     valid,
                     MLXArray(Float(0)).asType(cacheDtype),
                     MLXArray(Float(-1e9)).asType(cacheDtype)
                 ).reshaped(B, 1, 1, maxPostOffset)
+                attnMaskMode = .array(m)
             }
         } else {
             // No attention layers? (Shouldn't happen for Qwen3.5 hybrid, but
-            // compose a placeholder so type-checking is straightforward.)
-            attnMask = MLXArray.zeros([0, 1, 1, 0], dtype: hiddenStates.dtype)
+            // pick a safe default for type-checking.)
+            attnMaskMode = .none
         }
 
         let modelDtype = hiddenStates.dtype
         for (i, layer) in layers.enumerated() {
             hiddenStates = layer.fullyBatchedForward(
-                hiddenStates, layerCache: caches.layers[i], attnMask: attnMask)
+                hiddenStates, layerCache: caches.layers[i], attnMaskMode: attnMaskMode)
             // Same defensive cast as the per-request path: quantized ops can
             // promote bf16 → fp32 inside the lazy graph.
             hiddenStates = hiddenStates.asType(modelDtype)

@@ -33,8 +33,20 @@ public class BatchedMambaCache {
     /// Conv state: [maxBatch, kernel-1, convDim]
     public var convState: MLXArray
 
-    /// Recurrent state: [maxBatch, Hv, Dv, Dk] fp32
+    /// Recurrent state: [maxBatch, Hv, Dv, Dk]
     public var recState: MLXArray
+
+    /// Recurrent-state dtype. Read by `writeback(...)` to decide whether the
+    /// kernel's output requires an asType cast before being assigned into
+    /// `recState`. Model-dependent: Qwen 3.5 / 3.6 GatedDeltaNet's metal
+    /// kernel emits fp32 state regardless of input dtype (see
+    /// `gatedDeltaKernel`'s `StT` template parameter being fp32), but
+    /// NemotronH / Mamba2's `ssm_kernel` emits state in the input dtype
+    /// (`T`) — so mixing the two in a single `recState` storage dtype would
+    /// reinterpret the bytes incorrectly. Each model's `newBatchedHybridCache`
+    /// should pass `recDtype` matching the per-request `SSMStateCache` dtype
+    /// so the kernel reads back the same bit pattern it wrote.
+    public let recDtype: DType
 
     /// Active slot count (first `active` slots are in use)
     public var active: Int = 0
@@ -46,7 +58,8 @@ public class BatchedMambaCache {
         Hv: Int,
         Dv: Int,
         Dk: Int,
-        dtype: DType = .bfloat16
+        dtype: DType = .bfloat16,
+        recDtype: DType = .float32
     ) {
         self.maxBatch = maxBatch
         self.kernelMinusOne = kernelMinusOne
@@ -54,13 +67,14 @@ public class BatchedMambaCache {
         self.Hv = Hv
         self.Dv = Dv
         self.Dk = Dk
+        self.recDtype = recDtype
 
         // Don't bother zeroing here — slots get zeroed lazily in addSlot.
         // (We still allocate so the buffer exists with the right shape.)
         self.convState = MLXArray.zeros(
             [maxBatch, kernelMinusOne, convDim], dtype: dtype)
         self.recState = MLXArray.zeros(
-            [maxBatch, Hv, Dv, Dk], dtype: .float32)
+            [maxBatch, Hv, Dv, Dk], dtype: recDtype)
         eval(self.convState, self.recState)
     }
 
@@ -100,14 +114,14 @@ public class BatchedMambaCache {
 
     /// Writeback updated conv + rec state for the first `active` slots.
     /// `conv` shape: [active, kernel-1, convDim].
-    /// `rec` shape:  [active, Hv, Dv, Dk] (fp32).
+    /// `rec` shape:  [active, Hv, Dv, Dk] — dtype must match `recDtype`
+    /// (asType-cast on mismatch).
     public func writeback(conv: MLXArray, rec: MLXArray) {
         let B = conv.dim(0)
         precondition(B <= active, "writeback B (\(B)) exceeds active (\(active))")
         convState[..<B, 0..., 0...] = conv
-        // Force fp32 to match storage; defensive — caller should already be fp32.
         recState[..<B, 0..., 0..., 0...] =
-            (rec.dtype == .float32) ? rec : rec.asType(.float32)
+            (rec.dtype == recDtype) ? rec : rec.asType(recDtype)
     }
 
     /// Reset all slots.
@@ -122,7 +136,7 @@ public class BatchedMambaCache {
     private func zeroSlot(_ slot: Int) {
         let convZ = MLXArray.zeros(
             [kernelMinusOne, convDim], dtype: convState.dtype)
-        let recZ = MLXArray.zeros([Hv, Dv, Dk], dtype: .float32)
+        let recZ = MLXArray.zeros([Hv, Dv, Dk], dtype: recDtype)
         convState[slot, 0..., 0...] = convZ
         recState[slot, 0..., 0..., 0...] = recZ
     }

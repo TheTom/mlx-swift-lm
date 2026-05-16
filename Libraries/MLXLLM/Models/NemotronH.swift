@@ -1112,6 +1112,16 @@ extension NemotronHModel: BatchedHybridLLM {
             case .mamba:
                 // Mamba2 recurrent state shape: [B, numHeads, headDim, ssmStateSize]
                 //   Hv = numHeads, Dv = headDim, Dk = ssmStateSize.
+                //
+                // recDtype defaults to fp32 — matches both:
+                //   - The Mamba2 `ssm_kernel` (SSM.swift) which now has a
+                //     separate `U` template for state buffers so fp32 state
+                //     is correctly handled (the kernel internally
+                //     accumulates in fp32 either way).
+                //   - The per-request `SSMStateCache`'s state dtype after
+                //     `ssmAttn`'s fp32-dt-aware matmul → fp32 state.
+                // Mismatching dtypes here would reinterpret bytes and
+                // produce garbage / non-deterministic output.
                 layers.append(.gdn(BatchedMambaCache(
                     maxBatch: maxBatch,
                     kernelMinusOne: kernelMinusOne,

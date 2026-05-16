@@ -62,15 +62,30 @@ public enum Qwen3 {
 
     /// SwiGLU MLP — gate_proj / up_proj / down_proj with silu(gate) * up.
     /// Bit-identical between the LLM and VLM Qwen 3 implementations.
+    ///
+    /// At init time we fuse `gate_proj` and `up_proj` into a single
+    /// `gate_up_proj` Linear with output dim `2 * intermediate`, matching
+    /// the win agent #117 landed for Gemma4 (PR #66). Weight fusion
+    /// happens in the model's `sanitize()` via `fuseGateUpWeights(...)` —
+    /// when the checkpoint still ships the unfused `gate_proj`/`up_proj`
+    /// rows we concat them on axis 0 and rename to `gate_up_proj`. When
+    /// the fused key already exists (re-load of a Swift-saved checkpoint)
+    /// no work is done.
+    ///
+    /// Saves one Metal dispatch per layer per step vs. the prior
+    /// `gate(x) + up(x)` pair. At Qwen3-0.6B (28 layers) and B=64 decode
+    /// this is the next ~3% win once the fused norm+RoPE landed.
     public class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "gate_proj") var gate: Linear
+        @ModuleInfo(key: "gate_up_proj") var gateUp: Linear
         @ModuleInfo(key: "down_proj") var down: Linear
-        @ModuleInfo(key: "up_proj") var up: Linear
+
+        let hiddenDims: Int
 
         public init(dimensions: Int, hiddenDimensions: Int) {
-            self._gate.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
+            self.hiddenDims = hiddenDimensions
+            self._gateUp.wrappedValue = Linear(
+                dimensions, 2 * hiddenDimensions, bias: false)
             self._down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-            self._up.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
             super.init()
         }
 
@@ -84,8 +99,26 @@ public enum Qwen3 {
                 silu(gate) * up
             }
 
+        /// Set QWEN3_FUSED_GATE_ACT=0 to disable the C-kernel fused
+        /// split+silu*mul. Memory note `feedback_mlxfast_qgemv_qwen2_negative`
+        /// shows the kernel regresses at Qwen2 hidden=5120/27648 (kernel
+        /// is tuned for Gemma4 E2B's 2304). At Qwen3 small/dense (0.6B
+        /// intermediate=3072, 4B intermediate=9728) the post-projection
+        /// hidden-dim is closer to the kernel's sweet spot and the
+        /// dispatch saving lands net-positive.
+        private static let useFusedGateAct: Bool = {
+            ProcessInfo.processInfo.environment["QWEN3_FUSED_GATE_ACT"] != "0"
+        }()
+
         public func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(MLP.compiledSwiglu(gate(x), up(x)))
+            let gateUpOut = gateUp(x)
+            if Self.useFusedGateAct {
+                let activated = MLXFast.fusedGateActivation(
+                    gateUpOut, hiddenDims: hiddenDims, activation: .silu)
+                return down(activated)
+            }
+            let parts = split(gateUpOut, parts: 2, axis: -1)
+            return down(MLP.compiledSwiglu(parts[0], parts[1]))
         }
     }
 }

@@ -1726,6 +1726,14 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             adjusted[newKey] = value
         }
 
+        // Match the LLM-side Qwen3Model.sanitize fusion: the shared
+        // `Qwen3.MLP` was refactored to use a single `gate_up_proj`
+        // Linear (issue #168 / PR #66 mirror). Fuse the per-layer
+        // `language_model.model.layers.*.mlp.gate_proj` + `.up_proj`
+        // tensors into `.gate_up_proj` on axis 0. No-op if the
+        // checkpoint already ships the fused key.
+        fuseGateUpWeights(&adjusted, keyFilter: ".mlp.gate_proj.", outputAxis: 0)
+
         let sanitized = visionModel.sanitize(weights: adjusted)
         return sanitized
     }

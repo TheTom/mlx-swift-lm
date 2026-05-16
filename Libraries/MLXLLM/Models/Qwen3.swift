@@ -26,6 +26,21 @@ class Qwen3Attention: Module {
 
     let rope: RoPE
 
+    // Inverse frequencies for fused RMSNorm + RoPE (MLXFast.rmsNormRoPE
+    // framework kernel). Computed at init from `ropeTheta` and `headDim`.
+    // Mirrors `Gemma4Attention._fusedInvFreqs` (sliding-layer branch:
+    // standard RoPE with `1.0 / theta^(2i/D)` for `i in 0..<headDim/2`).
+    // Underscore prefix prevents Module weight loading from looking for
+    // this key in the checkpoint. Only built when the layer's RoPE is a
+    // plain (non-scaled) variant — linear-scaled RoPE would need its
+    // factor baked into the freqs, which is left for a follow-up.
+    let _fusedInvFreqs: MLXArray?
+
+    /// Set QWEN3_FUSED_NORM_ROPE=0 to disable for A/B testing.
+    private static let useFusedNormRoPE: Bool = {
+        ProcessInfo.processInfo.environment["QWEN3_FUSED_NORM_ROPE"] != "0"
+    }()
+
     public init(_ args: Qwen3Configuration) {
         self.args = args
 
@@ -45,21 +60,38 @@ class Qwen3Attention: Module {
         _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.rmsNormEps)
 
         let ropeScale: Float
+        let isLinearScaled: Bool
         if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
             let factor = ropeScaling["factor"]
         {
             if let v = factor.asFloat() {
                 ropeScale = 1 / v
+                isLinearScaled = true
             } else {
                 fatalError("ropeScaling.factor must be a float")
             }
         } else {
             ropeScale = 1
+            isLinearScaled = false
         }
 
         self.rope = RoPE(
             dimensions: headDim, traditional: false, base: args.ropeTheta,
             scale: ropeScale)
+
+        // Build inverse frequencies for the fused norm+RoPE kernel. Skip
+        // when scaled RoPE is in play (the kernel does not take a scale
+        // arg, and we want bit-identical fallback to the plain rope() path
+        // for those rare scaled-rope checkpoints).
+        if Self.useFusedNormRoPE && !isLinearScaled {
+            let exponents = MLXArray(
+                stride(from: Float(0), to: Float(headDim), by: 2)
+            ) / Float(headDim)
+            let freqs = pow(MLXArray(args.ropeTheta), exponents)
+            self._fusedInvFreqs = 1.0 / freqs
+        } else {
+            self._fusedInvFreqs = nil
+        }
     }
 
     public func callAsFunction(
@@ -189,28 +221,106 @@ class Qwen3Attention: Module {
         _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
         mask: MLXArray
     ) -> MLXArray {
+        fullyBatchedForwardImpl(
+            x, cache: cache, layerIndex: layerIndex,
+            mask: mask, allSameOffset: nil
+        )
+    }
+
+    /// Optimized variant: caller pre-computed `allSameOffset` (typically
+    /// once per step in `Qwen3ModelInner.fullyBatchedForward`) so we skip
+    /// the per-layer `allSatisfy` over `cache.offsets[0..<active]`. When
+    /// `mask` is `nil` the caller has guaranteed all slots have identical
+    /// offsets and the cache covers exactly those positions — we then
+    /// dispatch SDPA with `maskMode: .none`, skipping an entire mask-tensor
+    /// read per layer. At small Qwen3 (0.6B / 4B / dense) this saves both
+    /// CPU op-encode (allocations + allSatisfy) and GPU bandwidth (zero-
+    /// mask reads × 28-36 layers). See alpha-side perf notes in
+    /// `research/retrieval_attention/F83_*`.
+    public func fullyBatchedForwardFast(
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+        mask: MLXArray?, allSameOffset: Bool
+    ) -> MLXArray {
+        fullyBatchedForwardImpl(
+            x, cache: cache, layerIndex: layerIndex,
+            mask: mask, allSameOffset: allSameOffset
+        )
+    }
+
+    @inline(__always)
+    private func fullyBatchedForwardImpl(
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+        mask: MLXArray?, allSameOffset precomputed: Bool?
+    ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        // Batched projections
+        // Batched projections — three Linear dispatches share the same `x`.
         var queries = wq(x)
         var keys = wk(x)
         var values = wv(x)
 
+        // RoPE + cache update — use caller's pre-computed allSameOffset
+        // when available, else fall back to per-layer scan.
+        let allSameOffset: Bool
+        if let precomputed {
+            allSameOffset = precomputed
+        } else {
+            allSameOffset = cache.offsets[0..<cache.active]
+                .allSatisfy { $0 == cache.offsets[0] }
+        }
+
+        // Fused norm+RoPE fast path. Mirrors the win agent #117 landed for
+        // Gemma4 (`Gemma4Attention.fullyBatchedForward`, commit ff30de2):
+        // `qNorm + reshape + transpose + rope` is 4 dispatches per Q/K.
+        // `MLXFast.rmsNormRoPE` collapses that into a single kernel,
+        // shaving ~6 dispatches per attention layer at B=64. Eligible when
+        // all slots share the cache offset AND the layer built its
+        // inverse-frequency table at init (plain RoPE, no linear scaling).
+        // V still goes through plain reshape+transpose — no norm, no RoPE.
+        if let invFreqs = _fusedInvFreqs, allSameOffset {
+            let offset = cache.offsets[0]
+            // rmsNormRoPE takes input shaped `[B, L, nHeads, headDim]`
+            // (pre-transpose) and returns the same shape.
+            queries = queries.reshaped(B, L, args.attentionHeads, -1)
+            queries = MLXFast.rmsNormRoPE(
+                queries, weight: qNorm.weight, invFreqs: invFreqs,
+                eps: args.rmsNormEps, offset: offset,
+                nHeads: args.attentionHeads, seqLen: L)
+            queries = queries.transposed(0, 2, 1, 3)
+
+            keys = keys.reshaped(B, L, args.kvHeads, -1)
+            keys = MLXFast.rmsNormRoPE(
+                keys, weight: kNorm.weight, invFreqs: invFreqs,
+                eps: args.rmsNormEps, offset: offset,
+                nHeads: args.kvHeads, seqLen: L)
+            keys = keys.transposed(0, 2, 1, 3)
+
+            values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+            cache.updateFast(newKeys: keys, newValues: values, allSameOffset: true)
+
+            // No-mask fast path: caller guaranteed every cached position
+            // is valid after the update above.
+            let output: MLXArray
+            if mask == nil {
+                output = cache.attention(queries: queries, scale: scale, maskMode: .none)
+            } else {
+                output = cache.attention(queries: queries, scale: scale, mask: mask!)
+            }
+            return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        }
+
+        // Slow path (mixed offsets or fused-norm-rope disabled): keep
+        // bit-identical behaviour with the unfused norm + rope sequence.
         queries = qNorm(queries.reshaped(B, L, args.attentionHeads, -1)).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        // RoPE + cache update
-        let allSameOffset = cache.offsets[0..<cache.active]
-            .allSatisfy { $0 == cache.offsets[0] }
-
         if allSameOffset {
-            // Fast path: single batched RoPE
             let offset = cache.offsets[0]
             queries = rope(queries, offset: offset)
             keys = rope(keys, offset: offset)
-            cache.update(newKeys: keys, newValues: values)
+            cache.updateFast(newKeys: keys, newValues: values, allSameOffset: true)
         } else {
             // Mixed offsets: per-request RoPE then cache update
             let qSlices = split(queries, parts: B, axis: 0)
@@ -224,10 +334,18 @@ class Qwen3Attention: Module {
             }
             queries = concatenated(rotQ, axis: 0)
             keys = concatenated(rotK, axis: 0)
-            cache.update(newKeys: keys, newValues: values)
+            cache.updateFast(newKeys: keys, newValues: values, allSameOffset: false)
         }
 
-        let output = cache.attention(queries: queries, scale: scale, mask: mask)
+        // No-mask fast path: skip the zero-mask read in SDPA when caller
+        // confirmed every cached position is valid (allSameOffset + cache
+        // covers exactly those positions after the update above).
+        let output: MLXArray
+        if mask == nil {
+            output = cache.attention(queries: queries, scale: scale, maskMode: .none)
+        } else {
+            output = cache.attention(queries: queries, scale: scale, mask: mask!)
+        }
 
         return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
@@ -269,6 +387,24 @@ class Qwen3TransformerBlock: Module {
         let normed = inputLayerNorm(x)
         var r = attention.fullyBatchedForward(normed, cache: cache, layerIndex: layerIndex,
                                               mask: mask)
+        let h = x + r
+        r = mlp(postAttentionLayerNorm(h))
+        return h + r
+    }
+
+    /// Fast variant — caller passes pre-computed `allSameOffset` and an
+    /// optional `mask` (nil means "no mask, all positions valid"). See
+    /// `Qwen3Attention.fullyBatchedForwardFast`. Used by the small Qwen3
+    /// dense models (0.6B / 4B) where per-step CPU op-encode dominates.
+    public func fullyBatchedForwardFast(
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+        mask: MLXArray?, allSameOffset: Bool
+    ) -> MLXArray {
+        let normed = inputLayerNorm(x)
+        var r = attention.fullyBatchedForwardFast(
+            normed, cache: cache, layerIndex: layerIndex,
+            mask: mask, allSameOffset: allSameOffset
+        )
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         return h + r
@@ -325,34 +461,67 @@ public class Qwen3ModelInner: Module {
     }
 
     /// Fully batched forward: shared per-layer BatchedKVCaches.
+    ///
+    /// Hot-path opts (matter most at small dense Qwen3 — 0.6B / 4B —
+    /// where per-step CPU op-encode dominates step time):
+    ///
+    /// * `allSame` is computed ONCE here and threaded into every layer's
+    ///   `fullyBatchedForwardFast` so each attention layer skips its own
+    ///   `cache.offsets[0..<active].allSatisfy { ... }` scan + closure
+    ///   alloc. At 28-36 layers × N decode steps/sec this is real time.
+    /// * When `allSame == true`, every cached position is valid post-
+    ///   update — we hand each SDPA `mask: nil` so the cache attention
+    ///   call uses `MLXFast.SDPA(..., mask: .none)` instead of reading a
+    ///   `[B,1,1,T]` zero tensor. Saves both the mask-tensor alloc
+    ///   (`MLXArray.zeros(...)`) and 28-36 zero-mask GPU bandwidth reads.
     public func fullyBatchedForward(_ inputs: MLXArray, caches: [BatchedKVCache]) -> MLXArray {
         var h = embedTokens(inputs)
 
+        // Pull cache0 / offsets buffer once — avoids the per-layer
+        // closure capture of `caches[0]` and the repeated subscript.
+        let cache0 = caches[0]
+        let active = cache0.active
+
         // When all requests have same offset (continuous decode),
-        // all cache positions are valid — no mask needed.
-        // For mixed offsets, would need per-request mask.
-        let allSame = caches[0].offsets[0..<caches[0].active]
-            .allSatisfy { $0 == caches[0].offsets[0] }
-
-        let B = caches[0].active
-        let cacheDtype = caches[0].keys.dtype
-        // Post-update max offset (all advance by 1)
-        let maxPostOffset = (caches[0].offsets[0..<B].max() ?? 0) + 1
-        let mask: MLXArray
-        if allSame {
-            mask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
-        } else {
-            let positions = MLXArray(0..<maxPostOffset).reshaped(1, maxPostOffset)
-            let offsetsArr = MLXArray(caches[0].offsets[0..<B].map { $0 + 1 }).reshaped(B, 1)
-            let valid = positions .< offsetsArr
-            mask = MLX.where(valid,
-                             MLXArray(Float(0)).asType(cacheDtype),
-                             MLXArray(Float(-1e9)).asType(cacheDtype))
-                .reshaped(B, 1, 1, maxPostOffset)
+        // every cached position is valid → no mask needed.
+        // For mixed offsets, build a per-request lower-triangular mask.
+        let first = cache0.offsets[0]
+        var allSame = true
+        var maxOff = first
+        for i in 1..<active {
+            let o = cache0.offsets[i]
+            if o != first { allSame = false }
+            if o > maxOff { maxOff = o }
         }
+        let maxPostOffset = maxOff + 1
 
-        for (i, layer) in layers.enumerated() {
-            h = layer.fullyBatchedForward(h, cache: caches[i], layerIndex: i, mask: mask)
+        if allSame {
+            // No-mask fast path: hand each layer `mask: nil` so SDPA runs
+            // with `maskMode: .none`. Saves one MLXArray.zeros alloc and
+            // 28-36 zero-mask reads per step.
+            for (i, layer) in layers.enumerated() {
+                h = layer.fullyBatchedForwardFast(
+                    h, cache: caches[i], layerIndex: i,
+                    mask: nil, allSameOffset: true
+                )
+            }
+        } else {
+            let cacheDtype = cache0.keys.dtype
+            let positions = MLXArray(0..<maxPostOffset).reshaped(1, maxPostOffset)
+            let offsetsArr = MLXArray(cache0.offsets[0..<active].map { $0 + 1 })
+                .reshaped(active, 1)
+            let valid = positions .< offsetsArr
+            let mask = MLX.where(valid,
+                                 MLXArray(Float(0)).asType(cacheDtype),
+                                 MLXArray(Float(-1e9)).asType(cacheDtype))
+                .reshaped(active, 1, 1, maxPostOffset)
+
+            for (i, layer) in layers.enumerated() {
+                h = layer.fullyBatchedForwardFast(
+                    h, cache: caches[i], layerIndex: i,
+                    mask: mask, allSameOffset: false
+                )
+            }
         }
         return norm(h)
     }
@@ -431,6 +600,14 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
         }
+
+        // Fuse `mlp.gate_proj` + `mlp.up_proj` into `mlp.gate_up_proj` for
+        // the shared `Qwen3.MLP` (output dim doubled, rows concatenated on
+        // axis 0). Mirrors `Gemma4` PR #66 — saves one Metal dispatch per
+        // MLP per step. Covers `.weight`, `.scales`, and `.biases` keys
+        // produced by the quantization pipeline. No-op when the checkpoint
+        // already ships the fused key (re-load of a Swift-saved model).
+        fuseGateUpWeights(&weights, keyFilter: ".mlp.gate_proj.", outputAxis: 0)
 
         return weights
     }
