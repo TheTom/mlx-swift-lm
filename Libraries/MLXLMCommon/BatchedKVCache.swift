@@ -232,6 +232,34 @@ public class BatchedKVCache {
         )
     }
 
+    /// Variant of ``attention(queries:scale:mask:)`` that accepts an explicit
+    /// SDPA mask mode. Callers can pass `.none` when all active slots have
+    /// identical offsets AND the cache covers the full attention window
+    /// (sliding or global) — i.e. no positions need masking. Saves one
+    /// mask-construction + one mask-tensor read per layer per step. Falls
+    /// back to the array path for turbo mode (turbo SDPA requires an
+    /// explicit additive mask today).
+    public func attention(
+        queries: MLXArray, scale: Float,
+        maskMode: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        if isTurbo {
+            // Turbo path needs an explicit additive mask; synthesise zeros
+            // when the caller asked for `.none`.
+            let maxOff = offsets[0..<active].max() ?? 0
+            let zeros = MLXArray.zeros(
+                [active, 1, 1, maxOff], dtype: keys.dtype)
+            return turboAttention(queries: queries, scale: scale, mask: zeros)
+        }
+        let maxOffset = offsets[0..<active].max() ?? 0
+        let allK = keys[..<active, 0..., ..<maxOffset, 0...]
+        let allV = values[..<active, 0..., ..<maxOffset, 0...]
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: allK, values: allV,
+            scale: scale, mask: maskMode
+        )
+    }
+
     /// Get cached K/V for all active requests up to their offsets.
     /// Returns (K, V, mask) for batched SDPA.
     /// K: [B, kv_heads, max_offset, head_dim]

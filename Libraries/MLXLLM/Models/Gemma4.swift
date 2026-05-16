@@ -688,11 +688,18 @@ class Gemma4Attention: Module {
     }
 
     /// Fully batched attention with shared `BatchedKVCache`. Caller provides
-    /// the per-layer-type mask (sliding-window vs global). Same `attentionKEqV`
-    /// handling as the per-request batched path.
+    /// the per-layer-type mask MODE (sliding-window vs global). Passing
+    /// `.none` skips the per-step mask construction + SDPA mask read when
+    /// the cache fully covers the attention window for every slot (the
+    /// common bench case: uniform decode offsets that fit inside the
+    /// sliding window). Same `attentionKEqV` handling as the per-request
+    /// batched path. When the fused norm+rope kernel is wired AND offsets
+    /// are aligned we collapse Q/K's `qNorm + transpose + rope` into a
+    /// single dispatch each via `MLXFast.rmsNormRoPE` (mirrors the
+    /// single-stream forward's hot path).
     public func fullyBatchedForward(
         _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
-        mask: MLXArray
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -706,13 +713,36 @@ class Gemma4Attention: Module {
             values = vProj!(x).reshaped(B, L, nKVHeads, -1)
         }
 
+        let allSameOffset = cache.offsets[0 ..< cache.active]
+            .allSatisfy { $0 == cache.offsets[0] }
+
+        // Fused norm+RoPE fast path. Same shared `MLXFast.rmsNormRoPE`
+        // kernel that the single-stream forward uses: collapses qNorm +
+        // transpose + rope (4 dispatches per Q/K) into a single dispatch.
+        // Eligible when all slots share the cache offset and the layer
+        // built its inverse-frequency table at init.
+        if let invFreqs = _fusedInvFreqs, allSameOffset {
+            let offset = cache.offsets[0]
+            queries = MLXFast.rmsNormRoPE(
+                queries, weight: qNorm.weight, invFreqs: invFreqs,
+                eps: rmsNormEps, offset: offset, nHeads: nHeads, seqLen: L)
+            queries = queries.transposed(0, 2, 1, 3)
+            keys = MLXFast.rmsNormRoPE(
+                keys, weight: kNorm.weight, invFreqs: invFreqs,
+                eps: rmsNormEps, offset: offset, nHeads: nKVHeads, seqLen: L)
+            keys = keys.transposed(0, 2, 1, 3)
+            values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
+            values = values.transposed(0, 2, 1, 3)
+            cache.update(newKeys: keys, newValues: values)
+            let output = cache.attention(queries: queries, scale: scale, maskMode: mask)
+            return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        }
+
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys).transposed(0, 2, 1, 3)
         values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
         values = values.transposed(0, 2, 1, 3)
 
-        let allSameOffset = cache.offsets[0 ..< cache.active]
-            .allSatisfy { $0 == cache.offsets[0] }
         if allSameOffset {
             let offset = cache.offsets[0]
             queries = rope(queries, offset: offset)
@@ -735,7 +765,7 @@ class Gemma4Attention: Module {
             cache.update(newKeys: keys, newValues: values)
         }
 
-        let output = cache.attention(queries: queries, scale: scale, mask: mask)
+        let output = cache.attention(queries: queries, scale: scale, maskMode: mask)
         return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 
@@ -745,7 +775,7 @@ class Gemma4Attention: Module {
     /// current per-slot offsets.
     public func fullyBatchedSharedKVForward(
         _ x: MLXArray, donorCache: BatchedKVCache, donorPreUpdateOffsets: [Int],
-        mask: MLXArray
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -771,7 +801,7 @@ class Gemma4Attention: Module {
             queries = concatenated(rotQ, axis: 0)
         }
 
-        let output = donorCache.attention(queries: queries, scale: scale, mask: mask)
+        let output = donorCache.attention(queries: queries, scale: scale, maskMode: mask)
         return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
@@ -874,6 +904,10 @@ class Gemma4Router: Module {
 
     let rootSize: Float
     let eps: Float
+    /// Cached `scale * rootSize` to avoid recomputing the constant scalar
+    /// multiply every layer per step. Built lazily on first call (parameters
+    /// load post-init). Saves ~30 mul + alloc dispatches per decode step.
+    private var _fusedNormWeight: MLXArray?
 
     init(dimensions: Int, numExperts: Int, eps: Float) {
         self.rootSize = pow(Float(dimensions), -0.5)
@@ -885,8 +919,15 @@ class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let normWeight = scale * MLXArray(rootSize)
-        let normed = MLXFast.rmsNorm(x, weight: normWeight, eps: eps)
+        let w: MLXArray
+        if let cached = _fusedNormWeight {
+            w = cached
+        } else {
+            let built = scale * rootSize
+            _fusedNormWeight = built
+            w = built
+        }
+        let normed = MLXFast.rmsNorm(x, weight: w, eps: eps)
         return proj(normed)
     }
 }
@@ -1055,6 +1096,13 @@ class Gemma4TransformerBlock: Module {
     /// both batched and fully-batched paths — operates element-wise per token,
     /// so [B, 1, hidden] passes through unchanged. SwitchGLU/FusedGateUpSwitchGLU
     /// are expert-batched internally so MoE works on any B.
+    ///
+    /// For the MoE dispatch we flatten the `[B, L, H]` stream down to
+    /// `[B*L, H]` before calling `experts(...)` (matching Python's
+    /// `Experts.__call__` flow). At L=1 this is a metadata-only reshape but
+    /// it removes an axis from the tensor flowing through
+    /// `expandedDimensions(..., [-2, -3])` inside `FusedGateUpSwitchGLU`,
+    /// keeping `gatherQuantizedMM` on its 4D dispatch path.
     private func ffnAndScale(_ h_in: MLXArray, perLayerInput: MLXArray?) -> MLXArray {
         var h = h_in
         if let experts, let router,
@@ -1069,12 +1117,27 @@ class Gemma4TransformerBlock: Module {
             let routerLogits = router(h)
             let (topKLogits, topKIndices) = gemma4TopK(routerLogits, k: topKExperts, axis: -1)
             let stopIndices = MLX.stopGradient(topKIndices)
-            var expertWeights = softmax(topKLogits, axis: -1, precise: true)
+            // Softmax over 8 logits — `precise=true` buys nothing at this
+            // scale and Python's `mx.softmax(expert_scores)` doesn't request
+            // it either. Saves one reduce dispatch per layer.
+            var expertWeights = softmax(topKLogits, axis: -1)
             expertWeights = expertWeights * router.perExpertScale[topKIndices]
             let preFFNNorm2 = preNorm2(h)
-            var h2 = experts(preFFNNorm2, stopIndices)
-            h2 = h2 * expandedDimensions(expertWeights, axis: -1)
-            h2 = h2.sum(axis: -2)
+
+            // Flatten (B, L) → (B*L, H) for the MoE dispatch — Python's
+            // pattern. At L=1 this is metadata-only.
+            let B = preFFNNorm2.dim(0)
+            let L = preFFNNorm2.dim(1)
+            let H = preFFNNorm2.dim(2)
+            let N = B * L
+            let flatX = preFFNNorm2.reshaped(N, H)
+            let flatIdx = stopIndices.reshaped(N, topKExperts)
+            let flatWeights = expertWeights.reshaped(N, topKExperts)
+
+            var h2 = experts(flatX, flatIdx)              // [N, K, H_moe]
+            h2 = h2 * expandedDimensions(flatWeights, axis: -1)
+            h2 = h2.sum(axis: -2)                          // [N, H_moe]
+            h2 = h2.reshaped(B, L, H)
             h2 = postNorm2(h2)
 
             let ffnOut = h1 + h2
@@ -1135,7 +1198,8 @@ class Gemma4TransformerBlock: Module {
     /// per-layer batched cache; for shared-KV layers, `cache` IS the donor's
     /// cache and `useSharedKV=true` so we skip the K/V projection.
     func fullyBatchedForward(
-        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int, mask: MLXArray,
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
         perLayerInput: MLXArray? = nil,
         useSharedKV: Bool = false,
         donorPreUpdateOffsets: [Int]? = nil
@@ -1482,25 +1546,46 @@ public class Gemma4ModelInner: Module {
             .allSatisfy { $0 == caches[0].offsets[0] }
         // For decode (L=1), positions covered after update is offsets+1.
         let maxPostOffset = (caches[0].offsets[0 ..< B].max() ?? 0) + 1
+        let minPostOffset = (caches[0].offsets[0 ..< B].min() ?? 0) + 1
 
-        // Global mask: all valid positions up to each request's offset.
-        let globalMask: MLXArray
+        // Mask-elision fast path. When all slots have identical offsets, the
+        // global mask is all-zeros (every position is valid) — pass `.none`
+        // to SDPA and skip both the mask alloc and per-layer mask read.
+        // Python's `create_attention_mask` returns `None` for L=1 for the
+        // same reason; this brings parity. When offsets diverge, we still
+        // need an additive mask to gate out unused tail positions.
+        let globalMaskMode: MLXFast.ScaledDotProductAttentionMaskMode
+        let globalMaskArray: MLXArray?
         if allSame {
-            globalMask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+            globalMaskMode = .none
+            globalMaskArray = nil
         } else {
             let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
             let offsetsArr = MLXArray(caches[0].offsets[0 ..< B].map { $0 + 1 })
                 .reshaped(B, 1)
             let valid = positions .< offsetsArr
-            globalMask = MLX.where(
+            let m = MLX.where(
                 valid,
                 MLXArray(Float(0)).asType(cacheDtype),
                 MLXArray(Float(-1e9)).asType(cacheDtype)
             ).reshaped(B, 1, 1, maxPostOffset)
+            globalMaskMode = .array(m)
+            globalMaskArray = m
         }
-        // Sliding mask: positions older than (offset - slidingWindow + 1)
-        // are masked out.
-        let slidingMask: MLXArray = {
+        // Sliding mask elision. When every slot's post-update offset still
+        // fits inside the sliding window AND offsets are aligned, every
+        // cached position is in-window — no mask needed (matches Python's
+        // `RotatingKVCache.make_mask` returning None when offset <
+        // window_size at L=1).
+        let slidingFits = allSame && minPostOffset <= config.slidingWindow
+        let slidingMaskMode: MLXFast.ScaledDotProductAttentionMaskMode
+        if slidingFits {
+            slidingMaskMode = .none
+        } else if let g = globalMaskArray, minPostOffset <= config.slidingWindow {
+            // Different offsets but all fit in window — reuse global mask
+            // (it already excludes unused tail positions).
+            slidingMaskMode = .array(g)
+        } else {
             let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
             let offsetsArr = MLXArray(caches[0].offsets[0 ..< B].map { $0 + 1 })
                 .reshaped(B, 1)
@@ -1508,24 +1593,31 @@ public class Gemma4ModelInner: Module {
             let inWindow = MLX.logicalAnd(
                 positions .< offsetsArr,
                 positions .>= lowerBound)
-            return MLX.where(
+            let m = MLX.where(
                 inWindow,
                 MLXArray(Float(0)).asType(cacheDtype),
                 MLXArray(Float(-1e9)).asType(cacheDtype)
             ).reshaped(B, 1, 1, maxPostOffset)
-        }()
+            slidingMaskMode = .array(m)
+        }
 
         // KV-shared layers need donor's pre-update offsets snapshotted before
         // the donor's update runs (otherwise we'd see post-update offsets).
-        var donorPreUpdateOffsets = Array(
-            repeating: Array(repeating: 0, count: B), count: layers.count)
+        // Allocate the snapshot grid ONLY when shared layers are configured;
+        // Gemma4-26b sets `numKvSharedLayers=0` and the entire bookkeeping
+        // path is dead — skipping the alloc shaves a small but real CPU cost
+        // per step.
+        let hasSharedKV = config.numKvSharedLayers > 0
+        var donorPreUpdateOffsets: [[Int]] = hasSharedKV
+            ? Array(repeating: Array(repeating: 0, count: B), count: layers.count)
+            : []
 
         for (i, layer) in layers.enumerated() {
             let isGlobal = layerTypes[i] == "full_attention"
-            let mask = isGlobal ? globalMask : slidingMask
+            let mask = isGlobal ? globalMaskMode : slidingMaskMode
             let pli: MLXArray? = perLayerInputs.map { $0[0..., 0..., i, 0...] }
             let donorIdx = previousKVs[i]
-            let isShared = donorIdx != i
+            let isShared = hasSharedKV && donorIdx != i
 
             if isShared {
                 let donorCache = caches[donorIdx]
@@ -1535,7 +1627,7 @@ public class Gemma4ModelInner: Module {
                     donorPreUpdateOffsets: donorPreUpdateOffsets[donorIdx])
             } else {
                 // Snapshot pre-update offsets for downstream shared layers.
-                if config.numKvSharedLayers > 0 {
+                if hasSharedKV {
                     for b in 0 ..< B {
                         donorPreUpdateOffsets[i][b] = caches[i].offsets[b]
                     }
