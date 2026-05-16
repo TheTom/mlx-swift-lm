@@ -45,33 +45,60 @@ public final class RetrievalAttentionIndex {
     /// before MLX is initialized.
     private var jlMatrix: MLXArray?
 
-    /// Per-token f(K) embedding, `[T, selectorDim]` fp16. Grown via
-    /// concatenation; in v1 we don't pre-allocate — the typical
-    /// 1M-context worst case is 1M × 32 × 2 bytes = 64MB per (layer,
-    /// KV head), well within budget. v2 can preallocate.
-    private(set) public var perTokenFeatures: MLXArray?
+    /// Maximum sequence length the index will hold. Sets the
+    /// pre-allocated buffer sizes; caller picks from engine's max-prompt-
+    /// len or kv cap.
+    public let maxSeqLen: Int
 
-    /// Block-pooled f(K), `[nFineBlocks, selectorDim]`. Recomputed at
-    /// `update` for the affected tail block.
-    private(set) public var fineBlockFeatures: MLXArray?
+    /// v2 pre-allocated backing buffer `[maxSeqLen, selectorDim]`,
+    /// allocated lazily on first `update`. v1's per-step `concatenated()`
+    /// grew the buffer linearly and held the prior MLXArray refs alive
+    /// via the lazy graph — at 128K context × 64 layers × N decode steps
+    /// this leaked GBs and froze the system on long-context benches.
+    /// In-place slice writes on a fixed-size buffer kill that path.
+    private var _perTokenBuf: MLXArray?
+    private var _currentSeqLen: Int = 0
 
-    /// Same for coarse blocks (1024-token blocks).
-    private(set) public var coarseBlockFeatures: MLXArray?
+    /// Slice view into `_perTokenBuf` covering `_currentSeqLen` rows.
+    /// Aliases the underlying buffer; callers must not retain across
+    /// `update` calls (slice content changes when we write).
+    public var perTokenFeatures: MLXArray? {
+        guard let buf = _perTokenBuf, _currentSeqLen > 0 else { return nil }
+        return buf[..<_currentSeqLen, 0...]
+    }
+
+    /// Block-pooled `[ceil(maxSeqLen/fineBlockSize), selectorDim]` fp32.
+    private var _fineBlockBuf: MLXArray?
+    private var _currentFineBlockCount: Int = 0
+    public var fineBlockFeatures: MLXArray? {
+        guard let buf = _fineBlockBuf, _currentFineBlockCount > 0 else { return nil }
+        return buf[..<_currentFineBlockCount, 0...]
+    }
+
+    /// Same for coarse blocks.
+    private var _coarseBlockBuf: MLXArray?
+    private var _currentCoarseBlockCount: Int = 0
+    public var coarseBlockFeatures: MLXArray? {
+        guard let buf = _coarseBlockBuf, _currentCoarseBlockCount > 0 else { return nil }
+        return buf[..<_currentCoarseBlockCount, 0...]
+    }
 
     public init(
         config: RetrievalAttentionConfig = RetrievalAttentionConfig(),
         dHead: Int,
         ropeBase: Float = 10_000.0,
-        layerIdx: Int
+        layerIdx: Int,
+        maxSeqLen: Int = 131_072
     ) {
         self.config = config
         self.dHead = dHead
         self.ropeBase = ropeBase
         self.layerIdx = layerIdx
+        self.maxSeqLen = maxSeqLen
     }
 
-    /// Current cached sequence length (== rows in `perTokenFeatures`).
-    public var seqLen: Int { perTokenFeatures?.dim(0) ?? 0 }
+    /// Current cached sequence length.
+    public var seqLen: Int { _currentSeqLen }
 
     /// Append new post-RoPE keys. Updates per-token + block features.
     ///
@@ -96,8 +123,10 @@ public final class RetrievalAttentionIndex {
         let W = jlMatrix!
 
         // Compute selector features for the new rows.
-        let oldSeqLen = seqLen
+        let oldSeqLen = _currentSeqLen
         let newSeqLen = oldSeqLen + newK.dim(0)
+        precondition(newSeqLen <= maxSeqLen,
+            "RetrievalAttentionIndex: newSeqLen \(newSeqLen) > maxSeqLen \(maxSeqLen)")
 
         // content: [L, contentDim] = newK @ Wᵀ
         let contentNew = matmul(newK, W.transposed(1, 0)).asType(.float32)
@@ -115,30 +144,71 @@ public final class RetrievalAttentionIndex {
         // Concat content + trig along feature dim → [L, selectorDim]
         let selectorNew = concatenated([contentNew, trigNew], axis: -1)
 
-        // Append to the running per-token buffer.
-        if let existing = perTokenFeatures {
-            perTokenFeatures = concatenated([existing, selectorNew], axis: 0)
-        } else {
-            perTokenFeatures = selectorNew
+        // v2: in-place slice write into pre-allocated buffer instead of
+        // per-step concat. Releases prior buffer refs immediately; no
+        // lazy-graph chain growth. Lazy alloc on first call so MLX is
+        // guaranteed initialized.
+        let selectorDim = config.selectorDim
+        if _perTokenBuf == nil {
+            _perTokenBuf = MLXArray.zeros(
+                [maxSeqLen, selectorDim], dtype: .float32)
+            eval(_perTokenBuf!)
         }
+        _perTokenBuf![oldSeqLen ..< newSeqLen, 0...] = selectorNew
+        _currentSeqLen = newSeqLen
+        // Force eval to release any lazy refs to prior selectorNew /
+        // matmul intermediates — otherwise the graph keeps the chain
+        // alive across decode steps and RSS climbs.
+        eval(_perTokenBuf!)
 
         // Update fine + coarse block-pooled features. Incremental for
         // L=1 decode steps (only the tail block(s) can have changed);
         // full re-pool only for prefill / multi-token chunks.
-        if newK.dim(0) == 1 && fineBlockFeatures != nil {
+        if newK.dim(0) == 1 && _currentFineBlockCount > 0 {
             updateBlockTailIncremental(blockSize: config.fineBlockSize, oldSeqLen: oldSeqLen, isFine: true)
-            if config.coarseRescueEnabled && coarseBlockFeatures != nil {
+            if config.coarseRescueEnabled && _currentCoarseBlockCount > 0 {
                 updateBlockTailIncremental(blockSize: config.coarseBlockSize, oldSeqLen: oldSeqLen, isFine: false)
             }
         } else {
-            fineBlockFeatures = retrievalAttentionBlockMeanPool(
+            let fullPooledFine = retrievalAttentionBlockMeanPool(
                 perTokenFeatures!, blockSize: config.fineBlockSize
             )
+            writePoolBuffer(
+                full: fullPooledFine, blockSize: config.fineBlockSize, isFine: true)
             if config.coarseRescueEnabled {
-                coarseBlockFeatures = retrievalAttentionBlockMeanPool(
+                let fullPooledCoarse = retrievalAttentionBlockMeanPool(
                     perTokenFeatures!, blockSize: config.coarseBlockSize
                 )
+                writePoolBuffer(
+                    full: fullPooledCoarse, blockSize: config.coarseBlockSize, isFine: false)
             }
+        }
+    }
+
+    /// v2 in-place write into the pre-allocated fine/coarse block
+    /// buffer. Lazy allocates on first call.
+    private func writePoolBuffer(full: MLXArray, blockSize: Int, isFine: Bool) {
+        let nRows = full.dim(0)
+        let selectorDim = config.selectorDim
+        let maxBlocks = (maxSeqLen + blockSize - 1) / blockSize
+        if isFine {
+            if _fineBlockBuf == nil {
+                _fineBlockBuf = MLXArray.zeros(
+                    [maxBlocks, selectorDim], dtype: .float32)
+                eval(_fineBlockBuf!)
+            }
+            _fineBlockBuf![..<nRows, 0...] = full
+            _currentFineBlockCount = nRows
+            eval(_fineBlockBuf!)
+        } else {
+            if _coarseBlockBuf == nil {
+                _coarseBlockBuf = MLXArray.zeros(
+                    [maxBlocks, selectorDim], dtype: .float32)
+                eval(_coarseBlockBuf!)
+            }
+            _coarseBlockBuf![..<nRows, 0...] = full
+            _currentCoarseBlockCount = nRows
+            eval(_coarseBlockBuf!)
         }
     }
 
@@ -150,31 +220,41 @@ public final class RetrievalAttentionIndex {
     private func updateBlockTailIncremental(
         blockSize: Int, oldSeqLen: Int, isFine: Bool
     ) {
-        let pooled = isFine ? fineBlockFeatures! : coarseBlockFeatures!
-        let newSeqLen = seqLen  // == oldSeqLen + 1
-        let priorBlockCount = pooled.dim(0)
+        let priorBlockCount = isFine ? _currentFineBlockCount : _currentCoarseBlockCount
+        let newSeqLen = _currentSeqLen  // == oldSeqLen + 1
         let lastBlockIdx = oldSeqLen / blockSize
         let lastBlockStart = lastBlockIdx * blockSize
         // Mean over the slice [lastBlockStart..<newSeqLen] of perTokenFeatures.
         let tail = perTokenFeatures![lastBlockStart..., 0...]
         let tailMean = tail.mean(axis: 0).reshaped(1, -1)
+
+        // v2 in-place writes into pre-allocated _fineBlockBuf / _coarseBlockBuf.
+        // Replaces the v1 `concatenated([pooled, tailMean], axis: 0)` that
+        // grew a new MLXArray per decode step.
         if priorBlockCount == lastBlockIdx + 1 {
-            // Same block as before — replace last row.
-            if priorBlockCount == 1 {
-                if isFine { fineBlockFeatures = tailMean } else { coarseBlockFeatures = tailMean }
+            // Same block as before — replace last row in place.
+            if isFine {
+                _fineBlockBuf![(priorBlockCount - 1) ..< priorBlockCount, 0...] = tailMean
+                eval(_fineBlockBuf!)
             } else {
-                let head = pooled[..<(priorBlockCount - 1), 0...]
-                let merged = concatenated([head, tailMean], axis: 0)
-                if isFine { fineBlockFeatures = merged } else { coarseBlockFeatures = merged }
+                _coarseBlockBuf![(priorBlockCount - 1) ..< priorBlockCount, 0...] = tailMean
+                eval(_coarseBlockBuf!)
             }
         } else if priorBlockCount == lastBlockIdx {
-            // New block started at lastBlockIdx — append.
-            let merged = concatenated([pooled, tailMean], axis: 0)
-            if isFine { fineBlockFeatures = merged } else { coarseBlockFeatures = merged }
+            // New block started at lastBlockIdx — append in place.
+            if isFine {
+                _fineBlockBuf![priorBlockCount ..< (priorBlockCount + 1), 0...] = tailMean
+                _currentFineBlockCount = priorBlockCount + 1
+                eval(_fineBlockBuf!)
+            } else {
+                _coarseBlockBuf![priorBlockCount ..< (priorBlockCount + 1), 0...] = tailMean
+                _currentCoarseBlockCount = priorBlockCount + 1
+                eval(_coarseBlockBuf!)
+            }
         } else {
             // Unexpected (skipped blocks?). Fall back to full re-pool.
             let full = retrievalAttentionBlockMeanPool(perTokenFeatures!, blockSize: blockSize)
-            if isFine { fineBlockFeatures = full } else { coarseBlockFeatures = full }
+            writePoolBuffer(full: full, blockSize: blockSize, isFine: isFine)
         }
         _ = newSeqLen
     }
