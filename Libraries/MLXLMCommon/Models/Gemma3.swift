@@ -240,6 +240,153 @@ public enum Gemma3 {
             .reshaped(B, L, -1)
             return outputProj(output)
         }
+
+        /// Batched attention: B requests with per-request KV caches.
+        /// Mirrors Qwen2.Attention.batchedForward; Gemma3 q/k norms applied
+        /// post-reshape (head-wise), no bias on projections.
+        public func batchedForward(
+            _ x: MLXArray, caches: [KVCache?]
+        ) -> MLXArray {
+            let B = x.dim(0)
+            let L = x.dim(1)
+
+            var queries = queryProj(x)
+            var keys = keyProj(x)
+            var values = valueProj(x)
+
+            queries = queries.reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
+            keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+
+            // Apply q/k norm (head-wise) on the batched tensor — same op
+            // semantics as single-request path. Norm weights are broadcast.
+            queries = queryNorm(queries)
+            keys = keyNorm(keys)
+
+            let firstOffset = caches[0]?.offset ?? 0
+            let allSameOffset = (1 ..< B).allSatisfy {
+                (caches[$0]?.offset ?? 0) == firstOffset
+            }
+
+            let qSlices: [MLXArray]
+            let kSlices: [MLXArray]
+            let vSlices: [MLXArray]
+            if allSameOffset {
+                let qRoped = rope(queries, offset: firstOffset)
+                let kRoped = rope(keys, offset: firstOffset)
+                qSlices = split(qRoped, parts: B, axis: 0)
+                kSlices = split(kRoped, parts: B, axis: 0)
+                vSlices = split(values, parts: B, axis: 0)
+            } else {
+                qSlices = split(queries, parts: B, axis: 0)
+                kSlices = split(keys, parts: B, axis: 0)
+                vSlices = split(values, parts: B, axis: 0)
+            }
+
+            var rotQ = [MLXArray]()
+            var allKeys = [MLXArray]()
+            var allVals = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            allKeys.reserveCapacity(B)
+            allVals.reserveCapacity(B)
+
+            var allSameLen = true
+            var firstLen = -1
+
+            for i in 0 ..< B {
+                let cache_i = caches[i]
+                let qR: MLXArray
+                let kR: MLXArray
+                if allSameOffset {
+                    qR = qSlices[i]
+                    kR = kSlices[i]
+                } else {
+                    let offset = cache_i?.offset ?? 0
+                    qR = rope(qSlices[i], offset: offset)
+                    kR = rope(kSlices[i], offset: offset)
+                }
+                let (aK, aV) = cache_i?.update(keys: kR, values: vSlices[i])
+                    ?? (kR, vSlices[i])
+                rotQ.append(qR)
+                allKeys.append(aK)
+                allVals.append(aV)
+
+                let sLen = aK.dim(2)
+                if firstLen < 0 { firstLen = sLen }
+                if sLen != firstLen { allSameLen = false }
+            }
+
+            let output: MLXArray
+            if allSameLen && B > 1 {
+                let bQ = concatenated(rotQ, axis: 0)
+                let bK = concatenated(allKeys, axis: 0)
+                let bV = concatenated(allVals, axis: 0)
+                output = MLXFast.scaledDotProductAttention(
+                    queries: bQ, keys: bK, values: bV,
+                    scale: scale, mask: .none
+                )
+            } else {
+                var outputs = [MLXArray]()
+                outputs.reserveCapacity(B)
+                for i in 0 ..< B {
+                    let attn = MLXFast.scaledDotProductAttention(
+                        queries: rotQ[i], keys: allKeys[i], values: allVals[i],
+                        scale: scale, mask: .none
+                    )
+                    outputs.append(attn)
+                }
+                output = concatenated(outputs, axis: 0)
+            }
+
+            return outputProj(
+                output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            )
+        }
+
+        /// Fully batched attention with shared `BatchedKVCache`. The caller
+        /// provides the correct mask for this layer's attention type
+        /// (sliding-window vs global), built once in `Backbone.fullyBatchedForward`.
+        public func fullyBatchedForward(
+            _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+            mask: MLXArray
+        ) -> MLXArray {
+            let B = x.dim(0)
+            let L = x.dim(1)
+
+            var queries = queryProj(x).reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
+            var keys = keyProj(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            let values = valueProj(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+
+            queries = queryNorm(queries)
+            keys = keyNorm(keys)
+
+            let allSameOffset = cache.offsets[0 ..< cache.active]
+                .allSatisfy { $0 == cache.offsets[0] }
+            if allSameOffset {
+                let offset = cache.offsets[0]
+                queries = rope(queries, offset: offset)
+                keys = rope(keys, offset: offset)
+                cache.update(newKeys: keys, newValues: values)
+            } else {
+                let qSlices = split(queries, parts: B, axis: 0)
+                let kSlices = split(keys, parts: B, axis: 0)
+                var rotQ = [MLXArray]()
+                var rotK = [MLXArray]()
+                rotQ.reserveCapacity(B)
+                rotK.reserveCapacity(B)
+                for i in 0 ..< B {
+                    let off = cache.offsets[i]
+                    rotQ.append(rope(qSlices[i], offset: off))
+                    rotK.append(rope(kSlices[i], offset: off))
+                }
+                queries = concatenated(rotQ, axis: 0)
+                keys = concatenated(rotK, axis: 0)
+                cache.update(newKeys: keys, newValues: values)
+            }
+
+            let output = cache.attention(queries: queries, scale: scale, mask: mask)
+            return outputProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        }
     }
 
     // MARK: - MLP
@@ -297,6 +444,31 @@ public enum Gemma3 {
             let r2 = mlp(preFeedforwardLayerNorm(h))
             let out = Gemma.clipResidual(h, postFeedforwardLayerNorm(r2))
             return out
+        }
+
+        /// Batched forward: batched norms + MLP, per-request attention.
+        public func batchedForward(
+            _ x: MLXArray, caches: [KVCache?]
+        ) -> MLXArray {
+            let normed = inputLayerNorm(x)
+            let r = selfAttention.batchedForward(normed, caches: caches)
+            let h = Gemma.clipResidual(x, postAttentionLayerNorm(r))
+            let r2 = mlp(preFeedforwardLayerNorm(h))
+            return Gemma.clipResidual(h, postFeedforwardLayerNorm(r2))
+        }
+
+        /// Fully batched forward with shared `BatchedKVCache`. Mask is
+        /// pre-computed in `Backbone.fullyBatchedForward` for this layer's
+        /// attention type (sliding-window vs global).
+        public func fullyBatchedForward(
+            _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int, mask: MLXArray
+        ) -> MLXArray {
+            let normed = inputLayerNorm(x)
+            let r = selfAttention.fullyBatchedForward(
+                normed, cache: cache, layerIndex: layerIndex, mask: mask)
+            let h = Gemma.clipResidual(x, postAttentionLayerNorm(r))
+            let r2 = mlp(preFeedforwardLayerNorm(h))
+            return Gemma.clipResidual(h, postFeedforwardLayerNorm(r2))
         }
     }
 
@@ -370,6 +542,89 @@ public enum Gemma3 {
                     (i % config.slidingWindowPattern == config.slidingWindowPattern - 1)
                 let m = isGlobal ? globalMask : slidingWindowMask
                 stream = layer(stream, mask: m, cache: layerCache?[i])
+            }
+            return norm(stream)
+        }
+
+        /// Batched forward: B requests with separate per-layer caches.
+        /// caches: [[KVCache]] — outer per-request, inner per-layer.
+        public func batchedForward(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+            var stream = embedTokens(inputs)
+            // sqrt(hiddenSize) scale, computed in bf16 then cast to runtime dtype.
+            let s = MLXArray(sqrt(Float(config.hiddenSize)), dtype: .bfloat16)
+                .asType(stream.dtype)
+            stream = stream * s
+
+            for (i, layer) in layers.enumerated() {
+                let layerCaches = caches.map { $0[i] as KVCache? }
+                stream = layer.batchedForward(stream, caches: layerCaches)
+            }
+            return norm(stream)
+        }
+
+        /// Fully batched forward with shared per-layer `BatchedKVCache`.
+        /// Builds two masks: one for global layers, one for sliding-window
+        /// layers — and routes by `(i % slidingWindowPattern == pattern - 1)`.
+        public func fullyBatchedForward(
+            _ inputs: MLXArray, caches: [BatchedKVCache]
+        ) -> MLXArray {
+            var stream = embedTokens(inputs)
+            let s = MLXArray(sqrt(Float(config.hiddenSize)), dtype: .bfloat16)
+                .asType(stream.dtype)
+            stream = stream * s
+
+            // Build per-attention-type masks once. For L=1 decode with all-
+            // same-offset, global mask is all-zeros up to maxPostOffset; the
+            // sliding-window mask masks positions older than `slidingWindow`.
+            let B = caches[0].active
+            let cacheDtype = caches[0].keys.dtype
+            let allSame = caches[0].offsets[0 ..< B]
+                .allSatisfy { $0 == caches[0].offsets[0] }
+            let maxPostOffset = (caches[0].offsets[0 ..< B].max() ?? 0) + 1
+
+            // Global mask: all valid positions up to each request's offset.
+            let globalMask: MLXArray
+            if allSame {
+                globalMask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+            } else {
+                let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(caches[0].offsets[0 ..< B].map { $0 + 1 })
+                    .reshaped(B, 1)
+                let valid = positions .< offsetsArr
+                globalMask = MLX.where(
+                    valid,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            }
+
+            // Sliding-window mask: positions older than (offset - slidingWindow + 1)
+            // are masked out. Only build when there is at least one sliding layer.
+            let slidingMask: MLXArray
+            if config.slidingWindowPattern > 1 {
+                let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(caches[0].offsets[0 ..< B].map { $0 + 1 })
+                    .reshaped(B, 1)
+                let lowerBound = offsetsArr - Int32(config.slidingWindow)
+                let inWindow = MLX.logicalAnd(
+                    positions .< offsetsArr,
+                    positions .>= lowerBound
+                )
+                slidingMask = MLX.where(
+                    inWindow,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            } else {
+                slidingMask = globalMask
+            }
+
+            for (i, layer) in layers.enumerated() {
+                let isGlobal =
+                    (i % config.slidingWindowPattern == config.slidingWindowPattern - 1)
+                let m = isGlobal ? globalMask : slidingMask
+                stream = layer.fullyBatchedForward(
+                    stream, cache: caches[i], layerIndex: i, mask: m)
             }
             return norm(stream)
         }

@@ -48,6 +48,23 @@ public class Gemma3TextModel: Module, LLMModel {
         return lmHead(h)
     }
 
+    /// Batched decode: B requests with per-request per-layer caches.
+    /// Pairs with `Gemma3.Backbone.batchedForward` for vllm-swift's
+    /// `vsm_engine_decode_all` semi-batched path.
+    public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+        let h = model.batchedForward(inputs, caches: caches)
+        return lmHead(h)
+    }
+
+    /// Fully batched decode with shared per-layer `BatchedKVCache`. The
+    /// backbone handles dual-mask (sliding vs global) dispatch internally.
+    public func fullyBatchedDecode(
+        _ inputs: MLXArray, caches: [BatchedKVCache]
+    ) -> MLXArray {
+        let h = model.fullyBatchedForward(inputs, caches: caches)
+        return lmHead(h)
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var processedWeights = weights
 
