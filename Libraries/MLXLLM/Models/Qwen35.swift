@@ -383,21 +383,39 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim).contiguous()
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim).contiguous()
 
-        // Decode (S == 1) with non-nil state — use the fused kernel that
-        // absorbs rmsNorm(q), rmsNorm(k), sigmoid(b)→beta, and
-        // g = exp(-exp(aLog) * softplus(a + dtBias)) into one Metal dispatch.
-        // The kernel is already B>1-capable.
-        let (out, newRecState) = fusedGatedDeltaUpdate(
-            qRaw: q,
-            kRaw: k,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: recStateSlice,
-            mask: nil
-        )
+        // Decode (S == 1). Default = non-fused (rmsNorm outside + plain
+        // gated_delta_step kernel). The fused kernel that absorbs
+        // rmsNorm + sigmoid + compute_g into one Metal dispatch had
+        // register-pressure issues at Qwen3.6-27B's dims (headKDim=128,
+        // numKHeads=16, numVHeads=48): measured B=64 nonfused 333 tok/s
+        // vs fused 263 tok/s on M5 Max (+27%, closed the gap to Python
+        // mlx_lm from -44% to -14%). The non-fused path mirrors Python
+        // mlx-lm's qwen3_5.py flow line-for-line.
+        // Set VSM_GDN_FUSED=1 to restore the old fused path.
+        let useFused = ProcessInfo.processInfo.environment["VSM_GDN_FUSED"] == "1"
+        let out: MLXArray
+        let newRecState: MLXArray
+        if useFused {
+            (out, newRecState) = fusedGatedDeltaUpdate(
+                qRaw: q, kRaw: k, v: v,
+                a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: recStateSlice, mask: nil)
+        } else {
+            // Python: q = inv_scale^2 * rms_norm(q, None, 1e-6)
+            //         k = inv_scale     * rms_norm(k, None, 1e-6)
+            // `None` weight == apply norm without scaling; mlx-swift
+            // requires an MLXArray, so allocate ones once per call (cheap
+            // — single small alloc that the lazy graph hoists/reuses).
+            let invScale = Float(1.0) / Float(headKDim).squareRoot()
+            let onesK = MLXArray.ones([headKDim], dtype: q.dtype)
+            let qNormed = (invScale * invScale)
+                * MLXFast.rmsNorm(q, weight: onesK, eps: 1e-6)
+            let kNormed = invScale * MLXFast.rmsNorm(k, weight: onesK, eps: 1e-6)
+            (out, newRecState) = gatedDeltaUpdate(
+                q: qNormed, k: kNormed, v: v,
+                a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: recStateSlice, mask: nil)
+        }
 
         // Commit both pieces of state.
         cache.writeback(conv: newConvState, rec: newRecState)
