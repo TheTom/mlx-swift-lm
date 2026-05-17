@@ -237,4 +237,193 @@ struct F85V2BatchedMaskTests {
         let diffAB = (outA - outB).abs().max().item(Float.self)
         #expect(diffAB < 1e-4, "f73-batched vs f73-loop diff=\(diffAB)")
     }
+
+    /// F-85 v3 — compose-gather should match the F-71b kernel numerically.
+    ///
+    /// Important: compose-gather and F-71b BOTH use the per-(B, nKVH)
+    /// `perKVHeadGatherBatched` selector. F-73 mask, by contrast, builds a
+    /// UNION mask `[B, 1, 1, T]` that lets each Q-head in a slot attend
+    /// any position ANY KV-head wanted — strictly LESS selective than
+    /// compose-gather. So F-73 is NOT the right reference here.
+    ///
+    /// F-71b is the right reference: same selector, same gathered K/V
+    /// scope, just a different SDPA primitive (custom kernel vs MLXFast
+    /// SDPA on gathered slab). Output should agree numerically.
+    @Test func composeGatherMatchesF71b() {
+        var cfg = RetrievalAttentionConfig()
+        cfg.fineBlockSize = 32
+        cfg.coarseRescueEnabled = false
+        cfg.adaptiveTopK = false
+        cfg.fineTopK = 4
+        cfg.staticInit = 64
+        cfg.slidingWindow = 128
+        cfg.denseFirstN = 0
+        cfg.denseLastN = 0
+
+        let B = 2
+        let nKVH = 4
+        let nQH = 8     // groupSize = 2
+        let dHead = 64
+        let T = 512
+
+        let kAll = MLXRandom.normal([B, nKVH, T, dHead], key: MLXRandom.key(21)).asType(.float32)
+        let vAll = MLXRandom.normal([B, nKVH, T, dHead], key: MLXRandom.key(22)).asType(.float32)
+        let Q = MLXRandom.normal([B, nQH, 1, dHead], key: MLXRandom.key(23)).asType(.float32)
+
+        let scale = pow(Float(dHead), -0.5)
+
+        func makeRACache() -> BatchedRetrievalAttentionKVCache {
+            let cache = BatchedKVCache(
+                maxBatch: B, kvHeads: nKVH, headDim: dHead, maxSeq: T + 64,
+                dtype: .float32)
+            for _ in 0..<B { _ = cache.addRequest() }
+            cache.keys[..<B, 0..., ..<T, 0...] = kAll
+            cache.values[..<B, 0..., ..<T, 0...] = vAll
+            for i in 0..<B { cache.offsets[i] = T }
+            let raCache = BatchedRetrievalAttentionKVCache(
+                inner: cache, B: B, nKVHeads: nKVH, dHead: dHead,
+                layerIdx: 5, totalLayers: 10, raConfig: cfg)
+            raCache.updateIndex(newKeys: kAll)
+            return raCache
+        }
+
+        // Common Q-rep + projQ setup (mirrors sparseAttend internals).
+        let qSqueezed = Q[0..., 0..., 0, 0...]
+        let groupSize = nQH / nKVH
+        let headIdx = MLXArray((0..<nKVH).map { Int32($0 * groupSize) })
+        let qRep = qSqueezed.take(headIdx, axis: 1).asType(.float32)
+
+        // F-71b reference path (per-KV-head selective).
+        let raF71b = makeRACache()
+        let projQF71b = raF71b.index.projectQueriesBatched(qRep)
+        let (gatherF71b, _) = raF71b.index.perKVHeadGatherBatched(
+            projectedQ: projQF71b, seqLen: T)
+        let outF71b = retrievalAttentionGroupSparseSDPA(
+            queries: Q,
+            keys: kAll,
+            values: vAll,
+            perKVHeadGather: gatherF71b,
+            scale: scale)
+        eval(outF71b)
+
+        // Compose-gather path: same selector, MLXFast SDPA on gathered slab.
+        let raCG = makeRACache()
+        let projQCG = raCG.index.projectQueriesBatched(qRep)
+        let (gather, _) = raCG.index.perKVHeadGatherBatched(
+            projectedQ: projQCG, seqLen: T)
+        let gExp = gather.expandedDimensions(axis: 3)
+        let kSmall = takeAlong(kAll, gExp, axis: 2)
+        let vSmall = takeAlong(vAll, gExp, axis: 2)
+        let outCG = MLXFast.scaledDotProductAttention(
+            queries: Q, keys: kSmall, values: vSmall,
+            scale: scale, mask: .none)
+        eval(outCG)
+
+        // Both paths attend the SAME per-(B, nKVH) positions, so the only
+        // numerical difference is the SDPA primitive. Compose-gather hits
+        // the MLXFast fp32 fused tile; F-71b runs a custom group-sparse
+        // kernel that may have slightly different accumulation order.
+        // Tight cosine tolerance — same math, same scope.
+        for b in 0..<B {
+            for h in 0..<nQH {
+                let a = outF71b[b, h, 0, 0...].asArray(Float.self)
+                let c = outCG[b, h, 0, 0...].asArray(Float.self)
+                var dot: Float = 0
+                var na: Float = 0
+                var nc: Float = 0
+                for i in 0..<a.count {
+                    dot += a[i] * c[i]
+                    na += a[i] * a[i]
+                    nc += c[i] * c[i]
+                }
+                let cos = dot / (sqrt(na) * sqrt(nc) + 1e-9)
+                #expect(cos >= 0.99,
+                    "compose-gather vs F-71b cosine = \(cos) at (b=\(b), h=\(h))")
+            }
+        }
+    }
+
+    /// F-85 v3 — compose-gather output should be a reasonable approximation
+    /// to dense at high K_padded coverage. At small T with kFine=4, fineBS=32,
+    /// static=64, sliding=128 the gather covers ~320 of 512 positions = 62%
+    /// → cosine vs dense should be well above 0.6.
+    @Test func composeGatherSanityVsDense() {
+        var cfg = RetrievalAttentionConfig()
+        cfg.fineBlockSize = 32
+        cfg.coarseRescueEnabled = false
+        cfg.adaptiveTopK = false
+        cfg.fineTopK = 8     // 8 * 32 = 256 fine positions
+        cfg.staticInit = 64
+        cfg.slidingWindow = 128
+        cfg.denseFirstN = 0
+        cfg.denseLastN = 0
+
+        let B = 2
+        let nKVH = 4
+        let nQH = 8
+        let dHead = 64
+        let T = 512
+
+        let kAll = MLXRandom.normal([B, nKVH, T, dHead], key: MLXRandom.key(31)).asType(.float32)
+        let vAll = MLXRandom.normal([B, nKVH, T, dHead], key: MLXRandom.key(32)).asType(.float32)
+        let Q = MLXRandom.normal([B, nQH, 1, dHead], key: MLXRandom.key(33)).asType(.float32)
+        let scale = pow(Float(dHead), -0.5)
+
+        // Dense reference.
+        let outDense = MLXFast.scaledDotProductAttention(
+            queries: Q, keys: kAll, values: vAll,
+            scale: scale, mask: .none)
+        eval(outDense)
+
+        // Compose-gather.
+        let cache = BatchedKVCache(
+            maxBatch: B, kvHeads: nKVH, headDim: dHead, maxSeq: T + 64,
+            dtype: .float32)
+        for _ in 0..<B { _ = cache.addRequest() }
+        cache.keys[..<B, 0..., ..<T, 0...] = kAll
+        cache.values[..<B, 0..., ..<T, 0...] = vAll
+        for i in 0..<B { cache.offsets[i] = T }
+        let raCache = BatchedRetrievalAttentionKVCache(
+            inner: cache, B: B, nKVHeads: nKVH, dHead: dHead,
+            layerIdx: 5, totalLayers: 10, raConfig: cfg)
+        raCache.updateIndex(newKeys: kAll)
+
+        let qSqueezed = Q[0..., 0..., 0, 0...]
+        let groupSize = nQH / nKVH
+        let headIdx = MLXArray((0..<nKVH).map { Int32($0 * groupSize) })
+        let qRep = qSqueezed.take(headIdx, axis: 1).asType(.float32)
+        let projQ = raCache.index.projectQueriesBatched(qRep)
+        let (gather, _) = raCache.index.perKVHeadGatherBatched(
+            projectedQ: projQ, seqLen: T)
+        let gExp = gather.expandedDimensions(axis: 3)
+        let kSmall = takeAlong(kAll, gExp, axis: 2)
+        let vSmall = takeAlong(vAll, gExp, axis: 2)
+        let outCG = MLXFast.scaledDotProductAttention(
+            queries: Q, keys: kSmall, values: vSmall,
+            scale: scale, mask: .none)
+        eval(outCG)
+
+        var minCos: Float = 1.0
+        for b in 0..<B {
+            for h in 0..<nQH {
+                let a = outDense[b, h, 0, 0...].asArray(Float.self)
+                let c = outCG[b, h, 0, 0...].asArray(Float.self)
+                var dot: Float = 0
+                var na: Float = 0
+                var nc: Float = 0
+                for i in 0..<a.count {
+                    dot += a[i] * c[i]
+                    na += a[i] * a[i]
+                    nc += c[i] * c[i]
+                }
+                let cos = dot / (sqrt(na) * sqrt(nc) + 1e-9)
+                if cos < minCos { minCos = cos }
+            }
+        }
+        // Random K so absolute cosine is unpredictable, but should be
+        // clearly correlated. Lower bound 0.4 just guards against total
+        // wrong-axis bugs (output to slot 0 going to slot 1 etc).
+        #expect(minCos >= 0.4,
+            "compose-gather vs dense min cosine = \(minCos) — too low, possible slot crossover")
+    }
 }

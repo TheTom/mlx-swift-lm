@@ -39,11 +39,15 @@ public final class BatchedRetrievalAttentionKVCache {
     /// KV group. Built lazily on first sparseAttend.
     private var cachedHeadIdx: MLXArray?
 
-    /// F-85 v2 — env-gated kernel selection. Read once at module load.
+    /// F-85 v2/v3 — env-gated kernel selection. Read once at module load.
     /// Values:
-    ///   "f73"     (default) — F-73 batched mask kernel + MLXFast SDPA.
-    ///   "f73loop"           — Swift loop over single-batch F-73 mask + SDPA.
-    ///   "f71b"              — original v1 fused F-71b sparse SDPA.
+    ///   "f73"           (default) — F-73 batched mask kernel + MLXFast SDPA.
+    ///   "f73loop"                 — Swift loop over single-batch F-73 mask + SDPA.
+    ///   "f71b"                    — original v1 fused F-71b sparse SDPA.
+    ///   "composegather" (F-85 v3) — per-(B, nKVH) gather K/V into [B,nKVH,K_padded,D]
+    ///                               then dense MLXFast SDPA on the small slab.
+    ///                               Theory: at B=8 ctx=32K K_padded≈2K, KV BW
+    ///                               saving ≈16× vs F-73 mask which reads full T.
     public static let envBatchedKernel: String = {
         ProcessInfo.processInfo.environment["VSM_SPARSE_BATCHED_KERNEL"]
             ?? "f73"
@@ -97,9 +101,10 @@ public final class BatchedRetrievalAttentionKVCache {
     /// - Returns: `[B, nQH, 1, D]` attention output.
     ///
     /// Dispatches by `VSM_SPARSE_BATCHED_KERNEL`:
-    /// - `f73`     (default) — F-73 batched mask kernel + MLXFast SDPA.
-    /// - `f73loop`           — Swift loop over single-batch F-73 mask + SDPA.
-    /// - `f71b`              — original v1 F-71b custom kernel.
+    /// - `f73`           (default) — F-73 batched mask kernel + MLXFast SDPA.
+    /// - `f73loop`                 — Swift loop over single-batch F-73 mask + SDPA.
+    /// - `f71b`                    — original v1 F-71b custom kernel.
+    /// - `composegather` (v3)      — per-(B, nKVH) gather → small dense SDPA.
     public func sparseAttend(
         queries: MLXArray, scale: Float
     ) -> MLXArray {
@@ -146,6 +151,14 @@ public final class BatchedRetrievalAttentionKVCache {
             // Path B — Swift loop over single-batch F-73 mask + SDPA. Slow
             // fallback for A/B vs the batched-kernel path.
             return sparseAttendF73Loop(
+                queries: queries, projQ: projQ, K: cachedK, V: cachedV,
+                T: T, scale: scale)
+
+        case "composegather":
+            // Path C (F-85 v3) — per-(B, nKVH) gather K/V into a small
+            // [B, nKVH, K_padded, D] slab via takeAlong, then dense MLXFast
+            // SDPA with mask:.none on the slab.
+            return sparseAttendComposeGather(
                 queries: queries, projQ: projQ, K: cachedK, V: cachedV,
                 T: T, scale: scale)
 
@@ -217,5 +230,47 @@ public final class BatchedRetrievalAttentionKVCache {
             outputs.append(oSlot)
         }
         return concatenated(outputs, axis: 0)
+    }
+
+    /// F-85 v3 path C — compose-gather: build per-(B, nKVH) gather index
+    /// `[B, nKVH, K_padded]`, take K/V along axis 2 to materialize
+    /// `[B, nKVH, K_padded, D]` slabs, then call dense MLXFast SDPA with
+    /// `mask: .none` on the small slab. GQA broadcast (nKVH → nQH) handled
+    /// internally by MLXFast.
+    ///
+    /// Bandwidth theory (B=8, T=32K, K_padded≈2K, nKVH=8, D=128):
+    ///   dense reads:   B*nKVH*T*D*2B   = 268M elem × 2B = 536 MB/layer
+    ///   compose reads: B*nKVH*K_pad*D*2B = 33 MB/layer
+    ///   = 16× KV BW saving. Add SDPA on small slab + take overhead.
+    ///
+    /// Compose-gather vs F-84 blockGather: F-84 is B=1 with cross-head 1D
+    /// union (small T). Here we keep per-(B, nKVH) gather since selector is
+    /// already that shape, AND the union-across-heads-across-batch math gets
+    /// silly at B=8 (worst-case 8 × 8 × 32 fully disjoint blocks = 16K of
+    /// 32K which is close to dense anyway). Per-(B, nKVH) keeps the slab
+    /// fully addressed and stays in fast path.
+    private func sparseAttendComposeGather(
+        queries: MLXArray, projQ: MLXArray,
+        K: MLXArray, V: MLXArray, T: Int, scale: Float
+    ) -> MLXArray {
+        // Reuse existing selector — already returns [B, nKVH, K_padded] int32
+        // gather indices sorted + clipped to [0, T-1].
+        let (gather, kPadded) = index.perKVHeadGatherBatched(
+            projectedQ: projQ, seqLen: T)
+        precondition(gather.shape.count == 3, "gather must be [B, nKVH, K_padded]")
+        precondition(gather.dim(0) == queries.dim(0), "gather B mismatch")
+        // K/V shape [B, nKVH, T, D]. takeAlong expects indices broadcastable
+        // to K excluding axis 2 → [B, nKVH, K_padded, 1] broadcasts D.
+        let gExp = gather.expandedDimensions(axis: 3)        // [B, nKVH, K_padded, 1]
+        let kSmall = takeAlong(K, gExp, axis: 2)             // [B, nKVH, K_padded, D]
+        let vSmall = takeAlong(V, gExp, axis: 2)             // [B, nKVH, K_padded, D]
+        _ = kPadded  // silence unused warning; kPadded == kSmall.dim(2)
+        // Dense SDPA on the small slab. mask:.none hits the MLXFast fused
+        // tile path (F-84 measured ~9× faster than mask:.array at gathered
+        // shapes). GQA broadcasts nKVH up to nQH automatically.
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: kSmall, values: vSmall,
+            scale: scale, mask: .none
+        )
     }
 }
