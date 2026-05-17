@@ -199,6 +199,47 @@ public struct RetrievalAttentionConfig: Sendable {
     /// benches confirm a measurable win over the F-59 mask path.
     public var usePerKVHeadGather: Bool = false
 
+    /// F-84 experimental: block-gather attend — union top-K positions
+    /// across ALL KV heads into a single 1D index list, then one
+    /// `take(_, axis: 2)` gathers `[B, nKVH, k_padded, D]` keys/values
+    /// in a single memory-coalesced kernel dispatch. Compose-only — no
+    /// new Metal kernel. Targets the 128 K B=1 decode regime where dense
+    /// is bandwidth-bound (25 GB K/V read per step → ~67 ms at 400 GB/s)
+    /// and the F-73 mask path masks compute but still reads all 25 GB.
+    ///
+    /// Avoids the F-70 per-KV-head pitfall: F-70's `takeAlong(axis: 2)`
+    /// with per-row positions doesn't coalesce — each KV row dispatches
+    /// its own gather. blockGather's single 1D index list lets the gather
+    /// broadcast across heads with full coalescing.
+    ///
+    /// Trade-off: cross-head union grows `k_padded` slightly larger than
+    /// per-head's, but at default knobs (fineTopK=32, fineBS=64) and
+    /// 128 K context this still yields ~64× bandwidth saving vs dense
+    /// = ~1 ms theoretical SDPA floor. Off by default until benches
+    /// confirm a win over dense at long context.
+    public var useBlockGather: Bool = false
+
+    /// F-84 — when true, skip the duplicate-position additive mask in
+    /// `blockGatherAttend` and pass `mask: .none` to SDPA. Critical for
+    /// hitting the fast tiled-SDPA path: research benches measured ~9×
+    /// regression on `mask: .array(...)` vs `mask: .none` at gathered
+    /// shapes (per the perKVHead failure analysis). When the gather
+    /// config keeps cross-head duplicates rare (e.g. disjoint fine
+    /// blocks at long ctx), the doubled-softmax-weight on dup positions
+    /// is negligible vs the 9× speedup. Default true since the user-
+    /// recommended ship config (fineTopK=32, fineBS=64, no-adaptive)
+    /// minimizes cross-head overlap.
+    public var blockGatherNoMask: Bool = true
+
+    /// F-84 — soft guard: when k_padded exceeds this fraction of T,
+    /// `blockGatherAttend` falls back inline to plain dense SDPA (no
+    /// crash, no gather tax). At 0.05 (5%) the gather materializes f16
+    /// K/V scratch small enough to beat the dense fast path. Default
+    /// 1.0 = OFF so the user opts in explicitly when they know their
+    /// config keeps k_padded small (e.g. `VSM_SPARSE_BLOCK_GATHER_KPAD_FRAC=0.10`
+    /// at 128K with fineTopK=32).
+    public var blockGatherKPaddedMaxFraction: Float = 1.0
+
     /// F-79 SHIP DEFAULT: amortize the selector top-K computation
     /// across decode steps. Q drifts slowly between adjacent decode
     /// tokens, so the top-K picks at step T+1 are usually nearly

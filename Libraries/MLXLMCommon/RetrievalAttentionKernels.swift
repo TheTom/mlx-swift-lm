@@ -30,6 +30,9 @@ private final class _RAKernelCache: @unchecked Sendable {
     private var sparseSDPAKernel: MLXFast.MLXFastKernel?
     private var groupSDPAKernel: MLXFast.MLXFastKernel?
     private var buildMaskKernel: MLXFast.MLXFastKernel?
+    /// F-85 v2 — B-aware sibling of `buildMaskKernel`. Same membership
+    /// logic but threadgroup Y axis indexes the batch slot.
+    private var buildMaskBatchedKernel: MLXFast.MLXFastKernel?
     private var selectorBundleKernel: MLXFast.MLXFastKernel?
     private var parallelScoreKernel: MLXFast.MLXFastKernel?
     private var implicitSparseSDPAKernel: MLXFast.MLXFastKernel?
@@ -995,6 +998,91 @@ private final class _RAKernelCache: @unchecked Sendable {
         return k
     }
 
+    /// F-85 v2 — B-aware build-mask kernel. Takes per-slot top-K block
+    /// starts and writes the `[B, 1, 1, T]` additive attention mask in
+    /// one launch. Grid Y axis indexes the batch slot; X axis the mask
+    /// position. Threadgroup memory still scoped to one slot — the
+    /// per-TG cost is unchanged from the single-batch kernel.
+    func getBuildMaskBatched() -> MLXFast.MLXFastKernel {
+        lock.lock()
+        defer { lock.unlock() }
+        if let k = buildMaskBatchedKernel { return k }
+        let header = """
+            // F-85 v2 batched build-mask kernel.
+
+            """
+        let source = """
+            // Template constants: FINE_BS, COARSE_BS, NKVH, K_FINE, K_COARSE
+            // Inputs:
+            //   fine_starts:   [B * NKVH * K_FINE]   int32 block start positions (per slot)
+            //   coarse_starts: [B * NKVH * K_COARSE] int32 block start positions (per slot)
+            //   params:        [T_f, staticInit_f, slidingWindow_f]
+            // Output:
+            //   mask:          [B * T] float — additive (0 valid, -inf masked)
+            //
+            // Grid: ((T + tg-1)/tg, B, 1) threadgroups × (tg, 1, 1) threads.
+            // Each TG owns ONE (slot, T-tile). All threads in a TG share the
+            // slot's top-K arrays in threadgroup memory.
+
+            const uint p = thread_position_in_grid.x;
+            const uint b = threadgroup_position_in_grid.y;
+            const uint T = (uint)params[0];
+            if (p >= T) return;
+            const uint staticInit = (uint)params[1];
+            const uint slidingWindow = (uint)params[2];
+            const uint sliding_start = (T > slidingWindow) ? (T - slidingWindow) : 0u;
+
+            // Per-slot offsets into the flat top-K arrays.
+            const uint fine_off = b * (uint)NKVH * (uint)K_FINE;
+            const uint coarse_off = b * (uint)NKVH * (uint)K_COARSE;
+
+            // Cache this slot's topK in threadgroup memory.
+            threadgroup int fine_tg[NKVH * K_FINE];
+            threadgroup int coarse_tg[NKVH * K_COARSE];
+
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint tg_size = threads_per_threadgroup.x;
+            for (uint i = tid; i < NKVH * K_FINE; i += tg_size) {
+                fine_tg[i] = fine_starts[fine_off + i];
+            }
+            for (uint i = tid; i < NKVH * K_COARSE; i += tg_size) {
+                coarse_tg[i] = coarse_starts[coarse_off + i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            bool valid = (p < staticInit) || (p >= sliding_start);
+
+            if (!valid) {
+                for (uint i = 0; i < NKVH * K_FINE && !valid; i++) {
+                    const int start = fine_tg[i];
+                    if ((int)p >= start && (int)p < start + (int)FINE_BS) {
+                        valid = true;
+                    }
+                }
+            }
+            if (!valid) {
+                for (uint i = 0; i < NKVH * K_COARSE && !valid; i++) {
+                    const int start = coarse_tg[i];
+                    if ((int)p >= start && (int)p < start + (int)COARSE_BS) {
+                        valid = true;
+                    }
+                }
+            }
+
+            mask[b * T + p] = valid ? 0.0f : -INFINITY;
+            """
+        let k = MLXFast.metalKernel(
+            name: "ra_build_mask_b",
+            inputNames: ["fine_starts", "coarse_starts", "params"],
+            outputNames: ["mask"],
+            source: source,
+            header: header,
+            ensureRowContiguous: true
+        )
+        buildMaskBatchedKernel = k
+        return k
+    }
+
     func getScoreTopK() -> MLXFast.MLXFastKernel {
         lock.lock()
         defer { lock.unlock() }
@@ -1474,6 +1562,68 @@ public func retrievalAttentionBuildMaskFused(
         grid: (gridX, 1, 1),
         threadGroup: (tgSize, 1, 1),
         outputShapes: [[1, 1, 1, T]],
+        outputDTypes: [.float32]
+    )
+    return outputs[0].asType(outputDtype)
+}
+
+/// F-85 v2 — batched build-mask. Same membership logic as F-73 but with
+/// an explicit batch dim, so we emit `[B, 1, 1, T]` in one kernel launch
+/// instead of B separate single-slot launches.
+///
+/// - Parameters:
+///   - fineStarts: `[B, nKVH, K_fine]` int32 token positions where fine
+///     top-K blocks start (output of per-slot top-K selector).
+///   - coarseStarts: `[B, nKVH, K_coarse]` int32 token positions.
+///   - T: total cache positions (rectangular across slots).
+///   - staticInit / slidingWindow / fineBS / coarseBS — match
+///     `retrievalAttentionBuildMaskFused`.
+///   - outputDtype: cast for the returned mask (typically `K.dtype`).
+/// - Returns: `[B, 1, 1, T]` additive mask (0 valid, -inf masked).
+public func retrievalAttentionBuildMaskFusedBatched(
+    fineStarts: MLXArray,
+    coarseStarts: MLXArray,
+    T: Int,
+    staticInit: Int,
+    slidingWindow: Int,
+    fineBS: Int,
+    coarseBS: Int,
+    outputDtype: DType
+) -> MLXArray {
+    precondition(fineStarts.shape.count == 3,
+        "fineStarts must be [B, nKVH, K_fine] (got \(fineStarts.shape))")
+    precondition(coarseStarts.shape.count == 3,
+        "coarseStarts must be [B, nKVH, K_coarse] (got \(coarseStarts.shape))")
+    let B = fineStarts.dim(0)
+    let nKVH = fineStarts.dim(1)
+    let kFine = fineStarts.dim(2)
+    let kCoarse = coarseStarts.dim(2)
+    precondition(coarseStarts.dim(0) == B, "B mismatch")
+    precondition(coarseStarts.dim(1) == nKVH, "head count mismatch")
+
+    let params = MLXArray([
+        Float(T), Float(staticInit), Float(slidingWindow),
+    ])
+    let fineFlat = fineStarts.reshaped(B * nKVH * kFine)
+    let coarseFlat = coarseStarts.reshaped(B * nKVH * kCoarse)
+
+    let kernel = _RAKernelCache.shared.getBuildMaskBatched()
+    let tgSize = 256
+    let gridX = ((T + tgSize - 1) / tgSize) * tgSize
+    let outputs = kernel(
+        [fineFlat, coarseFlat, params],
+        template: [
+            ("FINE_BS", fineBS),
+            ("COARSE_BS", coarseBS),
+            ("NKVH", nKVH),
+            ("K_FINE", kFine),
+            ("K_COARSE", kCoarse),
+        ],
+        // Grid: (T-tile X) × (B slots Y) × 1. Threadgroup spans tg threads
+        // on X only; Y dim makes one TG per (slot, tile).
+        grid: (gridX, B, 1),
+        threadGroup: (tgSize, 1, 1),
+        outputShapes: [[B, 1, 1, T]],
         outputDTypes: [.float32]
     )
     return outputs[0].asType(outputDtype)
