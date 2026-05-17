@@ -95,7 +95,8 @@ class Qwen3Attention: Module {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        raContext: RetrievalAttentionContext? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
@@ -124,7 +125,8 @@ class Qwen3Attention: Module {
 
         let output = attentionWithCacheUpdate(
             queries: queries, keys: keys, values: values,
-            cache: cache, scale: scale, mask: mask
+            cache: cache, scale: scale, mask: mask,
+            raContext: raContext
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
@@ -349,6 +351,79 @@ class Qwen3Attention: Module {
 
         return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
+
+    /// F-85 — batched sparse forward for Qwen3. Mirrors
+    /// `Qwen2.Attention.fullyBatchedSparseForward` (MLXLMCommon/Models/
+    /// Qwen2.swift:365-421) but applies Qwen3's q/k RMSNorm BEFORE RoPE
+    /// — matching Qwen3's standard attention ordering. Routes through
+    /// `BatchedRetrievalAttentionKVCache.sparseAttend` (F-73 batched
+    /// mask kernel by default) on sparse-eligible layers at L=1, else
+    /// falls back to dense `cache.attention`.
+    ///
+    /// Caveman: like fullyBatchedForward but qNorm+kNorm first, then
+    /// RoPE, then route L=1 sparse to F-73 mask kernel.
+    public func fullyBatchedSparseForward(
+        _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+        mask: MLXArray
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let cache = raCache.inner
+
+        // qNorm + kNorm applied per-head BEFORE RoPE (matches Qwen3's
+        // standard callAsFunction ordering). Values pass through unchanged.
+        var queries = qNorm(wq(x).reshaped(B, L, args.attentionHeads, -1))
+            .transposed(0, 2, 1, 3)
+        var keys = kNorm(wk(x).reshaped(B, L, args.kvHeads, -1))
+            .transposed(0, 2, 1, 3)
+        let values = wv(x).reshaped(B, L, args.kvHeads, -1)
+            .transposed(0, 2, 1, 3)
+
+        let allSameOffset = cache.offsets[0 ..< cache.active]
+            .allSatisfy { $0 == cache.offsets[0] }
+        // Capture pre-update K (post-RoPE) for the selector index.
+        let preUpdateK: MLXArray
+        if allSameOffset {
+            let offset = cache.offsets[0]
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+            preUpdateK = keys
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            // Ragged path — slot-by-slot RoPE. Not the v1 target but
+            // here for safety.
+            let qSlices = split(queries, parts: B, axis: 0)
+            let kSlices = split(keys, parts: B, axis: 0)
+            var rotQ = [MLXArray]()
+            var rotK = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            rotK.reserveCapacity(B)
+            for i in 0 ..< B {
+                let off = cache.offsets[i]
+                rotQ.append(rope(qSlices[i], offset: off))
+                rotK.append(rope(kSlices[i], offset: off))
+            }
+            queries = concatenated(rotQ, axis: 0)
+            keys = concatenated(rotK, axis: 0)
+            preUpdateK = keys
+            cache.update(newKeys: keys, newValues: values)
+        }
+
+        // Selector index update (skipped for L=1 per F-72; the wrapper
+        // method handles the L check).
+        raCache.updateIndex(newKeys: preUpdateK)
+
+        let output: MLXArray
+        if L == 1 && raCache.isSparseEligible {
+            // F-71b / F-73 batched sparse SDPA. queries: [B, nQH, 1, D].
+            output = raCache.sparseAttend(
+                queries: queries, scale: scale)
+        } else {
+            // Dense path — prefill chunk, dense-band layer, or L>1.
+            output = cache.attention(queries: queries, scale: scale, mask: mask)
+        }
+        return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
 }
 
 // `Qwen3MLP` is now an alias for the shared `Qwen3.MLP` in MLXLMCommon.
@@ -373,9 +448,10 @@ class Qwen3TransformerBlock: Module {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        raContext: RetrievalAttentionContext? = nil
     ) -> MLXArray {
-        var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+        var r = attention(inputLayerNorm(x), mask: mask, cache: cache, raContext: raContext)
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         return h + r
@@ -418,6 +494,22 @@ class Qwen3TransformerBlock: Module {
         r = mlp(postAttentionLayerNorm(h))            // [B, 1, hidden] batched
         return h + r
     }
+
+    /// F-85 — batched sparse decoder layer. Same shape as
+    /// `fullyBatchedForward` but threads through a
+    /// `BatchedRetrievalAttentionKVCache` so sparse-eligible attention
+    /// layers can route to F-71b / F-73 batched kernels.
+    public func fullyBatchedSparseForward(
+        _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+        mask: MLXArray
+    ) -> MLXArray {
+        let normed = inputLayerNorm(x)
+        var r = attention.fullyBatchedSparseForward(
+            normed, raCache: raCache, mask: mask)
+        let h = x + r
+        r = mlp(postAttentionLayerNorm(h))
+        return h + r
+    }
 }
 
 public class Qwen3ModelInner: Module {
@@ -440,6 +532,19 @@ public class Qwen3ModelInner: Module {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        callAsFunction(inputs, cache: cache, raContexts: nil)
+    }
+
+    /// Sidecar retrieval-attention overload: pass a parallel list of
+    /// `RetrievalAttentionContext?` aligned to `cache` so the dispatcher
+    /// (`attentionWithCacheUpdate`) routes through the sparse path
+    /// without needing a wrapper KV cache. `raContexts` defaults to nil;
+    /// when nil this is identical to the legacy entry point. Mirrors
+    /// the Qwen2 overload (F-83 sparse decode).
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        raContexts: [RetrievalAttentionContext?]?
+    ) -> MLXArray {
         var h = embedTokens(inputs)
 
         // Auto-upcast for bf16 unquantized weights to dodge MLX Swift's
@@ -452,7 +557,7 @@ public class Qwen3ModelInner: Module {
         let mask = createAttentionMask(h: h, cache: cache?.first)
 
         for (i, layer) in layers.enumerated() {
-            h = layer(h, mask: mask, cache: cache?[i])
+            h = layer(h, mask: mask, cache: cache?[i], raContext: raContexts?[i])
         }
 
         var normed = norm(h)
@@ -538,6 +643,49 @@ public class Qwen3ModelInner: Module {
 
         return norm(h)
     }
+
+    /// F-85 — batched sparse forward. Shared per-layer
+    /// `BatchedRetrievalAttentionKVCache`. The mask is built once from
+    /// the inner BatchedKVCache offsets (matches the dense path).
+    /// Mirrors `Qwen2.ModelInner.fullyBatchedSparseForward`.
+    public func fullyBatchedSparseForward(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        var h = embedTokens(inputs)
+
+        // Auto-upcast for bf16 unquantized weights (matches dense path).
+        let needsFP32Upcast = (h.dtype == .bfloat16)
+        let originalDtype = h.dtype
+        if needsFP32Upcast { h = h.asType(.float32) }
+
+        let cache0 = raCaches[0].inner
+        let B = cache0.active
+        let cacheDtype = cache0.keys.dtype
+        let allSame = cache0.offsets[0 ..< B]
+            .allSatisfy { $0 == cache0.offsets[0] }
+        let maxPostOffset = (cache0.offsets[0 ..< B].max() ?? 0) + 1
+        let mask: MLXArray
+        if allSame {
+            mask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+        } else {
+            let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+            let offsetsArr = MLXArray(cache0.offsets[0 ..< B].map { $0 + 1 })
+                .reshaped(B, 1)
+            let valid = positions .< offsetsArr
+            mask = MLX.where(
+                valid,
+                MLXArray(Float(0)).asType(cacheDtype),
+                MLXArray(Float(-1e9)).asType(cacheDtype)
+            ).reshaped(B, 1, 1, maxPostOffset)
+        }
+        for (i, layer) in layers.enumerated() {
+            h = layer.fullyBatchedSparseForward(
+                h, raCache: raCaches[i], mask: mask)
+        }
+        var normed = norm(h)
+        if needsFP32Upcast { normed = normed.asType(originalDtype) }
+        return normed
+    }
 }
 
 public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
@@ -561,7 +709,20 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
+        callAsFunction(inputs, cache: cache, raContexts: nil)
+    }
+
+    /// Sidecar retrieval-attention overload: pass a parallel list of
+    /// `RetrievalAttentionContext?` aligned to `cache` so the dispatcher
+    /// (`attentionWithCacheUpdate`) routes through the sparse path
+    /// without needing a wrapper KV cache. `raContexts` defaults to nil;
+    /// when nil this is identical to the legacy entry point. Mirrors
+    /// the Qwen2Model overload (F-83 sparse decode).
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        raContexts: [RetrievalAttentionContext?]?
+    ) -> MLXArray {
+        var out = model(inputs, cache: cache, raContexts: raContexts)
         if let lmHead {
             out = lmHead(out)
         } else {
@@ -573,6 +734,24 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     /// Fully batched decode: zero per-request loops.
     public func fullyBatchedDecode(_ inputs: MLXArray, caches: [BatchedKVCache]) -> MLXArray {
         var out = model.fullyBatchedForward(inputs, caches: caches)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = model.embedTokens.asLinear(out)
+        }
+        return out
+    }
+
+    /// F-85 — batched sparse decode. Pairs with
+    /// `Qwen3ModelInner.fullyBatchedSparseForward`. ONE batched forward
+    /// call per token, per-layer attention routes through the F-73 batched
+    /// mask kernel (or F-71b via `VSM_SPARSE_BATCHED_KERNEL=f71b`) for
+    /// sparse-eligible layers. vllm-swift's `vsm_engine_decode_all` calls
+    /// here when sparse + B>1 sessions exist AND `VSM_SPARSE_BATCHED=1`.
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        var out = model.fullyBatchedSparseForward(inputs, raCaches: raCaches)
         if let lmHead {
             out = lmHead(out)
         } else {
