@@ -79,6 +79,9 @@ struct Qwen35BatchedHybridCacheTests {
             case .gdn:
                 #expect(!expectAttention,
                         "layer \(i) is GDN but pattern expects attention")
+            case .sparseAttention:
+                #expect(expectAttention,
+                        "layer \(i) is sparseAttention but pattern expects GDN")
             }
         }
     }
@@ -102,6 +105,7 @@ struct Qwen35BatchedHybridCacheTests {
             switch layer {
             case .attention(let c): #expect(c.active == 2)
             case .gdn(let c): #expect(c.active == 2)
+            case .sparseAttention(let c): #expect(c.inner.active == 2)
             }
         }
     }
@@ -123,6 +127,7 @@ struct Qwen35BatchedHybridCacheTests {
             switch layer {
             case .attention(let c): #expect(c.active == 2)
             case .gdn(let c): #expect(c.active == 2)
+            case .sparseAttention(let c): #expect(c.inner.active == 2)
             }
         }
     }
@@ -271,6 +276,11 @@ struct Qwen35BatchedHybridCacheTests {
                 #expect(c.kvHeads == DenseShape.kvHeads)
                 #expect(c.headDim == DenseShape.headDim)
                 #expect(c.maxSeq == 2048)  // default when parameters == nil
+            case .sparseAttention(let c):
+                #expect(c.inner.maxBatch == 2)
+                #expect(c.inner.kvHeads == DenseShape.kvHeads)
+                #expect(c.inner.headDim == DenseShape.headDim)
+                #expect(c.inner.maxSeq == 2048)
             }
         }
     }

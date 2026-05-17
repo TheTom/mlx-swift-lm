@@ -224,6 +224,7 @@ struct BatchedHybridCacheTests {
             switch layer {
             case .attention(let c): #expect(c.active == 2)
             case .gdn(let c): #expect(c.active == 2)
+            case .sparseAttention(let c): #expect(c.inner.active == 2)
             }
         }
     }
@@ -251,6 +252,7 @@ struct BatchedHybridCacheTests {
             switch layer {
             case .attention(let c): #expect(c.active == 2)
             case .gdn(let c): #expect(c.active == 2)
+            case .sparseAttention(let c): #expect(c.inner.active == 2)
             }
         }
     }

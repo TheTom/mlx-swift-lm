@@ -419,6 +419,44 @@ private class NemotronHAttention: Module, NemotronHMixer {
 
         return wo(output)
     }
+
+    /// F-85 — batched sparse forward for NemotronH attention. Mirrors
+    /// `fullyBatchedForward` but routes the SDPA step through
+    /// `BatchedRetrievalAttentionKVCache.sparseAttend` at L=1 on sparse-
+    /// eligible layers. NemotronH attention is RoPE-free, no Q/K norm — the
+    /// simplest of the family ports. Updates the selector index AFTER the K
+    /// write so `updateIndex` sees post-projection K (no RoPE to apply).
+    ///
+    /// Caveman: project Q/K/V → write K/V to inner cache → updateIndex →
+    /// sparseAttend at L=1 sparse layer, else dense `cache.attention`.
+    public func fullyBatchedSparseForward(
+        _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+        mask: MLXArray
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let cache = raCache.inner
+
+        let queries = wq(x).reshaped(B, L, numHeads, headDim).transposed(0, 2, 1, 3)
+        let keys = wk(x).reshaped(B, L, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
+        let values = wv(x).reshaped(B, L, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
+
+        // No RoPE — write K/V as-is, then fold K into the selector index.
+        cache.update(newKeys: keys, newValues: values)
+        // Selector index update (wrapper short-circuits at L=1 per F-72; the
+        // sliding window covers the new decode token).
+        raCache.updateIndex(newKeys: keys)
+
+        let output: MLXArray
+        if L == 1 && raCache.isSparseEligible {
+            // F-73 (default) / F-71b batched sparse SDPA. queries: [B, nQH, 1, D].
+            output = raCache.sparseAttend(queries: queries, scale: scale)
+        } else {
+            // Dense fallback — prefill chunk, dense-band layer, or L>1.
+            output = cache.attention(queries: queries, scale: scale, mask: mask)
+        }
+        return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
 }
 
 // MARK: - MLP
@@ -724,6 +762,61 @@ private class NemotronHBlock: Module {
 
         return x + output
     }
+
+    /// F-85 — batched sparse decoder block dispatch. Per-(block-type, cache)
+    /// routing:
+    ///
+    /// * mamba + `.gdn(c)` → unchanged dense `NemotronHMamba2Mixer.
+    ///   fullyBatchedForward` path. Sparse only applies to attention layers
+    ///   (no notion of "sparse" for fixed-size SSM state).
+    /// * attention + `.sparseAttention(c)` → new sparse path through
+    ///   `NemotronHAttention.fullyBatchedSparseForward`.
+    /// * attention + `.attention(c)` → falls back to dense (heterogeneous-
+    ///   cache safety; e.g. selector decided to leave some attention layers
+    ///   dense via `RetrievalAttentionConfig.denseFirstN` / `denseLastN`).
+    /// * mlp / moe → dense UnaryLayer path, layerCache must be nil.
+    func fullyBatchedSparseForward(
+        _ x: MLXArray,
+        layerCache: BatchedHybridCache.BatchedLayerCache?,
+        attnMask: MLXArray
+    ) -> MLXArray {
+        let hidden = norm(x)
+        let output: MLXArray
+
+        switch blockType {
+        case .mamba:
+            guard let layerCache, case let .gdn(mambaCache) = layerCache else {
+                fatalError("NemotronHBlock.fullyBatchedSparseForward: mamba block expected .gdn cache")
+            }
+            output = (mixer as! NemotronHMamba2Mixer).fullyBatchedForward(
+                hidden, cache: mambaCache)
+        case .attention:
+            guard let layerCache else {
+                fatalError("NemotronHBlock.fullyBatchedSparseForward: attention block expected a cache")
+            }
+            switch layerCache {
+            case .sparseAttention(let raCache):
+                output = (mixer as! NemotronHAttention).fullyBatchedSparseForward(
+                    hidden, raCache: raCache, mask: attnMask)
+            case .attention(let kvCache):
+                // Heterogeneous-safety fallback: attention layer that wasn't
+                // sparse-promoted (boundary skip set / dense band) falls
+                // through to dense. Keeps the model runnable if someone
+                // hands us a mixed cache.
+                output = (mixer as! NemotronHAttention).fullyBatchedForward(
+                    hidden, cache: kvCache, mask: attnMask)
+            case .gdn:
+                fatalError(
+                    "NemotronHBlock.fullyBatchedSparseForward: attention block got .gdn cache")
+            }
+        case .mlp:
+            output = (mixer as! NemotronHMLP)(hidden)
+        case .moe:
+            output = (mixer as! NemotronHMoE)(hidden)
+        }
+
+        return x + output
+    }
 }
 
 // MARK: - Backbone (matches Python's NemotronHModel which is stored as self.backbone)
@@ -897,6 +990,78 @@ private class NemotronHBackbone: Module {
                 hidden, layerCache: layerCache, attnMask: attnMask)
             // Defensive cast — quantized ops can promote bf16 → fp32 inside
             // the lazy graph (matches Qwen35TextModelInner pattern).
+            hidden = hidden.asType(modelDtype)
+        }
+
+        return normF(hidden)
+    }
+
+    /// F-85 — batched sparse single-step decode forward pass. Same
+    /// orchestration shape as `fullyBatchedForward` (shared attention mask
+    /// from the first attention-bearing layer's inner BatchedKVCache,
+    /// per-layer cacheCounter advance) but routes attention layers through
+    /// `NemotronHBlock.fullyBatchedSparseForward` so sparse-eligible layers
+    /// can take the F-73 batched mask kernel path. Mamba / MLP / MoE
+    /// untouched.
+    func fullyBatchedSparseForward(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray {
+        var hidden = embeddings(inputs)
+
+        // Sample the first attention-bearing layer (either .attention or
+        // .sparseAttention) — both expose the same inner BatchedKVCache for
+        // offset bookkeeping. Mamba .gdn layers don't take a mask at S=1.
+        var sampleAttnCache: BatchedKVCache?
+        for layer in caches.layers {
+            switch layer {
+            case .attention(let c):
+                sampleAttnCache = c
+            case .sparseAttention(let c):
+                sampleAttnCache = c.inner
+            case .gdn:
+                continue
+            }
+            if sampleAttnCache != nil { break }
+        }
+
+        let attnMask: MLXArray
+        if let c = sampleAttnCache {
+            let B = c.active
+            let cacheDtype = c.keys.dtype
+            let allSame = c.offsets[0..<B].allSatisfy { $0 == c.offsets[0] }
+            let maxPostOffset = (c.offsets[0..<B].max() ?? 0) + 1
+            if allSame {
+                attnMask = MLXArray.zeros(
+                    [B, 1, 1, maxPostOffset], dtype: cacheDtype)
+            } else {
+                let positions = MLXArray(0..<maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(c.offsets[0..<B].map { $0 + 1 }).reshaped(B, 1)
+                let valid = positions .< offsetsArr
+                attnMask = MLX.where(
+                    valid,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            }
+        } else {
+            attnMask = MLXArray.zeros([0, 1, 1, 0], dtype: hidden.dtype)
+        }
+
+        let modelDtype = hidden.dtype
+        var cacheCounter = 0
+        for layer in layers {
+            let layerCache: BatchedHybridCache.BatchedLayerCache?
+            if layer.blockType == .mamba || layer.blockType == .attention {
+                layerCache = caches.layers[cacheCounter]
+                cacheCounter += 1
+            } else {
+                layerCache = nil
+            }
+
+            hidden = layer.fullyBatchedSparseForward(
+                hidden, layerCache: layerCache, attnMask: attnMask)
+            // Defensive cast — quantized ops can promote bf16 → fp32 inside
+            // the lazy graph (mirrors `fullyBatchedForward`).
             hidden = hidden.asType(modelDtype)
         }
 
@@ -1143,6 +1308,104 @@ extension NemotronHModel: BatchedHybridLLM {
                         headDim: attentionHeadDim, maxSeq: maxSeq)
                 }
                 layers.append(.attention(kvCache))
+            case .mlp, .moe:
+                continue  // No cache emitted; matches newCache(parameters:)
+            }
+        }
+        return BatchedHybridCache(layers: layers)
+    }
+}
+
+// MARK: - BatchedHybridSparseLLM (F-85 batched sparse for hybrid attention layers)
+
+extension NemotronHModel: BatchedHybridSparseLLM {
+    /// F-85 — batched sparse single-step decode. `[B, 1]` tokens → `[B, 1,
+    /// vocab]` logits. Attention layers route through the F-73 batched mask
+    /// kernel (default) via `BatchedRetrievalAttentionKVCache.sparseAttend`
+    /// for sparse-eligible layers at L=1. Mamba2 layers stay on the dense
+    /// `fullyBatchedForward` path (no sparse notion for fixed-size SSM
+    /// state). MLP / MoE layers pass through unchanged.
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray {
+        var out = backbone.fullyBatchedSparseForward(inputs, caches: caches)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = backbone.embeddings.asLinear(out)
+        }
+        return out
+    }
+
+    /// Build a fresh `BatchedHybridCache` with attention layers promoted to
+    /// `.sparseAttention(BatchedRetrievalAttentionKVCache)`. Mamba layers
+    /// remain `.gdn(BatchedMambaCache)` (sparse is not meaningful for SSM
+    /// state). MLP / MoE blocks skip — matches `newCache(parameters:)` and
+    /// `newBatchedHybridCache` layout so the bridge's per-layer copy paths
+    /// line up. The `layerIdx` / `totalLayers` passed to each
+    /// `BatchedRetrievalAttentionKVCache` use the OVERALL transformer layer
+    /// index (the position in the hybrid pattern), so
+    /// `RetrievalAttentionConfig.denseFirstN` / `denseLastN` boundary skip
+    /// behaves the same as for pure-attention models.
+    public func newBatchedHybridSparseCache(
+        maxBatch: Int, parameters: GenerateParameters?,
+        raConfig: RetrievalAttentionConfig
+    ) -> BatchedHybridCache {
+        let cfg = configuration
+        let attentionHeadDim = cfg.headDim ?? (cfg.hiddenSize / cfg.numAttentionHeads)
+        let kernelMinusOne = cfg.convKernel - 1
+        let intermediate = cfg.mambaNumHeads * cfg.mambaHeadDim
+        let convDim = intermediate + 2 * cfg.nGroups * cfg.ssmStateSize
+
+        // Sequence budget for the inner BatchedKVCache. Matches the dense
+        // `newBatchedHybridCache` ceiling.
+        let maxSeq = parameters?.maxKVSize ?? 2048
+
+        let pattern = Array(cfg.hybridOverridePattern)
+        // `totalLayers` here is the count of transformer blocks in the
+        // hybrid pattern (matches NemotronHModel's notion). Passing it
+        // through `RetrievalAttentionConfig.isSparseLayer` lets the
+        // boundary-skip selector reason about layer-position bands the same
+        // way as for pure-attention models.
+        let totalLayers = pattern.count
+
+        var layers: [BatchedHybridCache.BatchedLayerCache] = []
+        for (layerIdx, char) in pattern.enumerated() {
+            switch NemotronHBlockType(from: char) {
+            case .mamba:
+                // Mirror the dense cache construction — Mamba2 SSM kernel
+                // emits state in input dtype (T), but recDtype defaulting
+                // to fp32 stays correct because the per-request
+                // `SSMStateCache` and the fused metal kernel agree on the
+                // fp32 readback path (see the dense path comment at line
+                // ~1281 above for the full rationale).
+                layers.append(.gdn(BatchedMambaCache(
+                    maxBatch: maxBatch,
+                    kernelMinusOne: kernelMinusOne,
+                    convDim: convDim,
+                    Hv: cfg.mambaNumHeads,
+                    Dv: cfg.mambaHeadDim,
+                    Dk: cfg.ssmStateSize
+                )))
+            case .attention:
+                // Sparse attention wraps a standard BatchedKVCache (no
+                // TurboQuant for the sparse path — sparse + turbo is a
+                // separate v2 concern; the inner cache must be raw fp16
+                // K/V for the selector index + sparseAttend kernel).
+                let kvCache = BatchedKVCache(
+                    maxBatch: maxBatch, kvHeads: cfg.numKeyValueHeads,
+                    headDim: attentionHeadDim, maxSeq: maxSeq)
+                let raCache = BatchedRetrievalAttentionKVCache(
+                    inner: kvCache,
+                    B: maxBatch,
+                    nKVHeads: cfg.numKeyValueHeads,
+                    dHead: attentionHeadDim,
+                    layerIdx: layerIdx,
+                    totalLayers: totalLayers,
+                    raConfig: raConfig,
+                    ropeBase: cfg.ropeTheta
+                )
+                layers.append(.sparseAttention(raCache))
             case .mlp, .moe:
                 continue  // No cache emitted; matches newCache(parameters:)
             }

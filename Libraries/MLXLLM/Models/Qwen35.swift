@@ -370,8 +370,25 @@ final class Qwen35GatedDeltaNet: Module {
 
         let qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        // Mirror `callAsFunction`'s bf16-NaN workaround for the small-output-dim
+        // `in_proj_a` / `in_proj_b` projections (lines 254-262). MLX-Swift's
+        // Metal Linear kernel emits sparse NaN on bf16⊗bf16 at the small
+        // `numVHeads`-wide output — only triggers when those Linears are
+        // UNQUANTIZED (mixed-bit checkpoints: Qwen3.6-27B-UD, ConfigI). For
+        // pure-quant checkpoints in_proj_a/b are QuantizedLinear and the cast
+        // is wasted work. Only upcast when the bug path is reachable.
+        let inProjANeedsFP32 = !(inProjA is QuantizedLinear)
+            && inputs.dtype == .bfloat16
+        let b: MLXArray
+        let a: MLXArray
+        if inProjANeedsFP32 {
+            let inputsFp32 = inputs.asType(.float32)
+            b = inProjB(inputsFp32).asType(inputs.dtype)
+            a = inProjA(inputsFp32).asType(inputs.dtype)
+        } else {
+            b = inProjB(inputs)
+            a = inProjA(inputs)
+        }
 
         // Slice live conv + rec state for the active prefix. These are views.
         let (convStateSlice, recStateSlice) = cache.slice(active: B)
@@ -578,6 +595,87 @@ final class Qwen35Attention: Module {
 
         return oProj(sigmoidMultiply(output, gate))
     }
+
+    /// F-85 — batched sparse forward for Qwen3.5/3.6 hybrid attention layers.
+    /// Mirrors `fullyBatchedForward` (same gated-Q split, Q/K RMSNorm before
+    /// RoPE, sigmoidMultiply output) but routes the SDPA step through
+    /// `BatchedRetrievalAttentionKVCache.sparseAttend`. Selector index is
+    /// updated with the post-RoPE K (the `updateIndex` wrapper skips L=1
+    /// per F-72, so the call is cheap at decode).
+    ///
+    /// GDN/linearAttn layers do NOT call this method — see
+    /// `Qwen35DecoderLayer.fullyBatchedSparseForward` for the per-layer
+    /// dispatch.
+    public func fullyBatchedSparseForward(
+        _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+        maskMode: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let cache = raCache.inner
+
+        // qProj outputs 2x heads (queries + gate). Split before the head
+        // reshape so the gate stays at hidden granularity.
+        let qProjOutput = qProj(x)
+        let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
+        var queries = qSplit[0]
+        let gate = qSplit[1].reshaped(B, L, -1)
+
+        var keys = kProj(x)
+        var values = vProj(x)
+
+        // Qwen3.5 ordering: qNorm/kNorm BEFORE RoPE.
+        queries = qNorm(queries).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+
+        let allSameOffset = cache.offsets[0..<cache.active]
+            .allSatisfy { $0 == cache.offsets[0] }
+
+        // Capture post-RoPE K so the selector index can fold it into
+        // block features (only matters for L>1; L=1 sliding window covers it).
+        let preUpdateK: MLXArray
+        if allSameOffset {
+            let offset = cache.offsets[0]
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+            preUpdateK = keys
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            let qSlices = MLX.split(queries, parts: B, axis: 0)
+            let kSlices = MLX.split(keys, parts: B, axis: 0)
+            var rotQ = [MLXArray]()
+            var rotK = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            rotK.reserveCapacity(B)
+            for i in 0..<B {
+                let off = cache.offsets[i]
+                rotQ.append(rope(qSlices[i], offset: off))
+                rotK.append(rope(kSlices[i], offset: off))
+            }
+            queries = concatenated(rotQ, axis: 0)
+            keys = concatenated(rotK, axis: 0)
+            preUpdateK = keys
+            cache.update(newKeys: keys, newValues: values)
+        }
+
+        // Selector index update (wrapper short-circuits at L=1).
+        raCache.updateIndex(newKeys: preUpdateK)
+
+        let output: MLXArray
+        if L == 1 && raCache.isSparseEligible {
+            output = raCache.sparseAttend(queries: queries, scale: scale)
+        } else {
+            // Dense path — non-sparse layer, prefill chunk, or L>1.
+            output = cache.attention(queries: queries, scale: scale, maskMode: maskMode)
+        }
+
+        let projected = output
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+
+        return oProj(sigmoidMultiply(projected, gate))
+    }
 }
 
 // MARK: - SparseMoeBlock
@@ -730,8 +828,55 @@ final class Qwen35DecoderLayer: Module {
         case (false, .attention(let kvCache)):
             r = selfAttn!.fullyBatchedForward(
                 inputLayerNorm(x), cache: kvCache, maskMode: attnMaskMode)
+        case (false, .sparseAttention(let raCache)):
+            // Safety: dense path called with a sparse cache (mixed usage,
+            // shouldn't happen in normal flow but keeps the switch
+            // exhaustive without crashing). Route through inner BatchedKVCache.
+            r = selfAttn!.fullyBatchedForward(
+                inputLayerNorm(x), cache: raCache.inner, maskMode: attnMaskMode)
         default:
             fatalError("Qwen35DecoderLayer: layer/cache type mismatch (isLinear=\(isLinear))")
+        }
+
+        let h = x + r
+        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
+
+    /// F-85 — batched sparse decoder layer. Per-layer-type dispatch:
+    ///
+    /// * GDN/linearAttn (`isLinear == true`) → identical dense path as
+    ///   `fullyBatchedForward`. Sparse only applies to attention layers
+    ///   (no notion of "sparse" for fixed-size SSM recurrent state).
+    /// * Attention with `.sparseAttention(BatchedRetrievalAttentionKVCache)`
+    ///   → new sparse path through `Qwen35Attention.fullyBatchedSparseForward`.
+    /// * Attention with `.attention(BatchedKVCache)` → falls back to the
+    ///   dense path (heterogeneous-cache safety; lets the model run if
+    ///   only some attention layers got sparse-promoted in the future).
+    func fullyBatchedSparseForward(
+        _ x: MLXArray,
+        layerCache: BatchedHybridCache.BatchedLayerCache,
+        attnMaskMode: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        let r: MLXArray
+        switch (isLinear, layerCache) {
+        case (true, .gdn(let mambaCache)):
+            // GDN untouched — same selective-fp32 dance as the dense path.
+            let needsCast = (x.dtype == .float32)
+            let xIn = needsCast ? x.asType(.bfloat16) : x
+            let rRaw = linearAttn!.fullyBatchedForward(inputLayerNorm(xIn), cache: mambaCache)
+            r = needsCast ? rRaw.asType(.float32) : rRaw
+        case (false, .sparseAttention(let raCache)):
+            r = selfAttn!.fullyBatchedSparseForward(
+                inputLayerNorm(x), raCache: raCache, maskMode: attnMaskMode)
+        case (false, .attention(let kvCache)):
+            // Heterogeneous-safety fallback: attention layer that wasn't
+            // sparse-promoted falls through to dense. Keeps the model
+            // runnable if someone hands us a mixed cache.
+            r = selfAttn!.fullyBatchedForward(
+                inputLayerNorm(x), cache: kvCache, maskMode: attnMaskMode)
+        default:
+            fatalError(
+                "Qwen35DecoderLayer.fullyBatchedSparseForward: layer/cache type mismatch (isLinear=\(isLinear))")
         }
 
         let h = x + r
@@ -761,6 +906,16 @@ public class Qwen35TextModelInner: Module {
     /// Layers per `asyncEval` batch when `batchedPrefillEvalEligible` is
     /// true. Picked from the A/B matrix on M1 Max.
     private static let prefillEvalBatchSize = 8
+
+    /// Lazy-detected on first `fullyBatchedForward`. True iff the model
+    /// has any unquantized bf16 Linear in the hot path (mlp.gate router
+    /// for MoE variants, in_proj_a/b for GDN). These trigger MLX-Swift's
+    /// bf16⊗bf16 Metal Linear NaN bug at small output-dim tile paths.
+    /// When true, the per-layer fp32 upcast in the outer forward kicks
+    /// in (mirrors callAsFunction's :833-835). When false (pure-quant
+    /// like Qwen3.6-35B-A3B-4bit), the upcast is skipped — saves -45%
+    /// perf vs always-on (1798 vs 992 tok/s at B=64).
+    private var _needsOuterFP32Cache: Bool? = nil
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -946,14 +1101,148 @@ public class Qwen35TextModelInner: Module {
         }
 
         let modelDtype = hiddenStates.dtype
+        // Outer per-layer fp32 upcast — only needed when the model has
+        // unquantized bf16 Linears in the hot path (mlp.gate for MoE
+        // ConfigI variants; in_proj_a/b is handled by the inner GDN
+        // upcast). Lazy-detect once on first call. Forced by
+        // VSM_QWEN35_OUTER_FP32=1, disabled by VSM_QWEN35_OUTER_FP32=0.
+        if _needsOuterFP32Cache == nil {
+            let env = ProcessInfo.processInfo.environment["VSM_QWEN35_OUTER_FP32"]
+            if env == "1" {
+                _needsOuterFP32Cache = (modelDtype == .bfloat16)
+            } else if env == "0" {
+                _needsOuterFP32Cache = false
+            } else {
+                // Auto-detect: scan layers for unquantized small Linear
+                // in the MoE router (mlp.gate). If any layer has a plain
+                // Linear (not QuantizedLinear) here while modelDtype is
+                // bf16, the bf16⊗bf16 NaN path is reachable.
+                var detected = false
+                if modelDtype == .bfloat16 {
+                    for layer in layers {
+                        if let moe = layer.mlp as? Qwen35SparseMoeBlock,
+                           !(moe.gate is QuantizedLinear) {
+                            detected = true
+                            break
+                        }
+                    }
+                }
+                _needsOuterFP32Cache = detected
+                if detected {
+                    print("[vsm] Qwen35: auto-enabling outer fp32 upcast "
+                        + "(unquantized bf16 MoE router detected)")
+                }
+            }
+        }
+        let needsOuterFP32 = _needsOuterFP32Cache!
         for (i, layer) in layers.enumerated() {
+            if needsOuterFP32 {
+                hiddenStates = hiddenStates.asType(.float32)
+            }
             hiddenStates = layer.fullyBatchedForward(
                 hiddenStates, layerCache: caches.layers[i], attnMaskMode: attnMaskMode)
-            // Same defensive cast as the per-request path: quantized ops can
-            // promote bf16 → fp32 inside the lazy graph.
-            hiddenStates = hiddenStates.asType(modelDtype)
+            // Defensive cast for quantized op fp32 promotion in the lazy
+            // graph; skip when outer fp32 is active.
+            if !needsOuterFP32 {
+                hiddenStates = hiddenStates.asType(modelDtype)
+            }
+        }
+        if needsOuterFP32 { hiddenStates = hiddenStates.asType(.float32) }
+        return norm(hiddenStates)
+    }
+
+    /// F-85 — batched sparse single-step decode forward pass. Same
+    /// orchestration loop as `fullyBatchedForward` (shared attention
+    /// mask via mask-elision, outer fp32 upcast detection) but dispatches
+    /// per-layer through `Qwen35DecoderLayer.fullyBatchedSparseForward`
+    /// so attention layers can route through F-73/F-71b batched sparse
+    /// kernels. GDN layers are untouched.
+    func fullyBatchedSparseForward(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray {
+        precondition(caches.layers.count == layers.count,
+                     "fullyBatchedSparseForward: cache layer count mismatch")
+
+        var hiddenStates = embedTokens(inputs)
+
+        // Build the shared attention mask from the first sparse OR dense
+        // attention layer's inner BatchedKVCache. Either case uses the
+        // same per-step mask shape ([B, 1, 1, T]); sparseAttend ignores
+        // the mask (builds its own internally) but we still need it for
+        // the heterogeneous fall-through to dense attention.
+        var sampleAttnCache: BatchedKVCache?
+        for layer in caches.layers {
+            switch layer {
+            case .attention(let c):
+                sampleAttnCache = c
+            case .sparseAttention(let c):
+                sampleAttnCache = c.inner
+            case .gdn:
+                continue
+            }
+            if sampleAttnCache != nil { break }
         }
 
+        // Mask elision (Gemma4 pattern). All-same-offset → degenerate
+        // all-zeros mask → `.none` and skip the per-layer mask read.
+        let attnMaskMode: MLXFast.ScaledDotProductAttentionMaskMode
+        if let c = sampleAttnCache {
+            let B = c.active
+            let cacheDtype = c.keys.dtype
+            let allSame = c.offsets[0..<B].allSatisfy { $0 == c.offsets[0] }
+            if allSame {
+                attnMaskMode = .none
+            } else {
+                let maxPostOffset = (c.offsets[0..<B].max() ?? 0) + 1
+                let positions = MLXArray(0..<maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(c.offsets[0..<B].map { $0 + 1 }).reshaped(B, 1)
+                let valid = positions .< offsetsArr
+                let m = MLX.where(
+                    valid,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+                attnMaskMode = .array(m)
+            }
+        } else {
+            attnMaskMode = .none
+        }
+
+        let modelDtype = hiddenStates.dtype
+        // Outer per-layer fp32 upcast — same lazy-detect logic as the
+        // dense path. Reuses the same cache var.
+        if _needsOuterFP32Cache == nil {
+            let env = ProcessInfo.processInfo.environment["VSM_QWEN35_OUTER_FP32"]
+            if env == "1" {
+                _needsOuterFP32Cache = (modelDtype == .bfloat16)
+            } else if env == "0" {
+                _needsOuterFP32Cache = false
+            } else {
+                var detected = false
+                if modelDtype == .bfloat16 {
+                    for layer in layers {
+                        if let moe = layer.mlp as? Qwen35SparseMoeBlock,
+                           !(moe.gate is QuantizedLinear) {
+                            detected = true
+                            break
+                        }
+                    }
+                }
+                _needsOuterFP32Cache = detected
+            }
+        }
+        let needsOuterFP32 = _needsOuterFP32Cache!
+        for (i, layer) in layers.enumerated() {
+            if needsOuterFP32 {
+                hiddenStates = hiddenStates.asType(.float32)
+            }
+            hiddenStates = layer.fullyBatchedSparseForward(
+                hiddenStates, layerCache: caches.layers[i], attnMaskMode: attnMaskMode)
+            if !needsOuterFP32 {
+                hiddenStates = hiddenStates.asType(modelDtype)
+            }
+        }
+        if needsOuterFP32 { hiddenStates = hiddenStates.asType(.float32) }
         return norm(hiddenStates)
     }
 }
@@ -1221,6 +1510,82 @@ extension Qwen35TextModel: BatchedHybridLLM {
     }
 }
 
+// MARK: - BatchedHybridSparseLLM (F-85 — sparse attention layers only)
+
+extension Qwen35TextModel: BatchedHybridSparseLLM {
+    /// F-85 fully batched sparse decode for Qwen3.5/3.6 hybrid.
+    /// `[B, 1]` tokens → `[B, 1, vocab]` logits. Attention layers route
+    /// through `BatchedRetrievalAttentionKVCache.sparseAttend`; GDN
+    /// layers run the dense path (sparsity doesn't apply to fixed-size
+    /// SSM state). Caller must hand us a cache built by
+    /// `newBatchedHybridSparseCache` — attention slots must be
+    /// `.sparseAttention(_)`, GDN slots `.gdn(_)`.
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray {
+        var out = model.fullyBatchedSparseForward(inputs, caches: caches)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = model.embedTokens.asLinear(out)
+        }
+        return out
+    }
+
+    /// Build a fresh `BatchedHybridCache` with attention layers wrapped
+    /// in `.sparseAttention(BatchedRetrievalAttentionKVCache)`. GDN layers
+    /// stay `.gdn(BatchedMambaCache)`. Mirrors `newBatchedHybridCache`'s
+    /// shape derivation — both dense (Qwen3.5) and MoE (Qwen3.6) flavors
+    /// share the layout.
+    public func newBatchedHybridSparseCache(
+        maxBatch: Int, parameters: GenerateParameters?,
+        raConfig: RetrievalAttentionConfig
+    ) -> BatchedHybridCache {
+        let cfg = configuration
+        let headDim = cfg.headDim ?? (cfg.hiddenSize / cfg.attentionHeads)
+        let kernelMinusOne = cfg.linearConvKernelDim - 1
+        let keyDim = cfg.linearKeyHeadDim * cfg.linearNumKeyHeads
+        let valueDim = cfg.linearValueHeadDim * cfg.linearNumValueHeads
+        let convDim = keyDim * 2 + valueDim
+
+        let maxSeq = parameters?.maxKVSize ?? 2048
+        let recDtype: DType = (ProcessInfo.processInfo.environment["VSM_GDN_REC_FP32"] == "1")
+            ? .float32 : .bfloat16
+        let totalLayers = model.layers.count
+
+        let layerCaches: [BatchedHybridCache.BatchedLayerCache] =
+            model.layers.enumerated().map { (i, layer) in
+            if layer.isLinear {
+                return .gdn(BatchedMambaCache(
+                    maxBatch: maxBatch,
+                    kernelMinusOne: kernelMinusOne,
+                    convDim: convDim,
+                    Hv: cfg.linearNumValueHeads,
+                    Dv: cfg.linearValueHeadDim,
+                    Dk: cfg.linearKeyHeadDim,
+                    recDtype: recDtype
+                ))
+            } else {
+                let inner = BatchedKVCache(
+                    maxBatch: maxBatch, kvHeads: cfg.kvHeads, headDim: headDim,
+                    maxSeq: maxSeq)
+                let raCache = BatchedRetrievalAttentionKVCache(
+                    inner: inner,
+                    B: maxBatch,
+                    nKVHeads: cfg.kvHeads,
+                    dHead: headDim,
+                    layerIdx: i,
+                    totalLayers: totalLayers,
+                    raConfig: raConfig,
+                    ropeBase: cfg.ropeTheta
+                )
+                return .sparseAttention(raCache)
+            }
+        }
+        return BatchedHybridCache(layers: layerCaches)
+    }
+}
+
 // MARK: - Top-level Model
 
 public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
@@ -1310,5 +1675,27 @@ extension Qwen35Model: BatchedHybridLLM {
         languageModel.newBatchedHybridCache(
             maxBatch: maxBatch, parameters: parameters,
             turboKeyBits: turboKeyBits, turboValueBits: turboValueBits)
+    }
+}
+
+// MARK: - BatchedHybridSparseLLM (top-level) — F-85
+
+/// Forward F-85 batched sparse surface from `Qwen35Model` to its inner
+/// `Qwen35TextModel`. `Qwen35MoEModel` inherits this conformance — both
+/// dense Qwen3.5 and Qwen3.6 MoE use the same Qwen35TextModel class
+/// under the hood, so one port covers both.
+extension Qwen35Model: BatchedHybridSparseLLM {
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray {
+        languageModel.fullyBatchedSparseDecode(inputs, caches: caches)
+    }
+
+    public func newBatchedHybridSparseCache(
+        maxBatch: Int, parameters: GenerateParameters?,
+        raConfig: RetrievalAttentionConfig
+    ) -> BatchedHybridCache {
+        languageModel.newBatchedHybridSparseCache(
+            maxBatch: maxBatch, parameters: parameters, raConfig: raConfig)
     }
 }

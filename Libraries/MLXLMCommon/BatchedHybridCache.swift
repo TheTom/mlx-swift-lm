@@ -153,6 +153,10 @@ public class BatchedHybridCache {
     public enum BatchedLayerCache {
         case attention(BatchedKVCache)
         case gdn(BatchedMambaCache)
+        /// F-85: sparse attention layer. Wraps a `BatchedKVCache` (via `.inner`)
+        /// plus a `BatchedRetrievalAttentionIndexB` selector. Slot mgmt routes
+        /// through `inner` so lockstep with `.attention` / `.gdn` holds.
+        case sparseAttention(BatchedRetrievalAttentionKVCache)
     }
 
     public let layers: [BatchedLayerCache]
@@ -163,6 +167,7 @@ public class BatchedHybridCache {
         switch first {
         case .attention(let c): return c.active
         case .gdn(let c): return c.active
+        case .sparseAttention(let c): return c.inner.active
         }
     }
 
@@ -181,6 +186,7 @@ public class BatchedHybridCache {
             switch layer {
             case .attention(let c): slot = c.addRequest()
             case .gdn(let c): slot = c.addSlot()
+            case .sparseAttention(let c): slot = c.inner.addRequest()
             }
             if assigned < 0 { assigned = slot }
             assert(slot == assigned,
@@ -206,6 +212,16 @@ public class BatchedHybridCache {
                 c.active -= 1
             case .gdn(let c):
                 c.removeSlot(slot)
+            case .sparseAttention(let c):
+                let inner = c.inner
+                let last = inner.active - 1
+                if slot != last {
+                    inner.keys[slot, 0..., 0..., 0...] = inner.keys[last, 0..., 0..., 0...]
+                    inner.values[slot, 0..., 0..., 0...] = inner.values[last, 0..., 0..., 0...]
+                    inner.offsets[slot] = inner.offsets[last]
+                }
+                inner.offsets[last] = 0
+                inner.active -= 1
             }
         }
     }
@@ -216,6 +232,7 @@ public class BatchedHybridCache {
             switch layer {
             case .attention(let c): c.reset()
             case .gdn(let c): c.reset()
+            case .sparseAttention(let c): c.inner.reset()
             }
         }
     }
@@ -258,4 +275,27 @@ extension BatchedHybridLLM {
             maxBatch: maxBatch, parameters: parameters,
             turboKeyBits: nil, turboValueBits: nil)
     }
+}
+
+// MARK: - BatchedHybridSparseLLM (F-85)
+
+/// Hybrid models (attention + GDN/Mamba) that ALSO support F-85 batched
+/// sparse decode on their attention layers. GDN/Mamba layers stay dense
+/// (no sparse concept for fixed-size SSM state). Bridge dispatches here
+/// when `VSM_SPARSE_BATCHED=1` AND model conforms.
+public protocol BatchedHybridSparseLLM: BatchedHybridLLM {
+    /// Single-step batched sparse decode. `inputs` shape: `[B, 1]`. Returns
+    /// `[B, 1, vocab]` logits. Attention layers route through sparseAttend;
+    /// GDN layers untouched.
+    func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray
+
+    /// Build a fresh `BatchedHybridCache` with attention layers as
+    /// `.sparseAttention(BatchedRetrievalAttentionKVCache)` instead of
+    /// `.attention(BatchedKVCache)`. GDN layers remain `.gdn(BatchedMambaCache)`.
+    func newBatchedHybridSparseCache(
+        maxBatch: Int, parameters: GenerateParameters?,
+        raConfig: RetrievalAttentionConfig
+    ) -> BatchedHybridCache
 }
