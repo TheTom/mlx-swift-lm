@@ -185,6 +185,47 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
         weights = Qwen2.fuseGateUpWeights(weights)
         return weights
     }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let numLayers = configuration.hiddenLayers
+        let env = ProcessInfo.processInfo.environment
+        let enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        // TriAttention V3 — KV-cache eviction policy. Mirrors the Qwen3
+        // factory at MLXLLM/Models/Qwen3.swift. V3 owns the full cache
+        // list (one TriAttentionKVCache per layer) and is incompatible
+        // with a caller-supplied maxKVSize (which would route to the
+        // eviction-windowed StandardKVCache variant). Qwen2 has no
+        // explicit `head_dim` config field — derive it from hiddenSize /
+        // attentionHeads, matching `Qwen2.Attention.init` at
+        // MLXLMCommon/Models/Qwen2.swift:80.
+        if enabled, parameters?.maxKVSize == nil {
+            let headDim = configuration.hiddenSize / configuration.attentionHeads
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: configuration.hiddenLayers,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads,
+                headDim: headDim,
+                ropeTheta: configuration.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0..<numLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+
+        // Default path — route through `makeAttentionCache` so caller-
+        // supplied `maxKVSize` picks the eviction-windowed variant.
+        // Matches the Qwen3 factory's behavior + the
+        // `KVCacheDimensionProvider` extension default in
+        // MLXLMCommon/LanguageModel.swift.
+        return (0..<numLayers).map { _ in
+            makeAttentionCache(parameters: parameters, maxSize: parameters?.maxKVSize)
+        }
+    }
 }
 
 extension Qwen2Model: LoRAModel {
