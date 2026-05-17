@@ -67,7 +67,8 @@ class Phi3Attention: Module {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        raContext: RetrievalAttentionContext? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
@@ -91,7 +92,8 @@ class Phi3Attention: Module {
             values: values,
             cache: cache,
             scale: scale,
-            mask: mask
+            mask: mask,
+            raContext: raContext
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
@@ -239,6 +241,85 @@ class Phi3Attention: Module {
         let output = cache.attention(queries: queries, scale: scale, mask: mask)
         return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
+
+    /// F-85 — batched sparse forward for Phi3. Mirrors
+    /// `Llama.LlamaAttention.fullyBatchedSparseForward` but adapts to
+    /// Phi3's fused `qkv_proj` (single Linear projection followed by
+    /// position-based split into Q/K/V) and partial-RoPE configuration
+    /// (rope applies to first `ropeDim` channels). The fused split +
+    /// reshape mirrors Phi3's existing `fullyBatchedForward` exactly;
+    /// after RoPE + cache.update + selector index update, sparse-
+    /// eligible layers at L=1 route through
+    /// `BatchedRetrievalAttentionKVCache.sparseAttend` (F-73 batched
+    /// mask kernel by default). Else falls back to dense
+    /// `cache.attention`.
+    ///
+    /// Caveman: like fullyBatchedForward but L=1 sparse layers go to
+    /// F-73 mask kernel. fused qkv split same as dense path. K/V update
+    /// happen via inner.update either way.
+    public func fullyBatchedSparseForward(
+        _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+        mask: MLXArray
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let cache = raCache.inner
+
+        // Fused qkv split (Phi3-specific) — single batched matmul, then
+        // position-based split into Q/K/V along the last axis. Matches
+        // `fullyBatchedForward` line-for-line.
+        let queryPos = heads * headDim
+        let qkv = split(wqkv(x), indices: [queryPos, queryPos + kvHeads * headDim], axis: -1)
+        var queries = qkv[0].reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
+        var keys = qkv[1].reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        let values = qkv[2].reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+
+        let allSameOffset = cache.offsets[0 ..< cache.active]
+            .allSatisfy { $0 == cache.offsets[0] }
+        // Capture pre-update K (post-RoPE) for the selector index.
+        let preUpdateK: MLXArray
+        if allSameOffset {
+            let offset = cache.offsets[0]
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+            preUpdateK = keys
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            // Ragged path — slot-by-slot RoPE. Not the v1 target but
+            // here for safety. Phi3's partial RoPE (ropeDim < headDim)
+            // is handled by RoPE/SuScaledRoPE internally.
+            let qSlices = split(queries, parts: B, axis: 0)
+            let kSlices = split(keys, parts: B, axis: 0)
+            var rotQ = [MLXArray]()
+            var rotK = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            rotK.reserveCapacity(B)
+            for i in 0 ..< B {
+                let off = cache.offsets[i]
+                rotQ.append(rope(qSlices[i], offset: off))
+                rotK.append(rope(kSlices[i], offset: off))
+            }
+            queries = concatenated(rotQ, axis: 0)
+            keys = concatenated(rotK, axis: 0)
+            preUpdateK = keys
+            cache.update(newKeys: keys, newValues: values)
+        }
+
+        // Selector index update (skipped for L=1 per F-72; the wrapper
+        // method handles the L check).
+        raCache.updateIndex(newKeys: preUpdateK)
+
+        let output: MLXArray
+        if L == 1 && raCache.isSparseEligible {
+            // F-71b / F-73 batched sparse SDPA. queries: [B, nQH, 1, D].
+            output = raCache.sparseAttend(
+                queries: queries, scale: scale)
+        } else {
+            // Dense path — prefill chunk, dense-band layer, or L>1.
+            output = cache.attention(queries: queries, scale: scale, mask: mask)
+        }
+        return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
 }
 
 class Phi3MLP: Module, UnaryLayer {
@@ -275,9 +356,10 @@ class Phi3TransformerBlock: Module {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        raContext: RetrievalAttentionContext? = nil
     ) -> MLXArray {
-        var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+        var r = attention(inputLayerNorm(x), mask: mask, cache: cache, raContext: raContext)
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         let out = h + r
@@ -301,6 +383,21 @@ class Phi3TransformerBlock: Module {
         let normed = inputLayerNorm(x)
         let r = attention.fullyBatchedForward(
             normed, cache: cache, layerIndex: layerIndex, mask: mask)
+        let h = x + r
+        return h + mlp(postAttentionLayerNorm(h))
+    }
+
+    /// F-85 — batched sparse decoder layer. Same shape as
+    /// `fullyBatchedForward` but threads through a
+    /// `BatchedRetrievalAttentionKVCache` so sparse-eligible attention
+    /// layers can route to F-71b / F-73 batched kernels.
+    public func fullyBatchedSparseForward(
+        _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+        mask: MLXArray
+    ) -> MLXArray {
+        let normed = inputLayerNorm(x)
+        let r = attention.fullyBatchedSparseForward(
+            normed, raCache: raCache, mask: mask)
         let h = x + r
         return h + mlp(postAttentionLayerNorm(h))
     }
@@ -329,12 +426,25 @@ public class Phi3ModelInner: Module {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        callAsFunction(inputs, cache: cache, raContexts: nil)
+    }
+
+    /// Sidecar retrieval-attention overload: pass a parallel list of
+    /// `RetrievalAttentionContext?` aligned to `cache` so the dispatcher
+    /// (`attentionWithCacheUpdate`) routes through the sparse path
+    /// without needing a wrapper KV cache. `raContexts` defaults to nil;
+    /// when nil this is identical to the legacy entry point. Mirrors
+    /// the Llama / Qwen2 / Qwen3 overload (F-83 sparse decode).
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        raContexts: [RetrievalAttentionContext?]?
+    ) -> MLXArray {
         var h = embedTokens(inputs)
 
         let mask = createAttentionMask(h: h, cache: cache?.first)
 
         for (i, layer) in layers.enumerated() {
-            h = layer(h, mask: mask, cache: cache?[i])
+            h = layer(h, mask: mask, cache: cache?[i], raContext: raContexts?[i])
         }
 
         return norm(h)
@@ -381,6 +491,42 @@ public class Phi3ModelInner: Module {
         }
         return norm(h)
     }
+
+    /// F-85 — batched sparse forward. Shared per-layer
+    /// `BatchedRetrievalAttentionKVCache`. The mask is built once from
+    /// the inner BatchedKVCache offsets (matches the dense path).
+    /// Mirrors `Llama.LlamaModelInner.fullyBatchedSparseForward`.
+    public func fullyBatchedSparseForward(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        var h = embedTokens(inputs)
+
+        let cache0 = raCaches[0].inner
+        let B = cache0.active
+        let cacheDtype = cache0.keys.dtype
+        let allSame = cache0.offsets[0 ..< B]
+            .allSatisfy { $0 == cache0.offsets[0] }
+        let maxPostOffset = (cache0.offsets[0 ..< B].max() ?? 0) + 1
+        let mask: MLXArray
+        if allSame {
+            mask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+        } else {
+            let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+            let offsetsArr = MLXArray(cache0.offsets[0 ..< B].map { $0 + 1 })
+                .reshaped(B, 1)
+            let valid = positions .< offsetsArr
+            mask = MLX.where(
+                valid,
+                MLXArray(Float(0)).asType(cacheDtype),
+                MLXArray(Float(-1e9)).asType(cacheDtype)
+            ).reshaped(B, 1, 1, maxPostOffset)
+        }
+        for (i, layer) in layers.enumerated() {
+            h = layer.fullyBatchedSparseForward(
+                h, raCache: raCaches[i], mask: mask)
+        }
+        return norm(h)
+    }
 }
 
 public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
@@ -389,7 +535,7 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     public let model: Phi3ModelInner
-    private let args: Phi3Configuration
+    let configuration: Phi3Configuration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -397,16 +543,71 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
         self.model = Phi3ModelInner(args)
-        self.args = args
+        self.configuration = args
 
         if !args.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
     }
 
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let numLayers = configuration.hiddenLayers
+        let env = ProcessInfo.processInfo.environment
+        let enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        // TriAttention V3 — KV-cache eviction policy. Mirrors the Llama
+        // factory at MLXLLM/Models/Llama.swift. V3 owns the full cache
+        // list (one TriAttentionKVCache per layer) and is incompatible
+        // with a caller-supplied maxKVSize (which would route to the
+        // eviction-windowed StandardKVCache variant). Phi3 derives
+        // headDim from hiddenSize / attentionHeads (matches
+        // Phi3Attention.init at line 32) — no explicit `head_dim` config
+        // field on Phi3.
+        if enabled, parameters?.maxKVSize == nil {
+            let headDim = configuration.hiddenSize / configuration.attentionHeads
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: configuration.hiddenLayers,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads,
+                headDim: headDim,
+                ropeTheta: configuration.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0..<numLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+
+        // Default path — route through `makeAttentionCache` so caller-
+        // supplied `maxKVSize` picks the eviction-windowed variant.
+        // Matches the Llama/Qwen2/Qwen3 factory behavior + the
+        // `KVCacheDimensionProvider` extension default in
+        // MLXLMCommon/LanguageModel.swift.
+        return (0..<numLayers).map { _ in
+            makeAttentionCache(parameters: parameters, maxSize: parameters?.maxKVSize)
+        }
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let out = model(inputs, cache: cache)
-        if args.tieWordEmbeddings {
+        callAsFunction(inputs, cache: cache, raContexts: nil)
+    }
+
+    /// Sidecar retrieval-attention overload: pass a parallel list of
+    /// `RetrievalAttentionContext?` aligned to `cache` so the dispatcher
+    /// (`attentionWithCacheUpdate`) routes through the sparse path
+    /// without needing a wrapper KV cache. `raContexts` defaults to nil;
+    /// when nil this is identical to the legacy entry point. Mirrors
+    /// the LlamaModel / Qwen2Model / Qwen3Model overload (F-83 sparse
+    /// decode).
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        raContexts: [RetrievalAttentionContext?]?
+    ) -> MLXArray {
+        let out = model(inputs, cache: cache, raContexts: raContexts)
+        if configuration.tieWordEmbeddings {
             return model.embedTokens.asLinear(out)
         } else if let lmHead {
             return lmHead(out)
@@ -419,7 +620,7 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
     /// Batched decode: B requests with per-request per-layer caches.
     public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
         let out = model.batchedForward(inputs, caches: caches)
-        if args.tieWordEmbeddings {
+        if configuration.tieWordEmbeddings {
             return model.embedTokens.asLinear(out)
         } else if let lmHead {
             return lmHead(out)
@@ -434,7 +635,27 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
         _ inputs: MLXArray, caches: [BatchedKVCache]
     ) -> MLXArray {
         let out = model.fullyBatchedForward(inputs, caches: caches)
-        if args.tieWordEmbeddings {
+        if configuration.tieWordEmbeddings {
+            return model.embedTokens.asLinear(out)
+        } else if let lmHead {
+            return lmHead(out)
+        } else {
+            fatalError(
+                "Model configuration error: Neither tied embeddings nor lm_head is available")
+        }
+    }
+
+    /// F-85 — batched sparse decode. Pairs with `Phi3ModelInner.
+    /// fullyBatchedSparseForward`. ONE batched forward call per token,
+    /// per-layer attention routes through the F-73 batched mask kernel
+    /// (or F-71b via `VSM_SPARSE_BATCHED_KERNEL=f71b`) for sparse-
+    /// eligible layers. vllm-swift's `vsm_engine_decode_all` calls here
+    /// when sparse + B>1 sessions exist AND `VSM_SPARSE_BATCHED=1`.
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        let out = model.fullyBatchedSparseForward(inputs, raCaches: raCaches)
+        if configuration.tieWordEmbeddings {
             return model.embedTokens.asLinear(out)
         } else if let lmHead {
             return lmHead(out)

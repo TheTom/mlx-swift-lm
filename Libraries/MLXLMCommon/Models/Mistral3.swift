@@ -109,7 +109,8 @@ public enum Mistral3 {
 
         public func callAsFunction(
             _ x: MLXArray, attnScale: MLXArray,
-            mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+            mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+            raContext: RetrievalAttentionContext? = nil
         ) -> MLXArray {
             let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -127,7 +128,8 @@ public enum Mistral3 {
 
             let output = attentionWithCacheUpdate(
                 queries: queries, keys: keys, values: values,
-                cache: cache, scale: scale, mask: mask
+                cache: cache, scale: scale, mask: mask,
+                raContext: raContext
             )
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
@@ -275,6 +277,78 @@ public enum Mistral3 {
             let output = cache.attention(queries: queries, scale: scale, mask: mask)
             return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
         }
+
+        /// F-85 — batched sparse forward for Mistral 3. Mirrors
+        /// `Llama.Attention.fullyBatchedSparseForward` and
+        /// `Qwen2.Attention.fullyBatchedSparseForward` (MLXLMCommon/Models/
+        /// Qwen2.swift:365-421). Mistral 3 has no q/k RMSNorm (closer to
+        /// Llama / Qwen2 than Qwen3) but threads the Llama-4 attention
+        /// scale (`attnScale`) through the queries after RoPE, matching
+        /// the dense `fullyBatchedForward`. Routes through
+        /// `BatchedRetrievalAttentionKVCache.sparseAttend` (F-73 batched
+        /// mask kernel by default) on sparse-eligible layers at L=1,
+        /// else falls back to dense `cache.attention`.
+        public func fullyBatchedSparseForward(
+            _ x: MLXArray, attnScale: MLXArray,
+            raCache: BatchedRetrievalAttentionKVCache, mask: MLXArray
+        ) -> MLXArray {
+            let B = x.dim(0)
+            let L = x.dim(1)
+            let cache = raCache.inner
+
+            // Batched Q/K/V projections (bias=false on Mistral 3).
+            var queries = wq(x).reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
+            var keys = wk(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            let values = wv(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+
+            let allSameOffset = cache.offsets[0 ..< cache.active]
+                .allSatisfy { $0 == cache.offsets[0] }
+            // Capture pre-update K (post-RoPE) for the selector index.
+            let preUpdateK: MLXArray
+            if allSameOffset {
+                let offset = cache.offsets[0]
+                queries = rope(queries, offset: offset)
+                queries = queries * attnScale
+                keys = rope(keys, offset: offset)
+                preUpdateK = keys
+                cache.update(newKeys: keys, newValues: values)
+            } else {
+                // Ragged path — slot-by-slot RoPE. Not the v1 target but
+                // here for safety.
+                let qSlices = split(queries, parts: B, axis: 0)
+                let kSlices = split(keys, parts: B, axis: 0)
+                var rotQ = [MLXArray]()
+                var rotK = [MLXArray]()
+                rotQ.reserveCapacity(B)
+                rotK.reserveCapacity(B)
+                for i in 0 ..< B {
+                    let off = cache.offsets[i]
+                    var rotated = rope(qSlices[i], offset: off)
+                    rotated = rotated * attnScale
+                    rotQ.append(rotated)
+                    rotK.append(rope(kSlices[i], offset: off))
+                }
+                queries = concatenated(rotQ, axis: 0)
+                keys = concatenated(rotK, axis: 0)
+                preUpdateK = keys
+                cache.update(newKeys: keys, newValues: values)
+            }
+
+            // Selector index update (skipped for L=1 per F-72; the
+            // wrapper method handles the L check).
+            raCache.updateIndex(newKeys: preUpdateK)
+
+            let output: MLXArray
+            if L == 1 && raCache.isSparseEligible {
+                // F-71b / F-73 batched sparse SDPA. queries: [B, nQH, 1, D].
+                output = raCache.sparseAttend(
+                    queries: queries, scale: scale)
+            } else {
+                // Dense path — prefill chunk, dense-band layer, or L>1.
+                output = cache.attention(queries: queries, scale: scale, mask: mask)
+            }
+            return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        }
     }
 
     // MARK: - MLP
@@ -321,9 +395,12 @@ public enum Mistral3 {
 
         public func callAsFunction(
             _ x: MLXArray, attnScale: MLXArray,
-            mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+            mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+            raContext: RetrievalAttentionContext? = nil
         ) -> MLXArray {
-            let r = attention(inputLayerNorm(x), attnScale: attnScale, mask: mask, cache: cache)
+            let r = attention(
+                inputLayerNorm(x), attnScale: attnScale, mask: mask,
+                cache: cache, raContext: raContext)
             let h = x + r
             return h + mlp(postAttentionLayerNorm(h))
         }
@@ -347,6 +424,22 @@ public enum Mistral3 {
             let r = attention.fullyBatchedForward(
                 normed, attnScale: attnScale, cache: cache,
                 layerIndex: layerIndex, mask: mask)
+            let h = x + r
+            return h + mlp(postAttentionLayerNorm(h))
+        }
+
+        /// F-85 — batched sparse decoder layer. Same shape as
+        /// `fullyBatchedForward` but threads through a
+        /// `BatchedRetrievalAttentionKVCache` so sparse-eligible attention
+        /// layers can route to F-71b / F-73 batched kernels. Mirrors
+        /// `Llama.TransformerBlock.fullyBatchedSparseForward`.
+        public func fullyBatchedSparseForward(
+            _ x: MLXArray, attnScale: MLXArray,
+            raCache: BatchedRetrievalAttentionKVCache, mask: MLXArray
+        ) -> MLXArray {
+            let normed = inputLayerNorm(x)
+            let r = attention.fullyBatchedSparseForward(
+                normed, attnScale: attnScale, raCache: raCache, mask: mask)
             let h = x + r
             return h + mlp(postAttentionLayerNorm(h))
         }
@@ -384,7 +477,8 @@ public enum Mistral3 {
         }
 
         public func callAsFunction(
-            _ inputs: MLXArray, cache: [KVCache]? = nil, inputEmbeddings: MLXArray? = nil
+            _ inputs: MLXArray, cache: [KVCache]? = nil, inputEmbeddings: MLXArray? = nil,
+            raContexts: [RetrievalAttentionContext?]? = nil
         ) -> MLXArray {
             var h: MLXArray
             if let inputEmbeddings {
@@ -419,7 +513,9 @@ public enum Mistral3 {
 
             for (i, layer) in layers.enumerated() {
                 let mask = layer.useSliding ? swaMask : faMask
-                h = layer(h, attnScale: attnScale, mask: mask, cache: cache?[i])
+                h = layer(
+                    h, attnScale: attnScale, mask: mask, cache: cache?[i],
+                    raContext: raContexts?[i])
             }
             return norm(h)
         }
@@ -503,6 +599,75 @@ public enum Mistral3 {
                 h = layer.fullyBatchedForward(
                     h, attnScale: attnScale, cache: caches[i],
                     layerIndex: i, mask: mask)
+            }
+            return norm(h)
+        }
+
+        /// F-85 — batched sparse forward. Shared per-layer
+        /// `BatchedRetrievalAttentionKVCache`. The mask is built once
+        /// from the inner BatchedKVCache offsets (matches the dense
+        /// path). Builds both a global (full-attention) and sliding-
+        /// window mask, dispatched per-layer based on `layer.useSliding`.
+        /// Mirrors `Llama.ModelInner.fullyBatchedSparseForward` plus the
+        /// Mistral 3 sliding/full layer mix from
+        /// `Mistral3.ModelInner.fullyBatchedForward`.
+        public func fullyBatchedSparseForward(
+            _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+        ) -> MLXArray {
+            var h = embedTokens(inputs)
+
+            let attnScale = makeAttnScale(h: h, offset: raCaches[0].inner.offsets[0])
+
+            let cache0 = raCaches[0].inner
+            let B = cache0.active
+            let cacheDtype = cache0.keys.dtype
+            let allSame = cache0.offsets[0 ..< B]
+                .allSatisfy { $0 == cache0.offsets[0] }
+            let maxPostOffset = (cache0.offsets[0 ..< B].max() ?? 0) + 1
+
+            // Global (full attention) mask: all valid positions up to
+            // each request's offset.
+            let faMask: MLXArray
+            if allSame {
+                faMask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+            } else {
+                let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(cache0.offsets[0 ..< B].map { $0 + 1 })
+                    .reshaped(B, 1)
+                let valid = positions .< offsetsArr
+                faMask = MLX.where(
+                    valid,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            }
+
+            // Sliding-window mask: positions older than
+            // (offset - window + 1) are masked. Only built when at least
+            // one sliding layer present.
+            let swaMask: MLXArray
+            if swaIndex != nil, let window = args.slidingWindow {
+                let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(cache0.offsets[0 ..< B].map { $0 + 1 })
+                    .reshaped(B, 1)
+                let lowerBound = offsetsArr - Int32(window)
+                let inWindow = MLX.logicalAnd(
+                    positions .< offsetsArr,
+                    positions .>= lowerBound
+                )
+                swaMask = MLX.where(
+                    inWindow,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            } else {
+                swaMask = faMask
+            }
+
+            for (i, layer) in layers.enumerated() {
+                let mask = layer.useSliding ? swaMask : faMask
+                h = layer.fullyBatchedSparseForward(
+                    h, attnScale: attnScale, raCache: raCaches[i], mask: mask)
             }
             return norm(h)
         }

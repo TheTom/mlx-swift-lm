@@ -387,6 +387,94 @@ public enum Gemma3 {
             let output = cache.attention(queries: queries, scale: scale, mask: mask)
             return outputProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
         }
+
+        /// F-85 — batched sparse forward for Gemma 3. Mirrors
+        /// `fullyBatchedForward` above but at decode (L=1) and on
+        /// sparse-eligible layers routes through
+        /// `BatchedRetrievalAttentionKVCache.sparseAttend` (F-73 batched
+        /// mask kernel by default, F-71b via env) instead of dense
+        /// `cache.attention`. Pairs with `Gemma3TextModel.fullyBatchedSparseDecode`.
+        ///
+        /// Gemma 3 specifics handled:
+        ///   - q/k norms (per-head RMSNorm with learnable weight)
+        ///     applied AFTER projection+reshape, BEFORE RoPE — matches
+        ///     `fullyBatchedForward` ordering exactly.
+        ///   - The Attention init picks `ropeLocalBaseFreq` (sliding) or
+        ///     `ropeTheta` (global) at construction time; this method
+        ///     just uses `self.rope` so per-layer RoPE base is honoured.
+        ///   - `scale = pow(queryPreAttnScalar, -0.5)` (Gemma 3 SDPA
+        ///     scale) — `self.scale` is already set correctly.
+        ///   - Sliding-window layers are expected to be marked dense-band
+        ///     upstream (by the caller's per-layer RetrievalAttentionConfig)
+        ///     so `isSparseEligible=false` and they fall through to
+        ///     `cache.attention` with the sliding mask. Global layers
+        ///     are the sparse pool (unbounded K/V growth at long ctx).
+        ///
+        /// Caveman: like fullyBatched but L=1 sparse-eligible layers go
+        /// to F-73 mask kernel. K/V update happens via inner.update either
+        /// way. Selector index update is a no-op at L=1 per F-72.
+        public func fullyBatchedSparseForward(
+            _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+            mask: MLXArray
+        ) -> MLXArray {
+            let B = x.dim(0)
+            let L = x.dim(1)
+            let cache = raCache.inner
+
+            var queries = queryProj(x).reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
+            var keys = keyProj(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            let values = valueProj(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+
+            queries = queryNorm(queries)
+            keys = keyNorm(keys)
+
+            let allSameOffset = cache.offsets[0 ..< cache.active]
+                .allSatisfy { $0 == cache.offsets[0] }
+            // Capture pre-update K (post-norm, post-RoPE) for the
+            // selector index.
+            let preUpdateK: MLXArray
+            if allSameOffset {
+                let offset = cache.offsets[0]
+                queries = rope(queries, offset: offset)
+                keys = rope(keys, offset: offset)
+                preUpdateK = keys
+                cache.update(newKeys: keys, newValues: values)
+            } else {
+                // Ragged path — slot-by-slot RoPE. Not the v1 target but
+                // here for safety.
+                let qSlices = split(queries, parts: B, axis: 0)
+                let kSlices = split(keys, parts: B, axis: 0)
+                var rotQ = [MLXArray]()
+                var rotK = [MLXArray]()
+                rotQ.reserveCapacity(B)
+                rotK.reserveCapacity(B)
+                for i in 0 ..< B {
+                    let off = cache.offsets[i]
+                    rotQ.append(rope(qSlices[i], offset: off))
+                    rotK.append(rope(kSlices[i], offset: off))
+                }
+                queries = concatenated(rotQ, axis: 0)
+                keys = concatenated(rotK, axis: 0)
+                preUpdateK = keys
+                cache.update(newKeys: keys, newValues: values)
+            }
+
+            // Selector index update (skipped for L=1 per F-72; the wrapper
+            // method handles the L check).
+            raCache.updateIndex(newKeys: preUpdateK)
+
+            let output: MLXArray
+            if L == 1 && raCache.isSparseEligible {
+                // F-71b / F-73 batched sparse SDPA. queries: [B, nQH, 1, D].
+                output = raCache.sparseAttend(
+                    queries: queries, scale: scale)
+            } else {
+                // Dense path — prefill chunk, dense-band (sliding) layer,
+                // or L>1.
+                output = cache.attention(queries: queries, scale: scale, mask: mask)
+            }
+            return outputProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        }
     }
 
     // MARK: - MLP
@@ -466,6 +554,24 @@ public enum Gemma3 {
             let normed = inputLayerNorm(x)
             let r = selfAttention.fullyBatchedForward(
                 normed, cache: cache, layerIndex: layerIndex, mask: mask)
+            let h = Gemma.clipResidual(x, postAttentionLayerNorm(r))
+            let r2 = mlp(preFeedforwardLayerNorm(h))
+            return Gemma.clipResidual(h, postFeedforwardLayerNorm(r2))
+        }
+
+        /// F-85 — batched sparse decoder layer. Same shape as
+        /// `fullyBatchedForward` but threads through a
+        /// `BatchedRetrievalAttentionKVCache` so sparse-eligible
+        /// attention layers can route to F-71b / F-73 batched kernels.
+        /// Gemma 3 norm/residual layout (pre+post + pre/post feedforward
+        /// with `clipResidual`) is preserved unchanged.
+        public func fullyBatchedSparseForward(
+            _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+            mask: MLXArray
+        ) -> MLXArray {
+            let normed = inputLayerNorm(x)
+            let r = selfAttention.fullyBatchedSparseForward(
+                normed, raCache: raCache, mask: mask)
             let h = Gemma.clipResidual(x, postAttentionLayerNorm(r))
             let r2 = mlp(preFeedforwardLayerNorm(h))
             return Gemma.clipResidual(h, postFeedforwardLayerNorm(r2))
@@ -625,6 +731,91 @@ public enum Gemma3 {
                 let m = isGlobal ? globalMask : slidingMask
                 stream = layer.fullyBatchedForward(
                     stream, cache: caches[i], layerIndex: i, mask: m)
+            }
+            return norm(stream)
+        }
+
+        /// F-85 — batched sparse forward. Per-layer dispatch:
+        ///   - Global (`full_attention`) layers route through the per-layer
+        ///     `BatchedRetrievalAttentionKVCache.sparseAttend` (global K/V
+        ///     grows unboundedly with context — this is the win pool).
+        ///   - Sliding-window layers ALSO go through the sparse layer
+        ///     forward, but their `raCache.isSparseEligible` should be
+        ///     false (caller builds them with a `RetrievalAttentionConfig`
+        ///     that excludes sliding layers). Result: they fall through to
+        ///     `cache.attention` (dense) on the inner BatchedKVCache + the
+        ///     sliding-window mask. Memory is wasted on sliding layers vs
+        ///     a tight sliding cache, but at decode time this matches the
+        ///     dense fast path the rest of the family uses.
+        ///
+        /// Caveman: walk layer. global -> sparse. sliding -> dense in same
+        /// loop. mask pick by layer type. Uniform headDim/kvHeads — no
+        /// Gemma 4 style KV-shared / per-layer dim handling needed.
+        ///
+        /// Caller contract: every `raCaches[i].inner` is sized with
+        /// `[nKVHeads, headDim]` — uniform across layers on Gemma 3.
+        public func fullyBatchedSparseForward(
+            _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+        ) -> MLXArray {
+            var stream = embedTokens(inputs)
+            let s = MLXArray(sqrt(Float(config.hiddenSize)), dtype: .bfloat16)
+                .asType(stream.dtype)
+            stream = stream * s
+
+            // Build per-attention-type masks once. Same logic as the
+            // dense `fullyBatchedForward` — we route by layer type and
+            // hand the corresponding mask to each layer's sparse forward.
+            let cache0 = raCaches[0].inner
+            let B = cache0.active
+            let cacheDtype = cache0.keys.dtype
+            let allSame = cache0.offsets[0 ..< B]
+                .allSatisfy { $0 == cache0.offsets[0] }
+            let maxPostOffset = (cache0.offsets[0 ..< B].max() ?? 0) + 1
+
+            // Global mask: all valid positions up to each request's offset.
+            let globalMask: MLXArray
+            if allSame {
+                globalMask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+            } else {
+                let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(cache0.offsets[0 ..< B].map { $0 + 1 })
+                    .reshaped(B, 1)
+                let valid = positions .< offsetsArr
+                globalMask = MLX.where(
+                    valid,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            }
+
+            // Sliding-window mask: positions older than
+            // (offset - slidingWindow + 1) are masked out. Only build
+            // when at least one sliding layer exists.
+            let slidingMask: MLXArray
+            if config.slidingWindowPattern > 1 {
+                let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(cache0.offsets[0 ..< B].map { $0 + 1 })
+                    .reshaped(B, 1)
+                let lowerBound = offsetsArr - Int32(config.slidingWindow)
+                let inWindow = MLX.logicalAnd(
+                    positions .< offsetsArr,
+                    positions .>= lowerBound
+                )
+                slidingMask = MLX.where(
+                    inWindow,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            } else {
+                slidingMask = globalMask
+            }
+
+            for (i, layer) in layers.enumerated() {
+                let isGlobal =
+                    (i % config.slidingWindowPattern == config.slidingWindowPattern - 1)
+                let m = isGlobal ? globalMask : slidingMask
+                stream = layer.fullyBatchedSparseForward(
+                    stream, raCache: raCaches[i], mask: m)
             }
             return norm(stream)
         }

@@ -187,6 +187,25 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    /// Sidecar retrieval-attention overload: pass a parallel list of
+    /// `RetrievalAttentionContext?` aligned to `cache` so the dispatcher
+    /// (`attentionWithCacheUpdate`) routes through the sparse path
+    /// without needing a wrapper KV cache. `raContexts` defaults to nil;
+    /// when nil this is identical to the legacy entry point. Mirrors
+    /// the Qwen2Model / Qwen3Model / LlamaModel overload (F-83 sparse
+    /// decode).
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        raContexts: [RetrievalAttentionContext?]?
+    ) -> MLXArray {
+        let out = model(inputs, cache: cache, inputEmbeddings: nil, raContexts: raContexts)
+        if let lmHead {
+            return lmHead(out)
+        } else {
+            return model.embedTokens.asLinear(out)
+        }
+    }
+
     /// Batched decode: B requests with per-request per-layer caches.
     public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
         let out = model.batchedForward(inputs, caches: caches)
@@ -202,6 +221,24 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
         _ inputs: MLXArray, caches: [BatchedKVCache]
     ) -> MLXArray {
         let out = model.fullyBatchedForward(inputs, caches: caches)
+        if let lmHead {
+            return lmHead(out)
+        } else {
+            return model.embedTokens.asLinear(out)
+        }
+    }
+
+    /// F-85 — batched sparse decode. Pairs with
+    /// `Mistral3.ModelInner.fullyBatchedSparseForward`. ONE batched
+    /// forward call per token, per-layer attention routes through the
+    /// F-73 batched mask kernel (or F-71b via `VSM_SPARSE_BATCHED_KERNEL=f71b`)
+    /// for sparse-eligible layers. vllm-swift's `vsm_engine_decode_all`
+    /// calls here when sparse + B>1 sessions exist AND
+    /// `VSM_SPARSE_BATCHED=1`.
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        let out = model.fullyBatchedSparseForward(inputs, raCaches: raCaches)
         if let lmHead {
             return lmHead(out)
         } else {
@@ -247,7 +284,47 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     /// Per-layer cache: sliding-attention layers get a windowed
     /// `StandardKVCache`; full-attention layers get unbounded.
+    ///
+    /// TriAttention V3 — KV-cache eviction policy. Mirrors the Qwen2
+    /// factory at MLXLLM/Models/Qwen2.swift, the Qwen3 factory at
+    /// MLXLLM/Models/Qwen3.swift, the Llama factory at
+    /// MLXLLM/Models/Llama.swift, and the Gemma4 hetero-skip pattern at
+    /// MLXLLM/Models/Gemma4.swift. V3 owns the full cache list (one
+    /// TriAttentionKVCache per layer) and is incompatible with:
+    ///   - a caller-supplied `maxKVSize` (routes to eviction-windowed
+    ///     StandardKVCache instead)
+    ///   - heterogeneous layer_types (V3 engine takes a single nHeads/
+    ///     nKVHeads/headDim tuple, can't serve mixed sliding+full with
+    ///     different per-layer attn shapes — though Mistral 3 uses
+    ///     uniform GQA shape today, this guard matches Gemma 4's defensive
+    ///     fall-through for forward-compat).
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let env = ProcessInfo.processInfo.environment
+        let enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        // V3-eligible: env on, no maxKVSize override, all layers full-
+        // attention (homogeneous). Mistral 3 layer types today are
+        // ["full_attention", ...] uniformly so this is the common path;
+        // the hetero guard exists for future-proofing.
+        let allFullAttention = args.layerTypes.allSatisfy { $0 == "full_attention" }
+        if enabled, parameters?.maxKVSize == nil, allFullAttention {
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: args.hiddenLayers,
+                nHeads: args.attentionHeads,
+                nKVHeads: args.kvHeads,
+                headDim: args.resolvedHeadDimensions,
+                ropeTheta: args.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0 ..< args.hiddenLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+
+        // Default path — per-layer sliding/full mix.
         return model.layers.map { layer in
             let maxSize: Int? = layer.useSliding ? args.slidingWindow : nil
             return makeAttentionCache(parameters: parameters, maxSize: maxSize)
