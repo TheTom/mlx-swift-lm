@@ -100,6 +100,50 @@ public class Gemma3TextModel: Module, LLMModel {
     }
 
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
+        // TriAttention V3 — KV-cache eviction policy. Mirrors the Qwen2
+        // factory at MLXLLM/Models/Qwen2.swift and the Qwen3 factory at
+        // MLXLLM/Models/Qwen3.swift. Engages when `VLLM_TRIATT_ENABLED`
+        // is set in the environment AND the caller did not supply
+        // `parameters?.maxKVSize` (which routes to the eviction-windowed
+        // StandardKVCache variant instead).
+        //
+        // Gemma 3 architectural note (NOT a Gemma 4 style fall-through):
+        // ----------------------------------------------------------------
+        // Gemma 3 interleaves sliding-window and global-attention layers
+        // via `slidingWindowPattern`, BUT — unlike Gemma 4 — uses a
+        // SINGLE `headDim` / `kvHeads` / `nHeads` triple across both
+        // attention types (see Gemma3.TextConfiguration in
+        // MLXLMCommon/Models/Gemma3.swift). Sliding and global layers
+        // only differ in their RoPE base frequency (`ropeLocalBaseFreq`
+        // vs `ropeTheta`). The V3 engine pins on (nHeads, nKVHeads,
+        // headDim, ropeTheta), so a single engine CAN serve all layers
+        // — we install it directly (matches the Qwen2 / Qwen3 / Llama
+        // pattern). The mixed RoPE base across sliding layers means the
+        // selector's block-feature trig table is built with the global
+        // theta only; sliding layers reuse those features. This matches
+        // the Gemma 4 sliding-layer behaviour where V3 is opt-out at the
+        // layer level via the dense band but uses one engine.
+        let env = ProcessInfo.processInfo.environment
+        let triEnabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        if triEnabled, parameters?.maxKVSize == nil {
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: config.hiddenLayers,
+                nHeads: config.attentionHeads,
+                nKVHeads: config.kvHeads,
+                headDim: config.headDim,
+                ropeTheta: config.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0 ..< config.hiddenLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+
+        // Default path — sliding-window-aware per-layer cache mix.
         var caches = [KVCache]()
         let slidingWindow = config.slidingWindow
         let slidingWindowPattern = config.slidingWindowPattern
