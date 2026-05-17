@@ -505,6 +505,40 @@ public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider {
 
         return sanitizedWeights
     }
+
+    /// TriAttention V3 cache factory. Mirrors `Qwen3Model.newCache` —
+    /// Qwen3MoE shares the same dense-attention shape (q_norm/k_norm +
+    /// RoPE, single `attentionHeads`/`kvHeads`/`headDim` tuple across all
+    /// layers); the MoE FFN sub-layer is orthogonal to KV-cache layout
+    /// so V3 install is a direct mirror of the Qwen3 dense factory.
+    /// V3 stays OFF by default and is incompatible with caller-supplied
+    /// `maxKVSize` (matches sibling family behavior).
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let numLayers = configuration.hiddenLayers
+        let env = ProcessInfo.processInfo.environment
+        let enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        if enabled, parameters?.maxKVSize == nil {
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: configuration.hiddenLayers,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads,
+                headDim: configuration.headDim,
+                ropeTheta: configuration.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0..<numLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+
+        return (0..<numLayers).map { _ in
+            makeAttentionCache(parameters: parameters, maxSize: parameters?.maxKVSize)
+        }
+    }
 }
 
 public struct Qwen3MoEConfiguration: Codable, Sendable {
