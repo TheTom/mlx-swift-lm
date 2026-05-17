@@ -376,10 +376,12 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     public let model: LlamaModelInner
+    let configuration: LlamaConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     public init(_ args: LlamaConfiguration) {
+        self.configuration = args
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
         self.model = LlamaModelInner(args)
@@ -424,6 +426,48 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
         // Remove unused precomputed rotary frequencies
         weights.filter {
             !$0.key.contains("self_attn.rotary_emb.inv_freq")
+        }
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let numLayers = configuration.hiddenLayers
+        let env = ProcessInfo.processInfo.environment
+        let enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        // TriAttention V3 — KV-cache eviction policy. Mirrors the Qwen2
+        // factory at MLXLLM/Models/Qwen2.swift and the Qwen3 factory at
+        // MLXLLM/Models/Qwen3.swift. V3 owns the full cache list (one
+        // TriAttentionKVCache per layer) and is incompatible with a
+        // caller-supplied maxKVSize (which would route to the eviction-
+        // windowed StandardKVCache variant). LlamaConfiguration has a
+        // `headDimensions` codable field (`head_dim` in HF config) — when
+        // absent (older Llama-2 / Mistral-v0.1 checkpoints) it falls
+        // back to hiddenSize / attentionHeads via `resolvedHeadDimensions`,
+        // matching LlamaAttention.init.
+        if enabled, parameters?.maxKVSize == nil {
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: configuration.hiddenLayers,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads,
+                headDim: configuration.resolvedHeadDimensions,
+                ropeTheta: configuration.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0..<numLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+
+        // Default path — route through `makeAttentionCache` so caller-
+        // supplied `maxKVSize` picks the eviction-windowed variant.
+        // Matches the Qwen2/Qwen3 factory behavior + the
+        // `KVCacheDimensionProvider` extension default in
+        // MLXLMCommon/LanguageModel.swift.
+        return (0..<numLayers).map { _ in
+            makeAttentionCache(parameters: parameters, maxSize: parameters?.maxKVSize)
         }
     }
 
