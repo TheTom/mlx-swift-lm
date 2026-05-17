@@ -370,8 +370,19 @@ final class Qwen35GatedDeltaNet: Module {
 
         let qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        // Mirror `callAsFunction`'s bf16-NaN workaround for the small-output-dim
+        // `in_proj_a` / `in_proj_b` projections (lines 254-262). When these are
+        // left unquantized bf16 (Qwen3.6-27B-UD-MLX-4bit ships ALL linear_attn
+        // projections as dense bf16; Qwen3.6-27B-ConfigI ships layers 2+ that
+        // way), MLX-Swift's Metal Linear kernel hits a tile path that emits
+        // sparse NaN on bf16⊗bf16 at the small `numVHeads`-wide output. The
+        // single-request path upcasts inputs to fp32 for these two calls and
+        // casts the result back; `fullyBatchedForward` (the B>1 hot path) was
+        // missing the same defense and crashed every B>1 decode on those
+        // checkpoints with `!` spam after the first token.
+        let inputsFp32 = inputs.asType(.float32)
+        let b = inProjB(inputsFp32).asType(inputs.dtype)
+        let a = inProjA(inputsFp32).asType(inputs.dtype)
 
         // Slice live conv + rec state for the active prefix. These are views.
         let (convStateSlice, recStateSlice) = cache.slice(active: B)
@@ -946,14 +957,44 @@ public class Qwen35TextModelInner: Module {
         }
 
         let modelDtype = hiddenStates.dtype
+        // Selective fp32 upcast for bf16 unquantized weights — mirrors
+        // `Qwen35TextModelInner.callAsFunction`'s per-layer cast at line 833-835.
+        //
+        // Mixed-precision checkpoints (Qwen3.6-27B-UD-MLX-4bit, Qwen3.6-27B-ConfigI,
+        // Qwen3.6-35B-A3B-ConfigI) ship with the MoE router `mlp.gate` and the
+        // small linear-attn projections (`in_proj_a` / `in_proj_b`) left as
+        // unquantized bf16 Linear. MLX-Swift's Metal Linear kernel emits sparse
+        // NaN on bf16⊗bf16 matmul at certain output-dim tile paths — the
+        // per-request path side-steps it by upcasting the hidden stream to fp32
+        // before every layer, but `fullyBatchedForward` (the B>1 batched-decode
+        // hot path) was missing the same defense. Result: first decode token
+        // correct, subsequent steps NaN-collapse to argmax=0 (`!` spam) once
+        // the NaN-tainted state propagates through one round of GDN/attention.
+        // Symptom: B=1 baseline works (no NaN seeds), B>1 fails the same way.
+        //
+        // The per-DecoderLayer fullyBatchedForward already handles the bf16
+        // round-trip for GDN's fused Metal kernel (downcast for sub-call,
+        // upcast result). So passing fp32 here is correct — GDN downcasts
+        // internally, attention/MLP stay fp32, residual adds stay fp32.
+        let needsSelectiveFP32 = (modelDtype == .bfloat16)
         for (i, layer) in layers.enumerated() {
+            if needsSelectiveFP32 {
+                hiddenStates = hiddenStates.asType(.float32)
+            }
             hiddenStates = layer.fullyBatchedForward(
                 hiddenStates, layerCache: caches.layers[i], attnMaskMode: attnMaskMode)
             // Same defensive cast as the per-request path: quantized ops can
-            // promote bf16 → fp32 inside the lazy graph.
-            hiddenStates = hiddenStates.asType(modelDtype)
+            // promote bf16 → fp32 inside the lazy graph. SKIP when selective-fp32
+            // is active so attention/MLP outputs stay fp32 for the next layer.
+            if !needsSelectiveFP32 {
+                hiddenStates = hiddenStates.asType(modelDtype)
+            }
         }
 
+        // Keep norm + downstream lm_head in fp32 when selective-fp32 is active,
+        // for the same reason as the per-request path (line 884-888): the bf16
+        // lm_head matmul would otherwise re-trigger the NaN bug we just dodged.
+        if needsSelectiveFP32 { hiddenStates = hiddenStates.asType(.float32) }
         return norm(hiddenStates)
     }
 }
