@@ -804,6 +804,109 @@ class Gemma4Attention: Module {
         let output = donorCache.attention(queries: queries, scale: scale, maskMode: mask)
         return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
+
+    /// F-85 — batched sparse forward for Gemma 4. Mirrors the Qwen3 port
+    /// at `Qwen3Attention.fullyBatchedSparseForward` (commit 3186262)
+    /// with three Gemma 4 specific bits:
+    ///
+    ///   1. `attentionKEqV` (V=K) on non-sliding layers — skips the
+    ///      separate V projection and aliases values to keys, matching
+    ///      `fullyBatchedForward` above.
+    ///   2. v_norm (RMSNorm with ones weight, no learnable scale) is
+    ///      applied to V before transpose. Skipped when V=K because the
+    ///      shared tensor already went through k_norm.
+    ///   3. `scale = 1.0` (Gemma 4 SDPA scale, NOT 1/sqrt(D)). Both the
+    ///      dense fallback and `sparseAttend` use the same scale.
+    ///
+    /// The fused norm+RoPE kernel is intentionally NOT used here — it
+    /// requires the offset-aligned hot path, and the sparse decode path
+    /// already short-circuits to `sparseAttend` for L=1 + sparse layers.
+    /// Bit-identical to the unfused norm + RoPE branch in
+    /// `fullyBatchedForward`'s slow path.
+    ///
+    /// Caveman: like fullyBatched but K=V when attentionKEqV, then L=1
+    /// sparse route to F-73 mask kernel else dense cache.attention.
+    public func fullyBatchedSparseForward(
+        _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        let cache = raCache.inner
+
+        var queries = qProj(x).reshaped(B, L, nHeads, -1)
+        var keys = kProj(x).reshaped(B, L, nKVHeads, -1)
+        var values: MLXArray
+        if attentionKEqV {
+            // V=K on non-sliding global layers — skip the v_proj matmul.
+            // Match `fullyBatchedForward`: alias to pre-norm K, then run
+            // v_norm (RMSNorm with ones weight) below. Note this means V
+            // and K are NOT identical post-norm; they share the same pre-
+            // projection but go through different RMSNorms (kNorm has a
+            // learnable weight, v_norm uses ones).
+            values = keys
+        } else {
+            values = vProj!(x).reshaped(B, L, nKVHeads, -1)
+        }
+        // v_norm applied unconditionally (matches `fullyBatchedForward`
+        // slow path line 743). When `attentionKEqV` is true, this norms
+        // the aliased pre-projection K — that's correct, V still passes
+        // through v_norm even when sharing the projection with K.
+        values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
+
+        // q/k norms — applied per-head BEFORE RoPE (matches the unfused
+        // branch in `fullyBatchedForward`). These operate on independent
+        // tensors (`keys` is the kProj output; `values` already captured
+        // a separate post-v_norm tensor above).
+        queries = qNorm(queries).transposed(0, 2, 1, 3)
+        keys = kNorm(keys).transposed(0, 2, 1, 3)
+        values = values.transposed(0, 2, 1, 3)
+
+        let allSameOffset = cache.offsets[0 ..< cache.active]
+            .allSatisfy { $0 == cache.offsets[0] }
+        // Capture pre-update K (post-RoPE) for the selector index.
+        let preUpdateK: MLXArray
+        if allSameOffset {
+            let offset = cache.offsets[0]
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+            preUpdateK = keys
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            let qSlices = split(queries, parts: B, axis: 0)
+            let kSlices = split(keys, parts: B, axis: 0)
+            var rotQ = [MLXArray]()
+            var rotK = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            rotK.reserveCapacity(B)
+            for i in 0 ..< B {
+                let off = cache.offsets[i]
+                rotQ.append(rope(qSlices[i], offset: off))
+                rotK.append(rope(kSlices[i], offset: off))
+            }
+            queries = concatenated(rotQ, axis: 0)
+            keys = concatenated(rotK, axis: 0)
+            preUpdateK = keys
+            cache.update(newKeys: keys, newValues: values)
+        }
+
+        // Selector index update (skipped for L=1 per F-72; the wrapper
+        // method handles the L check).
+        raCache.updateIndex(newKeys: preUpdateK)
+
+        let output: MLXArray
+        if L == 1 && raCache.isSparseEligible {
+            // F-71b / F-73 batched sparse SDPA. queries: [B, nQH, 1, D].
+            output = raCache.sparseAttend(
+                queries: queries, scale: scale)
+        } else {
+            // Dense path — prefill chunk, dense-band layer, sliding-window
+            // layer (Gemma 4 marks these non-sparse-eligible upstream),
+            // or L>1.
+            output = cache.attention(queries: queries, scale: scale, maskMode: mask)
+        }
+        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
 }
 
 // MARK: - Compiled fused ops (matching Python mlx-lm)
@@ -1214,6 +1317,31 @@ class Gemma4TransformerBlock: Module {
             attnOut = selfAttention.fullyBatchedForward(
                 inputNorm, cache: cache, layerIndex: layerIndex, mask: mask)
         }
+        let h = MLXFast.rmsNormResidual(
+            attnOut, residual: x,
+            weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps)
+
+        return ffnAndScale(h, perLayerInput: perLayerInput)
+    }
+
+    /// F-85 — batched sparse decoder layer. Threads through a
+    /// `BatchedRetrievalAttentionKVCache` so sparse-eligible attention
+    /// layers can route to F-71b / F-73 batched kernels. Other Gemma 4
+    /// layer specifics (PLE, optional MoE, layer scalar, post-norm +
+    /// residual) are reused from `ffnAndScale`. KV-shared layers fall
+    /// back to dense `cache.attention` via the inner BatchedKVCache —
+    /// sparse + shared-KV is a v2 concern. The caller
+    /// (`Gemma4ModelInner.fullyBatchedSparseForward`) decides which
+    /// `raCache` each layer gets.
+    func fullyBatchedSparseForward(
+        _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        perLayerInput: MLXArray? = nil
+    ) -> MLXArray {
+        let inputNorm = inputLayerNorm(x)
+        let attnOut = selfAttention.fullyBatchedSparseForward(
+            inputNorm, raCache: raCache, mask: mask)
         let h = MLXFast.rmsNormResidual(
             attnOut, residual: x,
             weight: postAttentionLayerNorm.weight,
@@ -1639,6 +1767,141 @@ public class Gemma4ModelInner: Module {
         }
         return norm(h)
     }
+
+    /// F-85 — batched sparse forward. Per-layer dispatch:
+    ///   - `full_attention` layers route through the per-layer
+    ///     `BatchedRetrievalAttentionKVCache.sparseAttend` (global K/V
+    ///     grows unboundedly with context — this is the win pool).
+    ///   - `sliding_attention` layers ALSO go through the sparse layer
+    ///     forward, but their `raCache.isSparseEligible` is false (Bridge
+    ///     constructs them with a `RetrievalAttentionConfig` that
+    ///     excludes sliding layers from the sparse band). Result: they
+    ///     fall through to `cache.attention` (dense) using the inner
+    ///     BatchedKVCache + the sliding-window mask. Memory is wasted on
+    ///     sliding layers vs a tight sliding cache, but at decode time
+    ///     this matches the dense fast path the rest of the family uses.
+    ///   - KV-shared layers (Gemma 4 E2B / E4B `num_kv_shared_layers > 0`)
+    ///     also fall through to the dense path via the inner cache,
+    ///     because sparse + shared-KV is a v2 concern; the caller is
+    ///     expected to skip wiring sparse caches for these layers.
+    ///
+    /// Caveman: walk layer. global -> sparse. sliding -> dense in same
+    /// loop. mask pick by layer type. KV-shared go through dense too.
+    ///
+    /// Caller contract: `raCaches[i].inner` is the BatchedKVCache for
+    /// layer i sized with that layer's `[nKVHeads, headDim]`. For KV-
+    /// shared layers, `raCaches[i]` may be a placeholder; this method
+    /// won't actually invoke sparse path on those layers (it falls back
+    /// to the donor cache's dense attention via `inner`).
+    func fullyBatchedSparseForward(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        var h = embedTokens(inputs)
+        h = h * sqrt(Float(config.hiddenSize))
+
+        let perLayerInputs = computePerLayerInputs(inputs, h: h)
+
+        // Build the same dual sliding/global mask the dense path does.
+        // The masks are derived from a representative layer's offsets;
+        // we pick the first global layer's inner cache for global, and
+        // the first sliding layer's inner cache for sliding. They share
+        // the same offset progression because all caches advance in lock-
+        // step per decode step. (For first build this is also fine: at
+        // step 0 every cache is at the prefill T.)
+        let cache0 = raCaches[0].inner
+        let B = cache0.active
+        let cacheDtype = cache0.keys.dtype
+        let allSame = cache0.offsets[0 ..< B]
+            .allSatisfy { $0 == cache0.offsets[0] }
+        let maxPostOffset = (cache0.offsets[0 ..< B].max() ?? 0) + 1
+        let minPostOffset = (cache0.offsets[0 ..< B].min() ?? 0) + 1
+
+        let globalMaskMode: MLXFast.ScaledDotProductAttentionMaskMode
+        let globalMaskArray: MLXArray?
+        if allSame {
+            globalMaskMode = .none
+            globalMaskArray = nil
+        } else {
+            let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+            let offsetsArr = MLXArray(cache0.offsets[0 ..< B].map { $0 + 1 })
+                .reshaped(B, 1)
+            let valid = positions .< offsetsArr
+            let m = MLX.where(
+                valid,
+                MLXArray(Float(0)).asType(cacheDtype),
+                MLXArray(Float(-1e9)).asType(cacheDtype)
+            ).reshaped(B, 1, 1, maxPostOffset)
+            globalMaskMode = .array(m)
+            globalMaskArray = m
+        }
+        let slidingFits = allSame && minPostOffset <= config.slidingWindow
+        let slidingMaskMode: MLXFast.ScaledDotProductAttentionMaskMode
+        if slidingFits {
+            slidingMaskMode = .none
+        } else if let g = globalMaskArray, minPostOffset <= config.slidingWindow {
+            slidingMaskMode = .array(g)
+        } else {
+            let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+            let offsetsArr = MLXArray(cache0.offsets[0 ..< B].map { $0 + 1 })
+                .reshaped(B, 1)
+            let lowerBound = offsetsArr - Int32(config.slidingWindow)
+            let inWindow = MLX.logicalAnd(
+                positions .< offsetsArr,
+                positions .>= lowerBound)
+            let m = MLX.where(
+                inWindow,
+                MLXArray(Float(0)).asType(cacheDtype),
+                MLXArray(Float(-1e9)).asType(cacheDtype)
+            ).reshaped(B, 1, 1, maxPostOffset)
+            slidingMaskMode = .array(m)
+        }
+
+        // KV-sharing: for shared layers, route through the existing
+        // dense `fullyBatchedSharedKVForward` against the donor's INNER
+        // BatchedKVCache. Routing them through the sparse forward would
+        // re-trigger `cache.update` on the donor and double-advance its
+        // offsets (one update per shared layer that reuses the donor).
+        // Sparse + shared-KV is a v2 concern; for v1 we keep the dense
+        // fallback semantics that match `Gemma4ModelInner.fullyBatchedForward`.
+        let hasSharedKV = config.numKvSharedLayers > 0
+        var donorPreUpdateOffsets: [[Int]] = hasSharedKV
+            ? Array(repeating: Array(repeating: 0, count: B), count: layers.count)
+            : []
+
+        for (i, layer) in layers.enumerated() {
+            let isGlobal = layerTypes[i] == "full_attention"
+            let mask = isGlobal ? globalMaskMode : slidingMaskMode
+            let pli: MLXArray? = perLayerInputs.map { $0[0..., 0..., i, 0...] }
+            let donorIdx = previousKVs[i]
+            let isShared = hasSharedKV && donorIdx != i
+
+            if isShared {
+                // Dense shared-KV path. Reads K/V from donor's INNER
+                // BatchedKVCache (already updated by the donor earlier
+                // this step). Sparse selector index on the donor was
+                // populated for the donor's K stream; reusing it here
+                // would conflate Q from two different attention layers.
+                let donorCache = raCaches[donorIdx].inner
+                h = layer.fullyBatchedForward(
+                    h, cache: donorCache, layerIndex: i, mask: mask,
+                    perLayerInput: pli, useSharedKV: true,
+                    donorPreUpdateOffsets: donorPreUpdateOffsets[donorIdx])
+            } else {
+                // Snapshot pre-update offset for downstream shared
+                // layers BEFORE the donor's update runs. The sparse
+                // forward calls `cache.update` internally so we capture
+                // here, not after the call returns.
+                if hasSharedKV {
+                    for b in 0 ..< B {
+                        donorPreUpdateOffsets[i][b] = raCaches[i].inner.offsets[b]
+                    }
+                }
+                h = layer.fullyBatchedSparseForward(
+                    h, raCache: raCaches[i], mask: mask, perLayerInput: pli)
+            }
+        }
+        return norm(h)
+    }
 }
 
 // MARK: - Gemma4 Text Model
@@ -1730,6 +1993,28 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    /// F-83 sidecar retrieval-attention overload — required by the
+    /// `BatchedSparseLLM` protocol in vllm-swift Bridge.swift. Gemma 4
+    /// does NOT yet wire `raContexts` through `Gemma4ModelInner`
+    /// (`callAsFunction` lacks an `raContexts:` parameter and the inner
+    /// loop's KV-sharing + PLE bookkeeping would need to thread the per-
+    /// layer context through). Per-request F-83 sparse decode therefore
+    /// falls through to dense on Gemma 4 — only the F-85 batched sparse
+    /// decode (via `fullyBatchedSparseDecode` below) engages. This stub
+    /// ignores `raContexts` and dispatches to the standard dense path so
+    /// any caller that probes the protocol (e.g. the Bridge's logging
+    /// arm) does not crash.
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        raContexts: [RetrievalAttentionContext?]?
+    ) -> MLXArray {
+        // Phase 2 scope: F-85 batched sparse decode only. F-83 per-
+        // request raContexts dispatch would require an inner-model
+        // overload + per-layer threading through the KV-sharing /
+        // donor-offset bookkeeping. Punt to dense.
+        return callAsFunction(inputs, cache: cache)
+    }
+
     /// Batched decode: B requests with per-request per-layer caches. Closes
     /// the per-stream sequential fallback in vllm-swift's `vsm_engine_decode_all`
     /// when running Gemma4 at B>1. Inputs: [B, 1] token IDs. Caches: B arrays
@@ -1756,6 +2041,36 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         _ inputs: MLXArray, caches: [BatchedKVCache]
     ) -> MLXArray {
         var out = model.fullyBatchedForward(inputs, caches: caches)
+        if config.tieWordEmbeddings {
+            out = model.embedTokens.asLinear(out)
+        } else {
+            out = lmHead!(out)
+        }
+        if let softcap = config.finalLogitSoftcapping, softcap > 0 {
+            out = compiledLogitSoftcap(MLXArray(softcap), out)
+        }
+        return out
+    }
+
+    /// F-85 — batched sparse decode. Pairs with
+    /// `Gemma4ModelInner.fullyBatchedSparseForward`. ONE batched forward
+    /// call per token; per-layer attention routes through the F-73 batched
+    /// mask kernel (or F-71b via `VSM_SPARSE_BATCHED_KERNEL=f71b`) for
+    /// global (`full_attention`) layers, and through dense
+    /// `cache.attention` for sliding-window layers. vllm-swift's
+    /// `vsm_engine_decode_all` calls here when sparse + B>1 sessions
+    /// exist AND `VSM_SPARSE_BATCHED=1`.
+    ///
+    /// Per-layer cache shape contract: `raCaches[i].inner` is sized with
+    /// layer i's `[nKVHeads, headDim]`. The Bridge builder
+    /// (`buildBatchedSparseCaches` in vllm-swift) was updated to read
+    /// per-layer K shape from each session's prefilled cache to honour
+    /// this contract on heterogeneous models like Gemma 4 (sliding
+    /// `[8, 256]` vs global `[2, 512]`).
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        var out = model.fullyBatchedSparseForward(inputs, raCaches: raCaches)
         if config.tieWordEmbeddings {
             out = model.embedTokens.asLinear(out)
         } else {

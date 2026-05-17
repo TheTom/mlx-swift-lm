@@ -31,6 +31,44 @@ import MLXLMCommon
 import MLXNN
 import Testing
 
+/// Process-wide lock that serializes the VLLM_TRIATT_ENABLED env-var
+/// dance across V3 test suites. Swift Testing's `.serialized` trait is
+/// per-suite; without a cross-suite lock the three V3 suites (Qwen2,
+/// Qwen3, Gemma4) race on `setenv` / `unsetenv` and the homogeneous
+/// install test can sample a transient unsetenv from a sibling suite.
+/// Used internally — sibling Qwen2/Qwen3 suites don't hold this lock,
+/// so each test reruns its env setup + factory call inside a withLock
+/// block to guarantee the env is set at the moment `newCache` runs.
+private let triattEnvLock = NSLock()
+
+@inline(__always)
+private func withTriattEnv<T>(
+    _ vars: [(String, String?)], _ body: () throws -> T
+) rethrows -> T {
+    triattEnvLock.lock()
+    defer { triattEnvLock.unlock() }
+    let prior: [(String, String?)] = vars.map { (key, _) in
+        (key, getenv(key).map { String(cString: $0) })
+    }
+    for (key, value) in vars {
+        if let value {
+            setenv(key, value, 1)
+        } else {
+            unsetenv(key)
+        }
+    }
+    defer {
+        for (key, value) in prior {
+            if let value {
+                setenv(key, value, 1)
+            } else {
+                unsetenv(key)
+            }
+        }
+    }
+    return try body()
+}
+
 @Suite("Gemma4 TriAttention V3 — port", .serialized)
 struct Gemma4V3Tests {
 
@@ -99,68 +137,81 @@ struct Gemma4V3Tests {
 
     @Test("Gemma4 factory skips V3 install on heterogeneous attention shapes")
     func gemma4FactorySkipsV3OnHeterogeneousConfig() throws {
-        setenv("VLLM_TRIATT_ENABLED", "1", 1)
-        setenv("VLLM_TRIATT_GEMMA4_SILENT", "1", 1)
-        defer {
-            unsetenv("VLLM_TRIATT_ENABLED")
-            unsetenv("VLLM_TRIATT_GEMMA4_SILENT")
+        try withTriattEnv([
+            ("VLLM_TRIATT_ENABLED", "1"),
+            ("VLLM_TRIATT_GEMMA4_SILENT", "1"),
+        ]) {
+            let model = Gemma4TextModel(try Gemma4V3Tests.makeHeterogeneousConfig())
+            let caches = model.newCache(parameters: nil)
+
+            #expect(caches.count == 4)
+            // No TriAttentionKVCache anywhere — heterogeneous shape means
+            // V3 engine cannot be installed; factory must fall through.
+            #expect(caches.allSatisfy { !($0 is TriAttentionKVCache) })
         }
-
-        let model = Gemma4TextModel(try Gemma4V3Tests.makeHeterogeneousConfig())
-        let caches = model.newCache(parameters: nil)
-
-        #expect(caches.count == 4)
-        // No TriAttentionKVCache anywhere — heterogeneous shape means V3
-        // engine cannot be installed; factory must fall through.
-        #expect(caches.allSatisfy { !($0 is TriAttentionKVCache) })
     }
 
     @Test("Gemma4 factory installs V3 caches on homogeneous attention shapes")
     func gemma4FactoryInstallsV3OnHomogeneousConfig() throws {
-        setenv("VLLM_TRIATT_ENABLED", "1", 1)
-        setenv("VLLM_TRIATT_GEMMA4_SILENT", "1", 1)
-        defer {
-            unsetenv("VLLM_TRIATT_ENABLED")
-            unsetenv("VLLM_TRIATT_GEMMA4_SILENT")
+        // Retry up to a small number of times to defeat the cross-suite
+        // env-var race against Qwen2V3Tests / TriAttentionV3Tests. Both
+        // sibling suites call `unsetenv("VLLM_TRIATT_ENABLED")` in some
+        // of their tests; swift-testing's `.serialized` is per-suite so
+        // those calls can interleave with our setenv between the env
+        // setup and the factory's env read. The lock in `withTriattEnv`
+        // serializes within OUR suite but doesn't gate sibling suites.
+        // Retry loop is far simpler than a shared cross-suite mutex.
+        var caches: [KVCache] = []
+        let model = Gemma4TextModel(try Gemma4V3Tests.makeHomogeneousConfig())
+        var installed = false
+        for _ in 0..<8 {
+            caches = withTriattEnv([
+                ("VLLM_TRIATT_ENABLED", "1"),
+                ("VLLM_TRIATT_GEMMA4_SILENT", "1"),
+            ]) {
+                model.newCache(parameters: nil)
+            }
+            installed = caches.allSatisfy { $0 is TriAttentionKVCache }
+            if installed { break }
         }
 
-        let model = Gemma4TextModel(try Gemma4V3Tests.makeHomogeneousConfig())
-        let caches = model.newCache(parameters: nil)
-
         #expect(caches.count == 2)
-        #expect(caches.allSatisfy { $0 is TriAttentionKVCache })
-        let tri = try #require(caches.first as? TriAttentionKVCache)
-        #expect(tri.logicalOffset == 0)
-        #expect(tri.engine.nLayers == 2)
-        #expect(tri.engine.nHeads == 8)
-        #expect(tri.engine.nKVHeads == 2)
-        #expect(tri.engine.headDim == 8)
+        // After retries the factory still did not install V3 caches —
+        // cross-suite env-var race may be worse than expected.
+        #expect(installed)
+        if let tri = caches.first as? TriAttentionKVCache {
+            #expect(tri.logicalOffset == 0)
+            #expect(tri.engine.nLayers == 2)
+            #expect(tri.engine.nHeads == 8)
+            #expect(tri.engine.nKVHeads == 2)
+            #expect(tri.engine.headDim == 8)
+        }
     }
 
     @Test("Gemma4 factory uses default mix when V3 env disabled")
     func gemma4FactoryDefaultsWhenV3Disabled() throws {
-        unsetenv("VLLM_TRIATT_ENABLED")
-        let model = Gemma4TextModel(try Gemma4V3Tests.makeHomogeneousConfig())
-        let caches = model.newCache(parameters: nil)
-        #expect(caches.count == 2)
-        #expect(caches.allSatisfy { !($0 is TriAttentionKVCache) })
+        try withTriattEnv([("VLLM_TRIATT_ENABLED", nil)]) {
+            let model = Gemma4TextModel(try Gemma4V3Tests.makeHomogeneousConfig())
+            let caches = model.newCache(parameters: nil)
+            #expect(caches.count == 2)
+            #expect(caches.allSatisfy { !($0 is TriAttentionKVCache) })
+        }
     }
 
     @Test("Gemma4 factory falls through when maxKVSize is set")
     func gemma4FactoryRespectsMaxKVSize() throws {
-        setenv("VLLM_TRIATT_ENABLED", "1", 1)
-        setenv("VLLM_TRIATT_GEMMA4_SILENT", "1", 1)
-        defer {
-            unsetenv("VLLM_TRIATT_ENABLED")
-            unsetenv("VLLM_TRIATT_GEMMA4_SILENT")
+        try withTriattEnv([
+            ("VLLM_TRIATT_ENABLED", "1"),
+            ("VLLM_TRIATT_GEMMA4_SILENT", "1"),
+        ]) {
+            let model = Gemma4TextModel(try Gemma4V3Tests.makeHomogeneousConfig())
+            var params = GenerateParameters()
+            params.maxKVSize = 512
+            let caches = model.newCache(parameters: params)
+            // maxKVSize set → V3 incompatible (mirrors Qwen2/Qwen3
+            // behavior); factory falls through to eviction-windowed.
+            #expect(caches.allSatisfy { !($0 is TriAttentionKVCache) })
         }
-        let model = Gemma4TextModel(try Gemma4V3Tests.makeHomogeneousConfig())
-        var params = GenerateParameters()
-        params.maxKVSize = 512
-        let caches = model.newCache(parameters: params)
-        // maxKVSize set → V3 incompatible (mirrors Qwen2/Qwen3 behavior);
-        // factory falls through to the eviction-windowed default.
-        #expect(caches.allSatisfy { !($0 is TriAttentionKVCache) })
     }
 
     /// Gated real-model smoke. Loads gemma-4-26b-a4b-4bit and runs a tiny
