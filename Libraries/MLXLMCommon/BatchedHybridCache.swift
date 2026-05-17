@@ -139,6 +139,11 @@ public class BatchedHybridCache {
     public enum BatchedLayerCache {
         case attention(BatchedKVCache)
         case gdn(BatchedMambaCache)
+        /// Sparse-attention layer. Wraps a `BatchedKVCache` so the hybrid
+        /// lockstep slot management can still read/write `inner.active`,
+        /// `inner.offsets`, and the K/V buffers identically to a plain
+        /// `.attention` case.
+        case sparseAttention(BatchedRetrievalAttentionKVCache)
     }
 
     public let layers: [BatchedLayerCache]
@@ -149,6 +154,7 @@ public class BatchedHybridCache {
         switch first {
         case .attention(let c): return c.active
         case .gdn(let c): return c.active
+        case .sparseAttention(let ra): return ra.inner.active
         }
     }
 
@@ -167,6 +173,7 @@ public class BatchedHybridCache {
             switch layer {
             case .attention(let c): slot = c.addRequest()
             case .gdn(let c): slot = c.addSlot()
+            case .sparseAttention(let ra): slot = ra.inner.addRequest()
             }
             if assigned < 0 { assigned = slot }
             assert(slot == assigned,
@@ -192,6 +199,19 @@ public class BatchedHybridCache {
                 c.active -= 1
             case .gdn(let c):
                 c.removeSlot(slot)
+            case .sparseAttention(let ra):
+                // Same swap-from-end semantics applied to the inner cache.
+                // Selector index state stays consistent because it indexes
+                // by slot too (rebuilt on demand at the next sparseAttend).
+                let c = ra.inner
+                let last = c.active - 1
+                if slot != last {
+                    c.keys[slot, 0..., 0..., 0...] = c.keys[last, 0..., 0..., 0...]
+                    c.values[slot, 0..., 0..., 0...] = c.values[last, 0..., 0..., 0...]
+                    c.offsets[slot] = c.offsets[last]
+                }
+                c.offsets[last] = 0
+                c.active -= 1
             }
         }
     }
@@ -202,6 +222,7 @@ public class BatchedHybridCache {
             switch layer {
             case .attention(let c): c.reset()
             case .gdn(let c): c.reset()
+            case .sparseAttention(let ra): ra.inner.reset()
             }
         }
     }
