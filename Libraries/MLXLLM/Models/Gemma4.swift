@@ -1878,6 +1878,76 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
+        // TriAttention V3 — KV-cache eviction policy. Mirrors the Qwen3
+        // factory at MLXLLM/Models/Qwen3.swift and the Qwen2 port at
+        // MLXLLM/Models/Qwen2.swift. Engages when `VLLM_TRIATT_ENABLED`
+        // is set in the environment AND the caller did not supply
+        // `parameters?.maxKVSize` (which routes to the eviction-windowed
+        // StandardKVCache variant instead).
+        //
+        // Gemma4 architectural caveat (documented, not a regression):
+        // ----------------------------------------------------------------
+        // `TriAttentionV3Engine` takes a SINGLE `(nHeads, nKVHeads, headDim,
+        // ropeTheta)` tuple at init and uses those values to size per-(layer
+        // × kv-head × freq) accumulator buffers + Q-grouping reshapes (see
+        // `TriAttentionV3Engine.accumulateQ` at
+        // MLXLMCommon/TriAttention/TriAttentionV3.swift:222-250). Gemma 4's
+        // sliding-attention layers (`headDim=256, kvHeads=8`) and
+        // full-attention layers (`globalHeadDim=512, globalKvHeads=2`)
+        // disagree on BOTH `headDim` and `kvHeads`, so one engine cannot
+        // accumulate Q stats across the layer mix without aliasing the
+        // accumulators or silently truncating heads.
+        //
+        // Per the task spec, document and fall through — do NOT hack a
+        // mixed-shape V3 engine. When `VLLM_TRIATT_ENABLED=1` is set on
+        // Gemma 4 we log once and skip V3 install, returning the default
+        // sliding-window-aware cache mix.
+        let env = ProcessInfo.processInfo.environment
+        let triEnabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        if triEnabled, parameters?.maxKVSize == nil {
+            let heterogeneous =
+                config.headDim != config.globalHeadDim
+                || config.kvHeads != config.globalKvHeads
+            let mixedLayerTypes =
+                Set(config.layerTypes).count > 1
+            if heterogeneous && mixedLayerTypes {
+                // One-shot warning so longctx benches surface the skip
+                // without spamming every prefill.
+                if env["VLLM_TRIATT_GEMMA4_SILENT"] != "1" {
+                    print(
+                        "[gemma4] VLLM_TRIATT_ENABLED set but skipping V3 "
+                        + "install: sliding layers (headDim=\(config.headDim), "
+                        + "kvHeads=\(config.kvHeads)) and global layers "
+                        + "(headDim=\(config.globalHeadDim), "
+                        + "kvHeads=\(config.globalKvHeads)) have "
+                        + "incompatible attention shapes for a single "
+                        + "TriAttentionV3Engine. Falling through to default "
+                        + "sliding-window cache mix. "
+                        + "(set VLLM_TRIATT_GEMMA4_SILENT=1 to silence)")
+                }
+            } else {
+                // Homogeneous shapes — safe to install one V3 engine
+                // across all layers. Synthetic configs in the test suite
+                // hit this branch; real Gemma 4 checkpoints don't.
+                let engine = TriAttentionV3Engine(
+                    cfg: .fromEnv(),
+                    nLayers: config.hiddenLayers,
+                    nHeads: config.attentionHeads,
+                    nKVHeads: config.kvHeads,
+                    headDim: config.headDim,
+                    ropeTheta: config.ropeTheta
+                )
+                TriAttentionRescue.shared.install(on: engine)
+                return (0 ..< config.hiddenLayers).map { layerIdx in
+                    TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+                }
+            }
+        }
+
+        // Default path — sliding-window-aware per-layer cache mix.
         var caches = [KVCache]()
 
         for layerType in config.layerTypes {
