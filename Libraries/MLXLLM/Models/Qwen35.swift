@@ -371,18 +371,24 @@ final class Qwen35GatedDeltaNet: Module {
         let qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
         // Mirror `callAsFunction`'s bf16-NaN workaround for the small-output-dim
-        // `in_proj_a` / `in_proj_b` projections (lines 254-262). When these are
-        // left unquantized bf16 (Qwen3.6-27B-UD-MLX-4bit ships ALL linear_attn
-        // projections as dense bf16; Qwen3.6-27B-ConfigI ships layers 2+ that
-        // way), MLX-Swift's Metal Linear kernel hits a tile path that emits
-        // sparse NaN on bf16⊗bf16 at the small `numVHeads`-wide output. The
-        // single-request path upcasts inputs to fp32 for these two calls and
-        // casts the result back; `fullyBatchedForward` (the B>1 hot path) was
-        // missing the same defense and crashed every B>1 decode on those
-        // checkpoints with `!` spam after the first token.
-        let inputsFp32 = inputs.asType(.float32)
-        let b = inProjB(inputsFp32).asType(inputs.dtype)
-        let a = inProjA(inputsFp32).asType(inputs.dtype)
+        // `in_proj_a` / `in_proj_b` projections (lines 254-262). MLX-Swift's
+        // Metal Linear kernel emits sparse NaN on bf16⊗bf16 at the small
+        // `numVHeads`-wide output — only triggers when those Linears are
+        // UNQUANTIZED (mixed-bit checkpoints: Qwen3.6-27B-UD, ConfigI). For
+        // pure-quant checkpoints in_proj_a/b are QuantizedLinear and the cast
+        // is wasted work. Only upcast when the bug path is reachable.
+        let inProjANeedsFP32 = !(inProjA is QuantizedLinear)
+            && inputs.dtype == .bfloat16
+        let b: MLXArray
+        let a: MLXArray
+        if inProjANeedsFP32 {
+            let inputsFp32 = inputs.asType(.float32)
+            b = inProjB(inputsFp32).asType(inputs.dtype)
+            a = inProjA(inputsFp32).asType(inputs.dtype)
+        } else {
+            b = inProjB(inputs)
+            a = inProjA(inputs)
+        }
 
         // Slice live conv + rec state for the active prefix. These are views.
         let (convStateSlice, recStateSlice) = cache.slice(active: B)
@@ -773,6 +779,16 @@ public class Qwen35TextModelInner: Module {
     /// true. Picked from the A/B matrix on M1 Max.
     private static let prefillEvalBatchSize = 8
 
+    /// Lazy-detected on first `fullyBatchedForward`. True iff the model
+    /// has any unquantized bf16 Linear in the hot path (mlp.gate router
+    /// for MoE variants, in_proj_a/b for GDN). These trigger MLX-Swift's
+    /// bf16⊗bf16 Metal Linear NaN bug at small output-dim tile paths.
+    /// When true, the per-layer fp32 upcast in the outer forward kicks
+    /// in (mirrors callAsFunction's :833-835). When false (pure-quant
+    /// like Qwen3.6-35B-A3B-4bit), the upcast is skipped — saves -45%
+    /// perf vs always-on (1798 vs 992 tok/s at B=64).
+    private var _needsOuterFP32Cache: Bool? = nil
+
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
 
@@ -957,44 +973,53 @@ public class Qwen35TextModelInner: Module {
         }
 
         let modelDtype = hiddenStates.dtype
-        // Selective fp32 upcast for bf16 unquantized weights — mirrors
-        // `Qwen35TextModelInner.callAsFunction`'s per-layer cast at line 833-835.
-        //
-        // Mixed-precision checkpoints (Qwen3.6-27B-UD-MLX-4bit, Qwen3.6-27B-ConfigI,
-        // Qwen3.6-35B-A3B-ConfigI) ship with the MoE router `mlp.gate` and the
-        // small linear-attn projections (`in_proj_a` / `in_proj_b`) left as
-        // unquantized bf16 Linear. MLX-Swift's Metal Linear kernel emits sparse
-        // NaN on bf16⊗bf16 matmul at certain output-dim tile paths — the
-        // per-request path side-steps it by upcasting the hidden stream to fp32
-        // before every layer, but `fullyBatchedForward` (the B>1 batched-decode
-        // hot path) was missing the same defense. Result: first decode token
-        // correct, subsequent steps NaN-collapse to argmax=0 (`!` spam) once
-        // the NaN-tainted state propagates through one round of GDN/attention.
-        // Symptom: B=1 baseline works (no NaN seeds), B>1 fails the same way.
-        //
-        // The per-DecoderLayer fullyBatchedForward already handles the bf16
-        // round-trip for GDN's fused Metal kernel (downcast for sub-call,
-        // upcast result). So passing fp32 here is correct — GDN downcasts
-        // internally, attention/MLP stay fp32, residual adds stay fp32.
-        let needsSelectiveFP32 = (modelDtype == .bfloat16)
+        // Outer per-layer fp32 upcast — only needed when the model has
+        // unquantized bf16 Linears in the hot path (mlp.gate for MoE
+        // ConfigI variants; in_proj_a/b is handled by the inner GDN
+        // upcast). Lazy-detect once on first call. Forced by
+        // VSM_QWEN35_OUTER_FP32=1, disabled by VSM_QWEN35_OUTER_FP32=0.
+        if _needsOuterFP32Cache == nil {
+            let env = ProcessInfo.processInfo.environment["VSM_QWEN35_OUTER_FP32"]
+            if env == "1" {
+                _needsOuterFP32Cache = (modelDtype == .bfloat16)
+            } else if env == "0" {
+                _needsOuterFP32Cache = false
+            } else {
+                // Auto-detect: scan layers for unquantized small Linear
+                // in the MoE router (mlp.gate). If any layer has a plain
+                // Linear (not QuantizedLinear) here while modelDtype is
+                // bf16, the bf16⊗bf16 NaN path is reachable.
+                var detected = false
+                if modelDtype == .bfloat16 {
+                    for layer in layers {
+                        if let moe = layer.mlp as? Qwen35SparseMoeBlock,
+                           !(moe.gate is QuantizedLinear) {
+                            detected = true
+                            break
+                        }
+                    }
+                }
+                _needsOuterFP32Cache = detected
+                if detected {
+                    print("[vsm] Qwen35: auto-enabling outer fp32 upcast "
+                        + "(unquantized bf16 MoE router detected)")
+                }
+            }
+        }
+        let needsOuterFP32 = _needsOuterFP32Cache!
         for (i, layer) in layers.enumerated() {
-            if needsSelectiveFP32 {
+            if needsOuterFP32 {
                 hiddenStates = hiddenStates.asType(.float32)
             }
             hiddenStates = layer.fullyBatchedForward(
                 hiddenStates, layerCache: caches.layers[i], attnMaskMode: attnMaskMode)
-            // Same defensive cast as the per-request path: quantized ops can
-            // promote bf16 → fp32 inside the lazy graph. SKIP when selective-fp32
-            // is active so attention/MLP outputs stay fp32 for the next layer.
-            if !needsSelectiveFP32 {
+            // Defensive cast for quantized op fp32 promotion in the lazy
+            // graph; skip when outer fp32 is active.
+            if !needsOuterFP32 {
                 hiddenStates = hiddenStates.asType(modelDtype)
             }
         }
-
-        // Keep norm + downstream lm_head in fp32 when selective-fp32 is active,
-        // for the same reason as the per-request path (line 884-888): the bf16
-        // lm_head matmul would otherwise re-trigger the NaN bug we just dodged.
-        if needsSelectiveFP32 { hiddenStates = hiddenStates.asType(.float32) }
+        if needsOuterFP32 { hiddenStates = hiddenStates.asType(.float32) }
         return norm(hiddenStates)
     }
 }
