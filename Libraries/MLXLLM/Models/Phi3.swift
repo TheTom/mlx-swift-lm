@@ -389,7 +389,7 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     public let model: Phi3ModelInner
-    private let args: Phi3Configuration
+    let configuration: Phi3Configuration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -397,16 +397,57 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
         self.model = Phi3ModelInner(args)
-        self.args = args
+        self.configuration = args
 
         if !args.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
     }
 
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let numLayers = configuration.hiddenLayers
+        let env = ProcessInfo.processInfo.environment
+        let enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        // TriAttention V3 — KV-cache eviction policy. Mirrors the Llama
+        // factory at MLXLLM/Models/Llama.swift. V3 owns the full cache
+        // list (one TriAttentionKVCache per layer) and is incompatible
+        // with a caller-supplied maxKVSize (which would route to the
+        // eviction-windowed StandardKVCache variant). Phi3 derives
+        // headDim from hiddenSize / attentionHeads (matches
+        // Phi3Attention.init at line 32) — no explicit `head_dim` config
+        // field on Phi3.
+        if enabled, parameters?.maxKVSize == nil {
+            let headDim = configuration.hiddenSize / configuration.attentionHeads
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: configuration.hiddenLayers,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads,
+                headDim: headDim,
+                ropeTheta: configuration.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0..<numLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+
+        // Default path — route through `makeAttentionCache` so caller-
+        // supplied `maxKVSize` picks the eviction-windowed variant.
+        // Matches the Llama/Qwen2/Qwen3 factory behavior + the
+        // `KVCacheDimensionProvider` extension default in
+        // MLXLMCommon/LanguageModel.swift.
+        return (0..<numLayers).map { _ in
+            makeAttentionCache(parameters: parameters, maxSize: parameters?.maxKVSize)
+        }
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let out = model(inputs, cache: cache)
-        if args.tieWordEmbeddings {
+        if configuration.tieWordEmbeddings {
             return model.embedTokens.asLinear(out)
         } else if let lmHead {
             return lmHead(out)
@@ -419,7 +460,7 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
     /// Batched decode: B requests with per-request per-layer caches.
     public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
         let out = model.batchedForward(inputs, caches: caches)
-        if args.tieWordEmbeddings {
+        if configuration.tieWordEmbeddings {
             return model.embedTokens.asLinear(out)
         } else if let lmHead {
             return lmHead(out)
@@ -434,7 +475,7 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
         _ inputs: MLXArray, caches: [BatchedKVCache]
     ) -> MLXArray {
         let out = model.fullyBatchedForward(inputs, caches: caches)
-        if args.tieWordEmbeddings {
+        if configuration.tieWordEmbeddings {
             return model.embedTokens.asLinear(out)
         } else if let lmHead {
             return lmHead(out)
