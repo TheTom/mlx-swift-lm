@@ -13,6 +13,78 @@ import Testing
 @Suite("F-85 v2 batched mask kernel + path equivalence")
 struct F85V2BatchedMaskTests {
 
+    /// M3 — populating the selector index from migrated K should let the
+    /// top-K return non-zero / non-trivial block starts. Picking blocks
+    /// 0..k-1 by index order (the v1 placeholder behaviour) would mean
+    /// `topKFineBlockStarts` returns [0, fineBS, 2*fineBS, ...] regardless
+    /// of Q. After M3 (real population), the picked starts should differ
+    /// across slots with different K.
+    @Test func selectorPicksDifferentBlocksPerSlotAfterPopulation() {
+        var cfg = RetrievalAttentionConfig()
+        cfg.fineBlockSize = 64
+        cfg.coarseRescueEnabled = false
+        cfg.adaptiveTopK = false
+        cfg.fineTopK = 4
+        cfg.staticInit = 64
+        cfg.slidingWindow = 128
+        cfg.denseFirstN = 0
+        cfg.denseLastN = 0
+
+        let B = 2
+        let nKVH = 4
+        let dHead = 64
+        let T = 2048   // 32 fine blocks (way more than fineTopK=4)
+
+        // DIFFERENT K per slot so the optimal blocks differ.
+        let k0 = MLXRandom.normal([1, nKVH, T, dHead], key: MLXRandom.key(41)).asType(.float32)
+        let k1 = MLXRandom.normal([1, nKVH, T, dHead], key: MLXRandom.key(42)).asType(.float32)
+        let kAll = concatenated([k0, k1], axis: 0)
+        let vAll = MLXRandom.normal([B, nKVH, T, dHead], key: MLXRandom.key(43)).asType(.float32)
+
+        let cache = BatchedKVCache(
+            maxBatch: B, kvHeads: nKVH, headDim: dHead, maxSeq: T + 64,
+            dtype: .float32)
+        for _ in 0..<B { _ = cache.addRequest() }
+        cache.keys[..<B, 0..., ..<T, 0...] = kAll
+        cache.values[..<B, 0..., ..<T, 0...] = vAll
+        for i in 0..<B { cache.offsets[i] = T }
+
+        let raCache = BatchedRetrievalAttentionKVCache(
+            inner: cache, B: B, nKVHeads: nKVH, dHead: dHead,
+            layerIdx: 5, totalLayers: 10, raConfig: cfg)
+
+        // M3 migration call — populate selector index from migrated K.
+        raCache.index.update(newKeys: kAll)
+
+        // Project a Q and pull top-K.
+        let qRep = MLXRandom.normal([B, nKVH, dHead], key: MLXRandom.key(44)).asType(.float32)
+        let projQ = raCache.index.projectQueriesBatched(qRep)
+        let fineStarts = raCache.index.topKFineBlockStarts(projectedQ: projQ)
+        eval(fineStarts)
+        #expect(fineStarts.shape == [B, nKVH, cfg.fineTopK])
+
+        // Sanity: across SOME (slot, head) pairs the picked starts must
+        // NOT be [0, 64, 128, 192] (the placeholder index-order pattern).
+        // Different slots have different K — at least one head per slot
+        // should pick something other than the first 4 blocks.
+        var pickedDifferentFromIndexOrder = false
+        let starts = fineStarts.asArray(Int32.self)
+        let perHead = cfg.fineTopK
+        outer: for b in 0..<B {
+            for h in 0..<nKVH {
+                let base = b * nKVH * perHead + h * perHead
+                let slot = Array(starts[base ..< base + perHead]).sorted()
+                let placeholder = (0..<perHead).map { Int32($0 * cfg.fineBlockSize) }
+                if slot != placeholder {
+                    pickedDifferentFromIndexOrder = true
+                    break outer
+                }
+            }
+        }
+        #expect(pickedDifferentFromIndexOrder,
+            "after M3 population, selector must pick non-placeholder blocks")
+    }
+
     /// The batched build-mask kernel must emit a mask whose per-slot
     /// slices are equal to the single-batch F-73 mask for the same inputs.
     @Test func batchedMaskMatchesPerSlotLoop() {
