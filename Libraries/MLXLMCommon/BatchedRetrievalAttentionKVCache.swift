@@ -39,6 +39,16 @@ public final class BatchedRetrievalAttentionKVCache {
     /// KV group. Built lazily on first sparseAttend.
     private var cachedHeadIdx: MLXArray?
 
+    /// F-85 v2 — env-gated kernel selection. Read once at module load.
+    /// Values:
+    ///   "f73"     (default) — F-73 batched mask kernel + MLXFast SDPA.
+    ///   "f73loop"           — Swift loop over single-batch F-73 mask + SDPA.
+    ///   "f71b"              — original v1 fused F-71b sparse SDPA.
+    public static let envBatchedKernel: String = {
+        ProcessInfo.processInfo.environment["VSM_SPARSE_BATCHED_KERNEL"]
+            ?? "f73"
+    }()
+
     public var isSparseEligible: Bool {
         raConfig.isSparseLayer(layerIdx: layerIdx, totalLayers: totalLayers)
     }
@@ -86,11 +96,10 @@ public final class BatchedRetrievalAttentionKVCache {
     ///   - scale: SDPA scale (1/sqrt(D)).
     /// - Returns: `[B, nQH, 1, D]` attention output.
     ///
-    /// Path:
-    ///   1. Slice per-(B, KV-head) representative Q via the GQA stride.
-    ///   2. Project to selector content space.
-    ///   3. Per-(B, nKVH) top-K + sorted gather list `[B, nKVH, K_padded]`.
-    ///   4. Hand off to F-71b kernel `retrievalAttentionGroupSparseSDPA`.
+    /// Dispatches by `VSM_SPARSE_BATCHED_KERNEL`:
+    /// - `f73`     (default) — F-73 batched mask kernel + MLXFast SDPA.
+    /// - `f73loop`           — Swift loop over single-batch F-73 mask + SDPA.
+    /// - `f71b`              — original v1 F-71b custom kernel.
     public func sparseAttend(
         queries: MLXArray, scale: Float
     ) -> MLXArray {
@@ -111,27 +120,102 @@ public final class BatchedRetrievalAttentionKVCache {
         precondition(nQH % nKVH == 0)
         let groupSize = nQH / nKVH
 
-        // Build rep-per-group Q indices once. shape [nKVH] ints; we reuse
-        // the same indices for every slot (Q heads laid out groupSize-contig).
+        // Build rep-per-group Q indices once.
         if cachedHeadIdx == nil {
             cachedHeadIdx = MLXArray((0..<nKVH).map { Int32($0 * groupSize) })
             eval(cachedHeadIdx!)
         }
-        // queries[:, headIdx, 0, :]  → [B, nKVH, D]
-        // queries is [B, nQH, 1, D]; squeeze L → [B, nQH, D]; take heads axis 1.
-        let qSqueezed = queries[0..., 0..., 0, 0...]  // [B, nQH, D]
-        let qRep = qSqueezed.take(cachedHeadIdx!, axis: 1).asType(.float32)
-        // [B, nKVH, D]
-        let projQ = index.projectQueriesBatched(qRep)
-        let (gather, _) = index.perKVHeadGatherBatched(projectedQ: projQ, seqLen: T)
+        let qSqueezed = queries[0..., 0..., 0, 0...]                         // [B, nQH, D]
+        let qRep = qSqueezed.take(cachedHeadIdx!, axis: 1).asType(.float32)  // [B, nKVH, D]
+        let projQ = index.projectQueriesBatched(qRep)                        // [B, nKVH, contentDim]
 
-        // F-71b kernel direct. Returns [B, nQH, 1, D] in queries.dtype.
-        return retrievalAttentionGroupSparseSDPA(
-            queries: queries,
-            keys: cachedK,
-            values: cachedV,
-            perKVHeadGather: gather,
-            scale: scale
+        let kernelChoice = BatchedRetrievalAttentionKVCache.envBatchedKernel
+        switch kernelChoice {
+        case "f71b":
+            // v1 path — F-71b custom kernel. Retained for A/B regression check.
+            let (gather, _) = index.perKVHeadGatherBatched(projectedQ: projQ, seqLen: T)
+            return retrievalAttentionGroupSparseSDPA(
+                queries: queries,
+                keys: cachedK,
+                values: cachedV,
+                perKVHeadGather: gather,
+                scale: scale
+            )
+
+        case "f73loop":
+            // Path B — Swift loop over single-batch F-73 mask + SDPA. Slow
+            // fallback for A/B vs the batched-kernel path.
+            return sparseAttendF73Loop(
+                queries: queries, projQ: projQ, K: cachedK, V: cachedV,
+                T: T, scale: scale)
+
+        default:  // "f73" + anything else
+            // Path A — single batched F-73 mask kernel + MLXFast SDPA.
+            return sparseAttendF73Batched(
+                queries: queries, projQ: projQ, K: cachedK, V: cachedV,
+                T: T, scale: scale)
+        }
+    }
+
+    /// F-85 v2 path A — one batched F-73 mask kernel launch + MLXFast SDPA.
+    private func sparseAttendF73Batched(
+        queries: MLXArray, projQ: MLXArray,
+        K: MLXArray, V: MLXArray, T: Int, scale: Float
+    ) -> MLXArray {
+        // Per-slot per-KV-head top-K block starts. Both shapes [B, nKVH, K].
+        let fineStarts = index.topKFineBlockStarts(projectedQ: projQ)
+        let coarseStarts = index.topKCoarseBlockStarts(projectedQ: projQ)
+        let mask = retrievalAttentionBuildMaskFusedBatched(
+            fineStarts: fineStarts,
+            coarseStarts: coarseStarts,
+            T: T,
+            staticInit: raConfig.staticInit,
+            slidingWindow: raConfig.slidingWindow,
+            fineBS: raConfig.fineBlockSize,
+            coarseBS: raConfig.coarseBlockSize,
+            outputDtype: K.dtype
         )
+        // mask is [B, 1, 1, T] — broadcasts over nQH and L=1.
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: K, values: V,
+            scale: scale, mask: .array(mask)
+        )
+    }
+
+    /// F-85 v2 path B — fallback. B Swift-side launches of single-batch
+    /// F-73 mask + per-slot MLXFast SDPA. Only for A/B sanity vs the
+    /// batched-kernel path; expected slower at B>1.
+    private func sparseAttendF73Loop(
+        queries: MLXArray, projQ: MLXArray,
+        K: MLXArray, V: MLXArray, T: Int, scale: Float
+    ) -> MLXArray {
+        let B = queries.dim(0)
+        let fineStarts = index.topKFineBlockStarts(projectedQ: projQ)
+        let coarseStarts = index.topKCoarseBlockStarts(projectedQ: projQ)
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(B)
+        for b in 0..<B {
+            let fineB = fineStarts[b, 0..., 0...]    // [nKVH, K_fine]
+            let coarseB = coarseStarts[b, 0..., 0...]
+            let mask = retrievalAttentionBuildMaskFused(
+                fineStarts: fineB,
+                coarseStarts: coarseB,
+                T: T,
+                staticInit: raConfig.staticInit,
+                slidingWindow: raConfig.slidingWindow,
+                fineBS: raConfig.fineBlockSize,
+                coarseBS: raConfig.coarseBlockSize,
+                outputDtype: K.dtype
+            )  // [1, 1, 1, T]
+            let qSlot = queries[b ..< (b + 1), 0..., 0..., 0...]  // [1, nQH, 1, D]
+            let kSlot = K[b ..< (b + 1), 0..., 0..., 0...]
+            let vSlot = V[b ..< (b + 1), 0..., 0..., 0...]
+            let oSlot = MLXFast.scaledDotProductAttention(
+                queries: qSlot, keys: kSlot, values: vSlot,
+                scale: scale, mask: .array(mask)
+            )
+            outputs.append(oSlot)
+        }
+        return concatenated(outputs, axis: 0)
     }
 }
