@@ -56,6 +56,17 @@ public func retrievalAttentionStep(
         && ctx.batchedIndex != nil
     {
         let qFlat = queries[0, 0..., 0, 0...]
+        // F-84 block-gather: cross-KV-head UNION of top-K positions →
+        // single 1D `take(axis: 2)` gathers [B, nKVH, k_padded, D] in
+        // one coalesced kernel. Avoids F-70's per-row `takeAlong`
+        // pitfall (no coalesce → 57 ms loss at 128 K). Targets long-ctx
+        // bandwidth ceiling: dense reads 25 GB K/V at 128 K, blockGather
+        // reads ~1.2 GB → 20× faster gather + tiny SDPA matmul.
+        if ctx.raConfig.useBlockGather {
+            return ctx.blockGatherAttend(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                qHeads: qFlat, scale: scale, offset: cache.offset)
+        }
         // F-70 per-KV-head gather is the path that ACTUALLY reduces
         // K/V bandwidth: SDPA shape collapses from [1,nQH,1,T] (~131K
         // K positions @128K) to [1,nQH,1,K_padded] (~2k positions).
