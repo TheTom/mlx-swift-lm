@@ -187,6 +187,25 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    /// Sidecar retrieval-attention overload: pass a parallel list of
+    /// `RetrievalAttentionContext?` aligned to `cache` so the dispatcher
+    /// (`attentionWithCacheUpdate`) routes through the sparse path
+    /// without needing a wrapper KV cache. `raContexts` defaults to nil;
+    /// when nil this is identical to the legacy entry point. Mirrors
+    /// the Qwen2Model / Qwen3Model / LlamaModel overload (F-83 sparse
+    /// decode).
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        raContexts: [RetrievalAttentionContext?]?
+    ) -> MLXArray {
+        let out = model(inputs, cache: cache, inputEmbeddings: nil, raContexts: raContexts)
+        if let lmHead {
+            return lmHead(out)
+        } else {
+            return model.embedTokens.asLinear(out)
+        }
+    }
+
     /// Batched decode: B requests with per-request per-layer caches.
     public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
         let out = model.batchedForward(inputs, caches: caches)
@@ -202,6 +221,24 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
         _ inputs: MLXArray, caches: [BatchedKVCache]
     ) -> MLXArray {
         let out = model.fullyBatchedForward(inputs, caches: caches)
+        if let lmHead {
+            return lmHead(out)
+        } else {
+            return model.embedTokens.asLinear(out)
+        }
+    }
+
+    /// F-85 — batched sparse decode. Pairs with
+    /// `Mistral3.ModelInner.fullyBatchedSparseForward`. ONE batched
+    /// forward call per token, per-layer attention routes through the
+    /// F-73 batched mask kernel (or F-71b via `VSM_SPARSE_BATCHED_KERNEL=f71b`)
+    /// for sparse-eligible layers. vllm-swift's `vsm_engine_decode_all`
+    /// calls here when sparse + B>1 sessions exist AND
+    /// `VSM_SPARSE_BATCHED=1`.
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        let out = model.fullyBatchedSparseForward(inputs, raCaches: raCaches)
         if let lmHead {
             return lmHead(out)
         } else {
