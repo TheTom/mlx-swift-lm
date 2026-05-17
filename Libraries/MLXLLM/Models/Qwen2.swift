@@ -154,6 +154,23 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    /// F-85 — batched sparse decode. Pairs with `Qwen2.ModelInner.
+    /// fullyBatchedSparseForward`. ONE batched forward call per token,
+    /// per-layer attention routes through F-71b sparse kernel for
+    /// sparse-eligible layers. vllm-swift's `vsm_engine_decode_all` calls
+    /// here when sparse + B>1 sessions exist AND `VSM_SPARSE_BATCHED=1`.
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        var out = model.fullyBatchedSparseForward(inputs, raCaches: raCaches)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = model.embedTokens.asLinear(out)
+        }
+        return out
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
         if configuration.tieWordEmbeddings {

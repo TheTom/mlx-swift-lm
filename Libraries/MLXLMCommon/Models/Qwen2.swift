@@ -352,6 +352,73 @@ public enum Qwen2 {
             let output = cache.attention(queries: queries, scale: scale, mask: mask)
             return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
         }
+
+        /// F-85 — batched sparse forward. Mirrors `fullyBatchedForward` but
+        /// at decode (L=1) and on sparse-eligible layers routes through
+        /// `BatchedRetrievalAttentionKVCache.sparseAttend` (F-71b kernel)
+        /// instead of dense `cache.attention`. Pairs with
+        /// `Qwen2Model.fullyBatchedSparseDecode`.
+        ///
+        /// Caveman: like fullyBatched but path go through RA when L=1 +
+        /// sparse layer. Else dense. K/V update happen via inner.update
+        /// either way.
+        public func fullyBatchedSparseForward(
+            _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+            mask: MLXArray
+        ) -> MLXArray {
+            let B = x.dim(0)
+            let L = x.dim(1)
+            let cache = raCache.inner
+
+            var queries = wq(x).reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
+            var keys = wk(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+            let values = wv(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+
+            let allSameOffset = cache.offsets[0 ..< cache.active]
+                .allSatisfy { $0 == cache.offsets[0] }
+            // Capture pre-update K (post-RoPE) for the selector index.
+            let preUpdateK: MLXArray
+            if allSameOffset {
+                let offset = cache.offsets[0]
+                queries = rope(queries, offset: offset)
+                keys = rope(keys, offset: offset)
+                preUpdateK = keys
+                cache.update(newKeys: keys, newValues: values)
+            } else {
+                // Ragged path — slot-by-slot RoPE. Not the v1 target but
+                // here for safety.
+                let qSlices = split(queries, parts: B, axis: 0)
+                let kSlices = split(keys, parts: B, axis: 0)
+                var rotQ = [MLXArray]()
+                var rotK = [MLXArray]()
+                rotQ.reserveCapacity(B)
+                rotK.reserveCapacity(B)
+                for i in 0 ..< B {
+                    let off = cache.offsets[i]
+                    rotQ.append(rope(qSlices[i], offset: off))
+                    rotK.append(rope(kSlices[i], offset: off))
+                }
+                queries = concatenated(rotQ, axis: 0)
+                keys = concatenated(rotK, axis: 0)
+                preUpdateK = keys
+                cache.update(newKeys: keys, newValues: values)
+            }
+
+            // Selector index update (skipped for L=1 per F-72; the wrapper
+            // method handles the L check).
+            raCache.updateIndex(newKeys: preUpdateK)
+
+            let output: MLXArray
+            if L == 1 && raCache.isSparseEligible {
+                // F-71b batched sparse SDPA. queries: [B, nQH, 1, D].
+                output = raCache.sparseAttend(
+                    queries: queries, scale: scale)
+            } else {
+                // Dense path — prefill chunk, dense-band layer, or L>1.
+                output = cache.attention(queries: queries, scale: scale, mask: mask)
+            }
+            return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        }
     }
 
     // MARK: - MLP
@@ -582,6 +649,21 @@ public enum Qwen2 {
             let h = x + r
             return h + mlp(postAttentionLayerNorm(h))
         }
+
+        /// F-85 — batched sparse decoder layer. Same shape as
+        /// `fullyBatchedForward` but threads through a
+        /// `BatchedRetrievalAttentionKVCache` so sparse-eligible attention
+        /// layers can route to F-71b.
+        public func fullyBatchedSparseForward(
+            _ x: MLXArray, raCache: BatchedRetrievalAttentionKVCache,
+            mask: MLXArray
+        ) -> MLXArray {
+            let normed = inputLayerNorm(x)
+            let r = attention.fullyBatchedSparseForward(
+                normed, raCache: raCache, mask: mask)
+            let h = x + r
+            return h + mlp(postAttentionLayerNorm(h))
+        }
     }
 
     // MARK: - ModelInner
@@ -667,6 +749,40 @@ public enum Qwen2 {
 
             for (i, layer) in layers.enumerated() {
                 h = layer.fullyBatchedForward(h, cache: caches[i], layerIndex: i, mask: mask)
+            }
+            return norm(h)
+        }
+
+        /// F-85 — batched sparse forward. Shared per-layer
+        /// `BatchedRetrievalAttentionKVCache`. The mask is built once from
+        /// the inner BatchedKVCache offsets (matches the dense path).
+        public func fullyBatchedSparseForward(
+            _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+        ) -> MLXArray {
+            var h = embedTokens(inputs)
+            let cache0 = raCaches[0].inner
+            let B = cache0.active
+            let cacheDtype = cache0.keys.dtype
+            let allSame = cache0.offsets[0 ..< B]
+                .allSatisfy { $0 == cache0.offsets[0] }
+            let maxPostOffset = (cache0.offsets[0 ..< B].max() ?? 0) + 1
+            let mask: MLXArray
+            if allSame {
+                mask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
+            } else {
+                let positions = MLXArray(0 ..< maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(cache0.offsets[0 ..< B].map { $0 + 1 })
+                    .reshaped(B, 1)
+                let valid = positions .< offsetsArr
+                mask = MLX.where(
+                    valid,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            }
+            for (i, layer) in layers.enumerated() {
+                h = layer.fullyBatchedSparseForward(
+                    h, raCache: raCaches[i], mask: mask)
             }
             return norm(h)
         }
