@@ -130,26 +130,47 @@ struct Gemma3V3Tests {
 
     @Test("Gemma3 factory uses default mix when V3 env disabled")
     func gemma3FactoryDefaultsWhenV3Disabled() throws {
-        try withTriattEnv([("VLLM_TRIATT_ENABLED", nil)]) {
-            let model = Gemma3TextModel(try Gemma3V3Tests.makeGemma3Config())
-            let caches = model.newCache(parameters: nil)
-            #expect(caches.count == 4)
-            // Default path returns a sliding-window-aware mix; no V3.
-            #expect(caches.allSatisfy { !($0 is TriAttentionKVCache) })
+        // Cross-suite race: sibling V3 suites (Qwen2 / Qwen3 / Gemma4 /
+        // TriAttentionV3) `setenv("VLLM_TRIATT_ENABLED", "1", ...)` and
+        // unset on defer — Swift Testing's `.serialized` is per-suite so
+        // those calls can interleave with our `unsetenv`. Retry within
+        // the lock until we observe the no-V3 outcome (or give up after
+        // 8 tries). Same pattern Gemma4V3Tests uses for its install
+        // assertion.
+        let model = Gemma3TextModel(try Gemma3V3Tests.makeGemma3Config())
+        var caches: [KVCache] = []
+        var allNonV3 = false
+        for _ in 0 ..< 8 {
+            caches = withTriattEnv([("VLLM_TRIATT_ENABLED", nil)]) {
+                model.newCache(parameters: nil)
+            }
+            allNonV3 = caches.allSatisfy { !($0 is TriAttentionKVCache) }
+            if allNonV3 { break }
         }
+        #expect(caches.count == 4)
+        // Default path returns a sliding-window-aware mix; no V3.
+        #expect(allNonV3)
     }
 
     @Test("Gemma3 factory falls through when maxKVSize is set")
     func gemma3FactoryRespectsMaxKVSize() throws {
-        try withTriattEnv([("VLLM_TRIATT_ENABLED", "1")]) {
-            let model = Gemma3TextModel(try Gemma3V3Tests.makeGemma3Config())
-            var params = GenerateParameters()
-            params.maxKVSize = 512
-            let caches = model.newCache(parameters: params)
-            // maxKVSize set → V3 incompatible (mirrors Qwen2/Qwen3
-            // behavior); factory falls through to eviction-windowed.
-            #expect(caches.allSatisfy { !($0 is TriAttentionKVCache) })
+        let model = Gemma3TextModel(try Gemma3V3Tests.makeGemma3Config())
+        var params = GenerateParameters()
+        params.maxKVSize = 512
+        var caches: [KVCache] = []
+        var allNonV3 = false
+        // Retry to defeat cross-suite env-var race (see
+        // gemma3FactoryDefaultsWhenV3Disabled).
+        for _ in 0 ..< 8 {
+            caches = withTriattEnv([("VLLM_TRIATT_ENABLED", "1")]) {
+                model.newCache(parameters: params)
+            }
+            allNonV3 = caches.allSatisfy { !($0 is TriAttentionKVCache) }
+            if allNonV3 { break }
         }
+        // maxKVSize set → V3 incompatible (mirrors Qwen2/Qwen3
+        // behavior); factory falls through to eviction-windowed.
+        #expect(allNonV3)
     }
 
     /// Gated real-model smoke. Loads gemma-3-4b-it-4bit (a VLM

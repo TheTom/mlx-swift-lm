@@ -26,19 +26,25 @@ public typealias Gemma3TextConfiguration = Gemma3.TextConfiguration
 /// Public LLM-side Gemma 3 text model. Wraps the shared
 /// `Gemma3.Backbone` with a Linear lm_head and the
 /// LLMModel-protocol-required hooks (sanitize, newCache, prepare).
-public class Gemma3TextModel: Module, LLMModel {
+public class Gemma3TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo public var model: Gemma3.Backbone
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
     public let config: Gemma3.TextConfiguration
     public var vocabularySize: Int { config.vocabularySize }
+    /// Per-layer KV head counts for KVCacheDimensionProvider — uniform
+    /// across all Gemma 3 layers (sliding and global share the same
+    /// (nKVHeads, headDim) on this family, unlike Gemma 4). Required by
+    /// vllm-swift's `BatchedSparseLLM` protocol conformance.
+    public let kvHeads: [Int]
 
     public init(_ config: Gemma3.TextConfiguration) {
         self.config = config
         self.model = Gemma3.Backbone(config)
         self._lmHead.wrappedValue = Linear(
             config.hiddenSize, config.vocabularySize, bias: false)
+        self.kvHeads = Array(repeating: config.kvHeads, count: config.hiddenLayers)
         super.init()
     }
 
@@ -46,6 +52,28 @@ public class Gemma3TextModel: Module, LLMModel {
         let optionalCache = cache?.map { $0 as KVCache? }
         let h = model(inputs, cache: optionalCache)
         return lmHead(h)
+    }
+
+    /// F-83 sidecar retrieval-attention overload — required by the
+    /// `BatchedSparseLLM` protocol in vllm-swift Bridge.swift. Gemma 3
+    /// does NOT yet wire `raContexts` through `Gemma3.Backbone`
+    /// (`callAsFunction` lacks an `raContexts:` parameter; the inner
+    /// loop's sliding/global mask routing would need to thread per-layer
+    /// context through). Per-request F-83 sparse decode therefore falls
+    /// through to dense on Gemma 3 — only the F-85 batched sparse
+    /// decode (via `fullyBatchedSparseDecode` below) engages. This stub
+    /// ignores `raContexts` and dispatches to the standard dense path so
+    /// any caller that probes the protocol (e.g. the Bridge's logging
+    /// arm) does not crash.
+    public func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        raContexts: [RetrievalAttentionContext?]?
+    ) -> MLXArray {
+        // Phase 2 scope: F-85 batched sparse decode only. F-83 per-
+        // request raContexts dispatch would require an inner-model
+        // overload + per-layer threading through the dual-mask
+        // (sliding vs global) bookkeeping. Punt to dense.
+        return callAsFunction(inputs, cache: cache)
     }
 
     /// Batched decode: B requests with per-request per-layer caches.
@@ -62,6 +90,26 @@ public class Gemma3TextModel: Module, LLMModel {
         _ inputs: MLXArray, caches: [BatchedKVCache]
     ) -> MLXArray {
         let h = model.fullyBatchedForward(inputs, caches: caches)
+        return lmHead(h)
+    }
+
+    /// F-85 — batched sparse decode. Pairs with
+    /// `Gemma3.Backbone.fullyBatchedSparseForward`. ONE batched forward
+    /// call per token; per-layer attention routes through the F-73
+    /// batched mask kernel (or F-71b via `VSM_SPARSE_BATCHED_KERNEL=f71b`)
+    /// for global (`full_attention`) layers, and through dense
+    /// `cache.attention` for sliding-window layers. vllm-swift's
+    /// `vsm_engine_decode_all` calls here when sparse + B>1 sessions
+    /// exist AND `VSM_SPARSE_BATCHED=1`.
+    ///
+    /// Per-layer cache shape contract: `raCaches[i].inner` is sized with
+    /// `[nKVHeads, headDim]` — uniform across all layers on Gemma 3
+    /// (unlike Gemma 4 where sliding `[8, 256]` and global `[2, 512]`
+    /// differ).
+    public func fullyBatchedSparseDecode(
+        _ inputs: MLXArray, raCaches: [BatchedRetrievalAttentionKVCache]
+    ) -> MLXArray {
+        let h = model.fullyBatchedSparseForward(inputs, raCaches: raCaches)
         return lmHead(h)
     }
 
