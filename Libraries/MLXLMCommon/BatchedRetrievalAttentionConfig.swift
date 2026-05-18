@@ -118,6 +118,21 @@ public struct RetrievalAttentionConfig: Sendable {
     /// out unselected positions.
     public var sparseMinContext: Int = 16384
 
+    // ----- Sparse prefill (chunked attention with L > 1)
+
+    /// F-83 — enable sparse prefill (chunked attention with prior-chunks
+    /// gather + within-chunk dense). When false, prefill falls through
+    /// to dense SDPA. Default false to keep existing behavior; opt-in
+    /// per cache (consumer can flip via `VSM_SPARSE_PREFILL=1` env or by
+    /// passing a flipped config when constructing the cache).
+    public var sparsePrefillEnabled: Bool = false
+
+    /// F-83 — minimum prior cache length (in tokens) before sparse
+    /// prefill engages. Below this, the chunk runs dense. Mirrors
+    /// `sparseMinContext` for the decode path. Default 16384 = ~2.6x
+    /// dedupe pre-budget at default config.
+    public var sparsePrefillMinContext: Int = 16384
+
     public init() {}
 
     /// Deterministic seed for the JL random projection. Same matrix

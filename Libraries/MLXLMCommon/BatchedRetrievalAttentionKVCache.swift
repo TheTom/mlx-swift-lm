@@ -49,6 +49,15 @@ public final class BatchedRetrievalAttentionKVCache {
             ?? "mask"
     }()
 
+    /// Env override for the prefill sparse path. When set to `1`, the
+    /// per-family `fullyBatchedSparsePrefill` hook engages the
+    /// `prefillSparseAttend` branch for L>1 chunks (subject to the
+    /// `sparsePrefillMinContext` threshold + sparse-eligible layer band).
+    /// Default off — opt-in. Mirrors the decode-side knob in the bridge.
+    public static let envSparsePrefillEnabled: Bool = {
+        ProcessInfo.processInfo.environment["VSM_SPARSE_PREFILL"] == "1"
+    }()
+
     public var isSparseEligible: Bool {
         raConfig.isSparseLayer(layerIdx: layerIdx, totalLayers: totalLayers)
     }
@@ -235,5 +244,184 @@ public final class BatchedRetrievalAttentionKVCache {
             queries: queries, keys: kSmall, values: vSmall,
             scale: scale, mask: .none
         )
+    }
+
+    // MARK: - F-83 sparse PREFILL (chunked attention, L > 1)
+
+    /// Sparse attend for a chunk of L queries (L > 1) — the prefill path.
+    ///
+    /// Called from the model's `fullyBatchedSparsePrefill` hook when:
+    ///   - L > 1 (prefill chunk)
+    ///   - the layer is sparse-eligible
+    ///   - `raConfig.sparsePrefillEnabled` is true (or env override set)
+    ///   - the prior cache length exceeds `sparsePrefillMinContext`
+    ///
+    /// Pipeline (per slot):
+    ///   1. Project chunk Q via the L-aware selector → union top-K
+    ///      fine + coarse block starts (max-pooled across L queries
+    ///      per KV head — NSA GQA pattern).
+    ///   2. Combine with static prefix + sliding window, clip to prior
+    ///      cache length, dedupe per slot. Duplicates in SDPA's K dim
+    ///      silently double-count rows through softmax — dedupe is
+    ///      load-bearing for correctness.
+    ///   3. Gather prior K/V at those positions; concat with the chunk's
+    ///      own K/V tail; run ONE MLXFast.SDPA with a `[L, P+L]` mask:
+    ///      prior cols = 0 (attend, all positions < chunk_start so
+    ///      causally safe), chunk cols = lower-triangular causal.
+    ///
+    /// Caller has ALREADY written the chunk's K/V into `inner` and
+    /// updated the selector index via `updateIndex(newKeys:)`. The
+    /// cache offsets already reflect the chunk being written —
+    /// `inner.offsets[i]` is the post-chunk length for slot i.
+    ///
+    /// - Parameters:
+    ///   - queries: `[B, nQH, L, D]` post-RoPE queries.
+    ///   - scale: SDPA scale (typically `1/sqrt(D)`).
+    /// - Returns: `[B, nQH, L, D]` attention output.
+    public func prefillSparseAttend(
+        queries: MLXArray, scale: Float
+    ) -> MLXArray {
+        precondition(queries.shape.count == 4,
+            "queries must be [B, nQH, L, D]")
+        let B = queries.dim(0)
+        let nQH = queries.dim(1)
+        let L = queries.dim(2)
+        precondition(L > 1,
+            "prefillSparseAttend requires L > 1; use sparseAttend at decode")
+        precondition(B == index.B, "B mismatch")
+
+        // Pull rectangular cache state — same assumption as `sparseAttend`.
+        let off = inner.offsets[0]
+        precondition(off >= L,
+            "inner offset (\(off)) must include the chunk (L=\(L)) — caller " +
+            "must write K/V before invoking prefillSparseAttend")
+        let cachedK = inner.keys[..<B, 0..., ..<off, 0...]
+        let cachedV = inner.values[..<B, 0..., ..<off, 0...]
+        let nKVH = cachedK.dim(1)
+        let priorLen = off - L
+
+        // Fast path: nothing to gather. Run dense causal chunk-against-chunk.
+        // Caller normally avoids this via the `sparsePrefillMinContext` gate.
+        if priorLen <= 0 {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: cachedK, values: cachedV,
+                scale: scale, mask: .causal)
+        }
+
+        precondition(nQH % nKVH == 0,
+            "Q heads (\(nQH)) must be a multiple of KV heads (\(nKVH))")
+        let groupSize = nQH / nKVH
+
+        // Build rep-per-group Q indices (lazy + reused across calls — same
+        // pattern as `sparseAttend`).
+        if cachedHeadIdx == nil {
+            cachedHeadIdx = MLXArray((0..<nKVH).map { Int32($0 * groupSize) })
+            eval(cachedHeadIdx!)
+        }
+
+        // [B, nQH, L, D] → take rep-per-KV-group → [B, nKVH, L, D]
+        let qStacked = queries.take(cachedHeadIdx!, axis: 1).asType(.float32)
+        let qProjL = index.projectQueriesBatchedL(qStacked)
+        let fineStarts = index.topKFineBlockStartsUnionL(projectedQL: qProjL)
+        let coarseStarts = index.topKCoarseBlockStartsUnionL(projectedQL: qProjL)
+
+        // Static + sliding ranges are shared across slots (rectangular T).
+        let staticEnd = min(raConfig.staticInit, priorLen)
+        let slidingStart = max(0, priorLen - raConfig.slidingWindow)
+        var staticSliding: [Int32] = []
+        staticSliding.reserveCapacity(staticEnd + (priorLen - slidingStart))
+        if staticEnd > 0 {
+            for p in 0..<staticEnd { staticSliding.append(Int32(p)) }
+        }
+        if slidingStart < priorLen {
+            for p in slidingStart..<priorLen { staticSliding.append(Int32(p)) }
+        }
+
+        let fineBS = raConfig.fineBlockSize
+        let coarseBS = raConfig.coarseBlockSize
+        let kFine = fineStarts.dim(2)
+        let kCoarse = coarseStarts.dim(2)
+
+        // Pull selector picks to CPU once per layer per chunk. CPU dedupe
+        // + sort is on the order of (nKVH × kFine × fineBS) ints per slot
+        // — tens of thousands per layer per chunk, negligible vs gather +
+        // SDPA wall-clock at long context.
+        let fineCpu = fineStarts.asArray(Int32.self)        // [B*nKVH*kFine]
+        let coarseCpu = raConfig.coarseRescueEnabled
+            ? coarseStarts.asArray(Int32.self) : [Int32]()  // [B*nKVH*kCoarse]
+        let outputDtype = queries.dtype
+
+        // Within-chunk causal mask is shared across slots.
+        let neginf: Float = -.infinity
+        let iRow = MLXArray(0..<Int32(L)).reshaped(L, 1)
+        let iCol = MLXArray(0..<Int32(L)).reshaped(1, L)
+        let chunkMaskTemplate = MLX.where(
+            iCol .<= iRow,
+            MLXArray(Float(0)),
+            MLXArray(neginf)
+        ).asType(outputDtype)  // [L, L]
+
+        var perSlotOutputs: [MLXArray] = []
+        perSlotOutputs.reserveCapacity(B)
+        for slot in 0..<B {
+            var union = Set<Int32>(staticSliding)
+            // Cross-head fine union for this slot.
+            let fineBase = slot * nKVH * kFine
+            for h in 0..<nKVH {
+                let hBase = fineBase + h * kFine
+                for kk in 0..<kFine {
+                    let start = fineCpu[hBase + kk]
+                    if start < 0 { continue }
+                    let startI = Int(start)
+                    let endExc = min(startI + fineBS, priorLen)
+                    if endExc <= 0 { continue }
+                    let s = max(0, startI)
+                    for p in s..<endExc { union.insert(Int32(p)) }
+                }
+            }
+            if raConfig.coarseRescueEnabled {
+                let coarseBase = slot * nKVH * kCoarse
+                for h in 0..<nKVH {
+                    let hBase = coarseBase + h * kCoarse
+                    for kk in 0..<kCoarse {
+                        let start = coarseCpu[hBase + kk]
+                        if start < 0 { continue }
+                        let startI = Int(start)
+                        let endExc = min(startI + coarseBS, priorLen)
+                        if endExc <= 0 { continue }
+                        let s = max(0, startI)
+                        for p in s..<endExc { union.insert(Int32(p)) }
+                    }
+                }
+            }
+
+            // Sort + materialize positions tensor.
+            let positions = union.sorted()
+            let P = positions.count
+            let posArr = MLXArray(positions)
+
+            // Gather prior K/V at `positions`; concat with chunk's own.
+            let priorK = cachedK[slot ..< (slot + 1), 0..., ..<priorLen, 0...]
+            let priorV = cachedV[slot ..< (slot + 1), 0..., ..<priorLen, 0...]
+            let gK = priorK.take(posArr, axis: 2)            // [1, nKVH, P, D]
+            let gV = priorV.take(posArr, axis: 2)
+            let chunkK = cachedK[slot ..< (slot + 1), 0..., priorLen..., 0...]
+            let chunkV = cachedV[slot ..< (slot + 1), 0..., priorLen..., 0...]
+            let combinedK = concatenated([gK, chunkK], axis: 2)  // [1, nKVH, P+L, D]
+            let combinedV = concatenated([gV, chunkV], axis: 2)
+
+            // Combined mask [1, 1, L, P+L]: prior all-zero, chunk causal.
+            let priorMask = MLXArray.zeros([L, P], dtype: outputDtype)
+            let combinedMask = concatenated(
+                [priorMask, chunkMaskTemplate], axis: 1
+            ).reshaped(1, 1, L, P + L)
+            let qSlot = queries[slot ..< (slot + 1), 0..., 0..., 0...]
+            let oSlot = MLXFast.scaledDotProductAttention(
+                queries: qSlot, keys: combinedK, values: combinedV,
+                scale: scale, mask: .array(combinedMask)
+            )
+            perSlotOutputs.append(oSlot)
+        }
+        return concatenated(perSlotOutputs, axis: 0)
     }
 }
