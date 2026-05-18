@@ -85,6 +85,23 @@ The mask-kernel default depends on Apple's `sdpa_vector_2pass` Metal kernel runn
 
 The bridge (downstream) sets `MLX_SDPA_BLOCKS=128` at engine-create time. Setting the env BEFORE `python` invokes is preferable to setting it from Swift (PSO JIT timing) but both work; the difference is the first-call warmup window.
 
+## Legacy retirement
+
+The fork carried a single-stream sparse decode path (`RetrievalAttentionKVCache`,
+B=1 wrapper) plus a B≥1 batched cache (`BatchedRetrievalAttentionKVCache`,
+this PR). Both share the same selector + mask kernel. With the batched cache
+handling B=1 correctly (see `Qwen2BatchedSparseB1Tests`), the single-stream
+wrapper is redundant and is not proposed for upstreaming. Memory cost at
+B=1 long-context single-stream is `O(maxSeq)` rectangular preallocation —
+equivalent to the wrapper's dynamic-concat cost when `maxSeq` is sized to
+actual context. One cache, one selector, one mask kernel covers all batch
+sizes.
+
+Failed exploration paths (F-71b custom Metal sparse SDPA kernel at B=8 was
+14× slower than dense; F-76 implicit sparse was slower than dense at 128K;
+F-84 blockGather lost 1.3× at B=1) are documented in the project's research
+notes and not proposed for upstreaming.
+
 ## Open
 
 - **vllm-swift bridge dispatch** — wiring up `BatchedSparseLLM` / `BatchedHybridSparseLLM` casting in the engine's `decode_step` lives in the downstream `vllm-swift` consumer, NOT this repo.
