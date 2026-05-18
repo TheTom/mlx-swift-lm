@@ -14,15 +14,20 @@ import MLXNN
 
 extension Qwen2.Attention {
 
-    /// Batched sparse forward for a single decode step (L=1). The caller
-    /// passes a per-layer `BatchedRetrievalAttentionKVCache` whose inner
-    /// `BatchedKVCache` already has B slots reserved (via `addRequest()`)
-    /// and whose offsets reflect prefill completion.
+    /// Batched sparse forward for a chunk of L queries (L >= 1) — handles
+    /// both prefill chunks AND decode steps. The caller passes a per-layer
+    /// `BatchedRetrievalAttentionKVCache` whose inner `BatchedKVCache` has
+    /// B slots reserved and whose offsets reflect prior completion.
     ///
-    /// Cache update writes post-RoPE K/V into the rectangular buffer; the
-    /// selector index gets fed the post-RoPE K (skipped at L=1 — sliding
-    /// window covers decode positions). Then either dense `getCachedWithMask`
-    /// + MLXFast.SDPA or `raCache.sparseAttend` depending on layer eligibility.
+    /// Dispatch:
+    ///   - L = 1: decode-step semantics — write K/V via `cache.update`
+    ///     (advances offsets by 1), then `raCache.sparseAttend` for
+    ///     sparse-eligible layers or dense fall-through.
+    ///   - L > 1 + sparse-eligible + `sparsePrefillEnabled` (or env knob)
+    ///     + priorLen > `sparsePrefillMinContext`: prefill-sparse via
+    ///     `cache.updateChunk` (advances offsets by L), selector index
+    ///     update, then `raCache.prefillSparseAttend`.
+    ///   - L > 1 otherwise: dense via `cache.updateChunk` + `getCachedWithMask`.
     public func fullyBatchedSparseForward(
         _ x: MLXArray,
         raCache: BatchedRetrievalAttentionKVCache
@@ -37,7 +42,7 @@ extension Qwen2.Attention {
         let values = wv(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
 
         // RoPE — fast path when all slots share the same offset (the
-        // common steady-state decode case).
+        // common steady-state case, including rectangular prefill).
         let allSameOffset = cache.offsets[0 ..< cache.active]
             .allSatisfy { $0 == cache.offsets[0] }
         let preUpdateK: MLXArray
@@ -46,7 +51,6 @@ extension Qwen2.Attention {
             queries = rope(queries, offset: offset)
             keys = rope(keys, offset: offset)
             preUpdateK = keys
-            cache.update(newKeys: keys, newValues: values)
         } else {
             // Ragged slot offsets — slot-by-slot RoPE then re-stack.
             let qSlices = split(queries, parts: B, axis: 0)
@@ -63,17 +67,43 @@ extension Qwen2.Attention {
             queries = concatenated(rotQ, axis: 0)
             keys = concatenated(rotK, axis: 0)
             preUpdateK = keys
-            cache.update(newKeys: keys, newValues: values)
         }
 
-        // Feed selector index (skipped at L=1; sliding window covers it).
+        // Cache update — L=1 uses the decode-step write; L>1 uses the
+        // prefill-chunk write (advances offsets by L, vectorized across B).
+        if L == 1 {
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            cache.updateChunk(newKeys: keys, newValues: values)
+        }
+
+        // Feed selector index. L=1 decode tokens are covered by the
+        // sliding window — skipped. L>1 prefill chunks populate the
+        // block-feature buffer in bulk.
         raCache.updateIndex(newKeys: preUpdateK)
+
+        // Sparse-prefill gate. Engages when:
+        //   - L > 1 (prefill chunk)
+        //   - layer is in the sparse band
+        //   - sparsePrefillEnabled OR env override
+        //   - priorLen exceeds sparsePrefillMinContext threshold
+        let priorLen = cache.offsets[0] - L
+        let sparsePrefillOn = raCache.raConfig.sparsePrefillEnabled
+            || BatchedRetrievalAttentionKVCache.envSparsePrefillEnabled
+        let canSparsePrefill = L > 1
+            && raCache.isSparseEligible
+            && sparsePrefillOn
+            && priorLen > raCache.raConfig.sparsePrefillMinContext
 
         let output: MLXArray
         if L == 1 && raCache.isSparseEligible {
+            // Decode-step sparse.
             output = raCache.sparseAttend(queries: queries, scale: scale)
+        } else if canSparsePrefill {
+            // Prefill-chunk sparse.
+            output = raCache.prefillSparseAttend(queries: queries, scale: scale)
         } else {
-            // Dense path — prefill chunk or dense-band layer.
+            // Dense path — short prefill, dense-band layer, or sparse-prefill off.
             let (k, v, mask) = cache.getCachedWithMask()
             output = MLXFast.scaledDotProductAttention(
                 queries: queries, keys: k, values: v,
