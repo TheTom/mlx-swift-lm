@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the mlx-swift-lm project
 //
-// Batched sparse decode hooks for the shared Mistral 3 / Ministral 3 layer
-// stack. Llama-style attention with two specifics:
+// Batched sparse decode + prefill hooks for the shared Mistral 3 /
+// Ministral 3 layer stack. Llama-style attention with two specifics:
 //   1. Llama-4 attention scaling: caller passes a pre-computed `attnScale`
 //      tensor (computed once per forward in ModelInner), multiplied into the
 //      post-RoPE queries.
@@ -17,10 +17,11 @@ import MLXNN
 
 extension Mistral3.Attention {
 
-    /// Batched sparse forward for a single decode step. Takes the
-    /// pre-computed Llama-4 `attnScale` tensor — caller (ModelInner) is
-    /// responsible for either computing it from the rope params or passing
-    /// a constant-1 tensor when the model isn't Llama-4-scaled.
+    /// Batched sparse forward for a chunk of L queries (L >= 1) — handles
+    /// both decode steps and prefill chunks. Takes the pre-computed
+    /// Llama-4 `attnScale` tensor — caller (ModelInner) is responsible
+    /// for either computing it from the rope params or passing a
+    /// constant-1 tensor when the model isn't Llama-4-scaled.
     public func fullyBatchedSparseForward(
         _ x: MLXArray,
         attnScale: MLXArray,
@@ -47,7 +48,6 @@ extension Mistral3.Attention {
             keys = rope(keys, offset: offset)
             queries = queries * attnScale
             preUpdateK = keys
-            cache.update(newKeys: keys, newValues: values)
         } else {
             let qSlices = split(queries, parts: B, axis: 0)
             let kSlices = split(keys, parts: B, axis: 0)
@@ -63,14 +63,31 @@ extension Mistral3.Attention {
             queries = concatenated(rotQ, axis: 0) * attnScale
             keys = concatenated(rotK, axis: 0)
             preUpdateK = keys
+        }
+
+        // Cache update — L=1 decode-write; L>1 prefill-chunk write.
+        if L == 1 {
             cache.update(newKeys: keys, newValues: values)
+        } else {
+            cache.updateChunk(newKeys: keys, newValues: values)
         }
 
         raCache.updateIndex(newKeys: preUpdateK)
 
+        // Sparse-prefill gate (mirrors Qwen2+Sparse).
+        let priorLen = cache.offsets[0] - L
+        let sparsePrefillOn = raCache.raConfig.sparsePrefillEnabled
+            || BatchedRetrievalAttentionKVCache.envSparsePrefillEnabled
+        let canSparsePrefill = L > 1
+            && raCache.isSparseEligible
+            && sparsePrefillOn
+            && priorLen > raCache.raConfig.sparsePrefillMinContext
+
         let output: MLXArray
         if L == 1 && raCache.isSparseEligible {
             output = raCache.sparseAttend(queries: queries, scale: scale)
+        } else if canSparsePrefill {
+            output = raCache.prefillSparseAttend(queries: queries, scale: scale)
         } else {
             let (k, v, mask) = cache.getCachedWithMask()
             output = MLXFast.scaledDotProductAttention(

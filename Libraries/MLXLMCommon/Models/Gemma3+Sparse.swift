@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the mlx-swift-lm project
 //
-// Batched sparse decode hooks for the shared Gemma 3 layer stack.
+// Batched sparse decode + prefill hooks for the shared Gemma 3 layer stack.
 // Gemma 3 specifics:
 //   - Q/K RMSNorm applied AFTER the [B, H, L, D] transpose, BEFORE RoPE.
 //   - Sliding-window vs global attention alternate per `slidingWindowPattern`
@@ -18,6 +18,9 @@ import MLXNN
 
 extension Gemma3.Attention {
 
+    /// Batched sparse forward for a chunk of L queries (L >= 1) — handles
+    /// both decode steps and prefill chunks. At L>1 dispatches to
+    /// `prefillSparseAttend` when sparse-prefill is enabled.
     public func fullyBatchedSparseForward(
         _ x: MLXArray,
         raCache: BatchedRetrievalAttentionKVCache
@@ -46,7 +49,6 @@ extension Gemma3.Attention {
             queries = rope(queries, offset: offset)
             keys = rope(keys, offset: offset)
             preUpdateK = keys
-            cache.update(newKeys: keys, newValues: values)
         } else {
             let qSlices = split(queries, parts: B, axis: 0)
             let kSlices = split(keys, parts: B, axis: 0)
@@ -62,14 +64,31 @@ extension Gemma3.Attention {
             queries = concatenated(rotQ, axis: 0)
             keys = concatenated(rotK, axis: 0)
             preUpdateK = keys
+        }
+
+        // Cache update — L=1 decode-write; L>1 prefill-chunk write.
+        if L == 1 {
             cache.update(newKeys: keys, newValues: values)
+        } else {
+            cache.updateChunk(newKeys: keys, newValues: values)
         }
 
         raCache.updateIndex(newKeys: preUpdateK)
 
+        // Sparse-prefill gate (mirrors Qwen2+Sparse).
+        let priorLen = cache.offsets[0] - L
+        let sparsePrefillOn = raCache.raConfig.sparsePrefillEnabled
+            || BatchedRetrievalAttentionKVCache.envSparsePrefillEnabled
+        let canSparsePrefill = L > 1
+            && raCache.isSparseEligible
+            && sparsePrefillOn
+            && priorLen > raCache.raConfig.sparsePrefillMinContext
+
         let output: MLXArray
         if L == 1 && raCache.isSparseEligible {
             output = raCache.sparseAttend(queries: queries, scale: scale)
+        } else if canSparsePrefill {
+            output = raCache.prefillSparseAttend(queries: queries, scale: scale)
         } else {
             let (k, v, mask) = cache.getCachedWithMask()
             output = MLXFast.scaledDotProductAttention(

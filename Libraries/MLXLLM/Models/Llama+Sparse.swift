@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the mlx-swift-lm project
 //
-// Batched sparse decode hooks for Llama (and Mistral, which shares the
-// model type). Mirrors Qwen2 — no Q/K norm, simpler than Qwen3.
+// Batched sparse decode + prefill hooks for Llama (and Mistral, which
+// shares the model type). Mirrors Qwen2 — no Q/K norm, simpler than
+// Qwen3.
 
 import Foundation
 import MLX
@@ -11,6 +12,10 @@ import MLXNN
 
 extension LlamaAttention {
 
+    /// Batched sparse forward for a chunk of L queries (L >= 1) — handles
+    /// both decode steps (L=1) and prefill chunks (L>1). At L>1 dispatches
+    /// to `prefillSparseAttend` when sparse-prefill is enabled and the
+    /// prior context exceeds `sparsePrefillMinContext`.
     public func fullyBatchedSparseForward(
         _ x: MLXArray,
         raCache: BatchedRetrievalAttentionKVCache,
@@ -28,7 +33,7 @@ extension LlamaAttention {
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        // RoPE + cache update — RoPELayer supports `(x, offset: Int)`.
+        // RoPE — fast/slow path on offset uniformity.
         let allSameOffset = cache.offsets[0 ..< cache.active]
             .allSatisfy { $0 == cache.offsets[0] }
         let preUpdateK: MLXArray
@@ -37,7 +42,6 @@ extension LlamaAttention {
             queries = rope(queries, offset: offset)
             keys = rope(keys, offset: offset)
             preUpdateK = keys
-            cache.update(newKeys: keys, newValues: values)
         } else {
             let qSlices = split(queries, parts: B, axis: 0)
             let kSlices = split(keys, parts: B, axis: 0)
@@ -53,14 +57,31 @@ extension LlamaAttention {
             queries = concatenated(rotQ, axis: 0)
             keys = concatenated(rotK, axis: 0)
             preUpdateK = keys
+        }
+
+        // Cache update — L=1 decode-write; L>1 prefill-chunk write.
+        if L == 1 {
             cache.update(newKeys: keys, newValues: values)
+        } else {
+            cache.updateChunk(newKeys: keys, newValues: values)
         }
 
         raCache.updateIndex(newKeys: preUpdateK)
 
+        // Sparse-prefill gate (mirrors Qwen2+Sparse).
+        let priorLen = cache.offsets[0] - L
+        let sparsePrefillOn = raCache.raConfig.sparsePrefillEnabled
+            || BatchedRetrievalAttentionKVCache.envSparsePrefillEnabled
+        let canSparsePrefill = L > 1
+            && raCache.isSparseEligible
+            && sparsePrefillOn
+            && priorLen > raCache.raConfig.sparsePrefillMinContext
+
         let output: MLXArray
         if L == 1 && raCache.isSparseEligible {
             output = raCache.sparseAttend(queries: queries, scale: scale)
+        } else if canSparsePrefill {
+            output = raCache.prefillSparseAttend(queries: queries, scale: scale)
         } else {
             let (k, v, mask) = cache.getCachedWithMask()
             output = MLXFast.scaledDotProductAttention(
