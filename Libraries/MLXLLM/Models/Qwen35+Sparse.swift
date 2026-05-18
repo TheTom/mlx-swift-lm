@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the mlx-swift-lm project
 //
-// Batched sparse decode hooks for the Qwen 3.5 / Qwen 3.6 hybrid family
-// (attention + GatedDeltaNet). Per-layer-type dispatch routes attention
-// layers through `BatchedRetrievalAttentionKVCache.sparseAttend` at L=1
-// while GDN layers stay on the existing batched GDN path.
+// Batched sparse decode + prefill hooks for the Qwen 3.5 / Qwen 3.6
+// hybrid family (attention + GatedDeltaNet). Per-layer-type dispatch
+// routes attention layers through `BatchedRetrievalAttentionKVCache`
+// (sparseAttend at L=1 decode, prefillSparseAttend at L>1 prefill —
+// the latter only for sparse-eligible layers when sparsePrefillEnabled).
+// GDN layers stay on the existing batched GDN path for both decode and
+// prefill — sparse prefill only applies to attention layers.
 //
 // Conformance lands on `Qwen35TextModel`, which is also the base class
 // for the MoE variant (`Qwen35MoEModel`) — both checkpoints share the
@@ -18,11 +21,14 @@ import MLXNN
 extension Qwen35Attention {
 
     /// Batched sparse forward over `BatchedRetrievalAttentionKVCache`.
+    /// Handles both decode steps (L=1) and prefill chunks (L>1). At L>1
+    /// dispatches to `prefillSparseAttend` when sparse-prefill is enabled.
+    ///
     /// Preserves the Qwen 3.5 gated-Q split (q_proj outputs 2× heads —
     /// queries + gate, then sigmoid-multiplied at the output projection).
     /// Q/K RMSNorm is applied pre-RoPE on the per-head views.
     /// `denseMask` is used only on the dense fallback (prefill chunks /
-    /// dense-band layers); sparse decode builds its own per-slot mask.
+    /// dense-band layers); sparse decode/prefill builds its own per-slot mask.
     public func fullyBatchedSparseForward(
         _ x: MLXArray,
         raCache: BatchedRetrievalAttentionKVCache,
@@ -54,7 +60,6 @@ extension Qwen35Attention {
             queries = rope(queries, offset: offset)
             keys = rope(keys, offset: offset)
             preUpdateK = keys
-            cache.update(newKeys: keys, newValues: values)
         } else {
             let qSlices = MLX.split(queries, parts: B, axis: 0)
             let kSlices = MLX.split(keys, parts: B, axis: 0)
@@ -70,14 +75,31 @@ extension Qwen35Attention {
             queries = concatenated(rotQ, axis: 0)
             keys = concatenated(rotK, axis: 0)
             preUpdateK = keys
+        }
+
+        // Cache update — L=1 decode-write; L>1 prefill-chunk write.
+        if L == 1 {
             cache.update(newKeys: keys, newValues: values)
+        } else {
+            cache.updateChunk(newKeys: keys, newValues: values)
         }
 
         raCache.updateIndex(newKeys: preUpdateK)
 
+        // Sparse-prefill gate (mirrors Qwen2+Sparse).
+        let priorLen = cache.offsets[0] - L
+        let sparsePrefillOn = raCache.raConfig.sparsePrefillEnabled
+            || BatchedRetrievalAttentionKVCache.envSparsePrefillEnabled
+        let canSparsePrefill = L > 1
+            && raCache.isSparseEligible
+            && sparsePrefillOn
+            && priorLen > raCache.raConfig.sparsePrefillMinContext
+
         let output: MLXArray
         if L == 1 && raCache.isSparseEligible {
             output = raCache.sparseAttend(queries: queries, scale: scale)
+        } else if canSparsePrefill {
+            output = raCache.prefillSparseAttend(queries: queries, scale: scale)
         } else {
             let maxOffset = cache.offsets[0..<cache.active].max() ?? 0
             let allK = cache.keys[..<cache.active, 0..., ..<maxOffset, 0...]

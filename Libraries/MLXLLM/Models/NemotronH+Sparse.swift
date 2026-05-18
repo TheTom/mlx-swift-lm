@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the mlx-swift-lm project
 //
-// Batched sparse decode hooks for the NemotronH hybrid family. NemotronH
+// Batched sparse decode + prefill hooks for the NemotronH hybrid family. NemotronH
 // interleaves four block kinds via the `hybridOverridePattern` string:
 //   - 'M' → Mamba2 mixer (selective-SSM; per-slot conv + recurrent state)
 //   - '*' → attention (RoPE-free, no Q/K norm — Llama-style stripped)
@@ -36,7 +36,9 @@ extension NemotronHAttention {
 
     /// Llama-style batched sparse forward — no RoPE, no Q/K norm.
     /// Mirrors `LlamaAttention.fullyBatchedSparseForward` minus the
-    /// RoPE rotations.
+    /// RoPE rotations. Handles both decode steps (L=1) and prefill
+    /// chunks (L>1). At L>1 dispatches to `prefillSparseAttend` when
+    /// sparse-prefill is enabled.
     public func fullyBatchedSparseForward(
         _ x: MLXArray,
         raCache: BatchedRetrievalAttentionKVCache
@@ -51,12 +53,27 @@ extension NemotronHAttention {
 
         // No RoPE on NemotronH attention; cache update + index update sit
         // directly on the projected K / V.
-        cache.update(newKeys: keys, newValues: values)
+        if L == 1 {
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            cache.updateChunk(newKeys: keys, newValues: values)
+        }
         raCache.updateIndex(newKeys: keys)
+
+        // Sparse-prefill gate (mirrors Qwen2+Sparse).
+        let priorLen = cache.offsets[0] - L
+        let sparsePrefillOn = raCache.raConfig.sparsePrefillEnabled
+            || BatchedRetrievalAttentionKVCache.envSparsePrefillEnabled
+        let canSparsePrefill = L > 1
+            && raCache.isSparseEligible
+            && sparsePrefillOn
+            && priorLen > raCache.raConfig.sparsePrefillMinContext
 
         let output: MLXArray
         if L == 1 && raCache.isSparseEligible {
             output = raCache.sparseAttend(queries: queries, scale: scale)
+        } else if canSparsePrefill {
+            output = raCache.prefillSparseAttend(queries: queries, scale: scale)
         } else {
             let (k, v, mask) = cache.getCachedWithMask()
             output = MLXFast.scaledDotProductAttention(
