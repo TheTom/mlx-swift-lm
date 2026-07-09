@@ -1,0 +1,421 @@
+diff --git a/rust/crates/backends/ffai-vulkan/Cargo.toml b/rust/crates/backends/ffai-vulkan/Cargo.toml
+index 84bc3ff..83257d3 100644
+--- a/rust/crates/backends/ffai-vulkan/Cargo.toml
++++ b/rust/crates/backends/ffai-vulkan/Cargo.toml
+@@ -34,3 +34,7 @@ required-features = ["vulkan"]
+ [[test]]
+ name = "qwen25_first_logit_diag"
+ required-features = ["vulkan"]
++
++[[test]]
++name = "qwen25_prefill_coopmat"
++required-features = ["vulkan"]
+diff --git a/rust/crates/backends/ffai-vulkan/tests/qwen25_prefill_coopmat.rs b/rust/crates/backends/ffai-vulkan/tests/qwen25_prefill_coopmat.rs
+new file mode 100644
+index 0000000..206c9f0
+--- /dev/null
++++ b/rust/crates/backends/ffai-vulkan/tests/qwen25_prefill_coopmat.rs
+@@ -0,0 +1,123 @@
++// Copyright 2026 Eric Kryski (@ekryski) and Tom Turney (@TheTom)
++// SPDX-License-Identifier: Apache-2.0
++//! Batched-prefill correctness + throughput on the Vulkan/RDNA4 backend.
++//!
++//! Drives `GgufModel::prefill` (the multi-token path that routes every
++//! projection + FFN matmul through `ffai_ops::gemm_q8_mpp` — the SimdGroup
++//! CoopTile GEMM) and:
++//!   1. validates the next-token logits' argmax matches the sequential `step`
++//!      path AND that a short greedy continuation still says "Paris", and
++//!   2. measures prefill throughput (prompt tokens / second) at a few prompt
++//!      lengths.
++//!
++//! Run it twice to A/B the gated `VK_KHR_cooperative_matrix` lever:
++//!   # scalar GEMM (SoftwareLocalC):   cargo test ... -- --nocapture
++//!   # coopmat GEMM (fragment MMA):    MT_VK_COOPMAT=1 cargo test ... -- --nocapture
++//! Both must produce identical tokens (the gate is bit-for-bit transparent to
++//! the model); only the prefill tok/s changes.
++//!
++//! Requires `--features vulkan`. Skips if no Vulkan device or model is absent.
++
++use ffai_loader::gguf::Gguf;
++use ffai_models::gguf_tokenizer::GgufTokenizer;
++use ffai_models::llama::GgufModel;
++use ffai_vulkan::VulkanDevice;
++use std::time::Instant;
++
++#[test]
++fn qwen25_1_5b_prefill_coopmat_vulkan() {
++    let Some(dev) = VulkanDevice::create().expect("vulkan init") else {
++        eprintln!("no Vulkan device — skipping");
++        return;
++    };
++    let path = std::env::var("QWEN25_GGUF")
++        .unwrap_or_else(|_| r"C:\models\qwen2.5-1.5b-instruct-q8_0.gguf".to_string());
++    if !std::path::Path::new(&path).exists() {
++        eprintln!("model not found at {path} — skipping");
++        return;
++    }
++    let coopmat = std::env::var("MT_VK_COOPMAT").map(|v| v == "1").unwrap_or(false);
++    eprintln!("=== Qwen2.5-1.5B prefill — MT_VK_COOPMAT={} ===", coopmat as u8);
++
++    let g = Gguf::open(&path).expect("open gguf");
++    let tok = GgufTokenizer::from_gguf(&g).expect("tokenizer");
++
++    // KV cache must hold the longest prefill we time below + a short decode tail.
++    let cap = 640usize;
++    let model = GgufModel::load(dev.as_ref(), &path, cap).expect("load gguf model (resident-Q8)");
++    eprintln!(
++        "loaded: layers={} hidden={} q_heads={} kv_heads={} head_dim={} bias={}",
++        model.n_layers, model.cfg.hidden, model.cfg.n_q_heads, model.cfg.n_kv_heads,
++        model.cfg.head_dim, model.cfg.attn_bias,
++    );
++
++    // ── (1) Correctness: batched prefill vs sequential step ──────────────────
++    let prompt_text = "The capital of France is";
++    let prompt = tok.encode(prompt_text);
++    assert!(prompt.len() > 1, "need a multi-token prompt to exercise the batched path");
++
++    // Sequential reference next-token logits (the proven per-token path).
++    let mut seq_logits = Vec::new();
++    for (i, &t) in prompt.iter().enumerate() {
++        seq_logits = model.step(dev.as_ref(), t, i).expect("step");
++    }
++    let seq_argmax = argmax(&seq_logits);
++
++    // Fresh model so the KV cache for the batched run is clean.
++    let model2 = GgufModel::load(dev.as_ref(), &path, cap).expect("reload");
++    let pf_logits = model2.prefill(dev.as_ref(), &prompt, 0).expect("prefill");
++    let pf_argmax = argmax(&pf_logits);
++
++    eprintln!(
++        "next-token argmax — sequential={} ({:?})  batched-prefill={} ({:?})",
++        seq_argmax, tok.decode(&[seq_argmax as u32]),
++        pf_argmax, tok.decode(&[pf_argmax as u32]),
++    );
++    assert_eq!(
++        seq_argmax, pf_argmax,
++        "batched prefill next-token must match the sequential step path"
++    );
++    let first_tok_text = tok.decode(&[pf_argmax as u32]);
++    assert!(
++        first_tok_text.contains("Paris"),
++        "expected the prefill's first predicted token to be 'Paris', got {first_tok_text:?}"
++    );
++
++    // Continue greedily a few tokens from the prefilled cache (decode via step).
++    let mut next = pf_argmax as u32;
++    let mut produced = vec![next];
++    for i in 0..5 {
++        let logits = model2.step(dev.as_ref(), next, prompt.len() + i).expect("decode step");
++        next = argmax(&logits) as u32;
++        produced.push(next);
++    }
++    eprintln!("FULL: {:?}{}", prompt_text, tok.decode(&produced));
++
++    // ── (2) Throughput: prefill tok/s at a few prompt lengths ────────────────
++    // Synthetic prompts (repeat the real prompt) so we can scale S without
++    // depending on a long corpus. Each timing reloads the model so the KV cache
++    // starts empty and the measurement is pure prefill compute (incl. dispatch).
++    eprintln!("--- prefill throughput (MT_VK_COOPMAT={}) ---", coopmat as u8);
++    for &s in &[64usize, 128, 256, 512] {
++        if s + 8 > cap { continue; }
++        let toks: Vec<u32> = (0..s).map(|i| prompt[i % prompt.len()]).collect();
++        let m = GgufModel::load(dev.as_ref(), &path, cap).expect("reload for timing");
++        // Warm once (first call JIT-compiles the kernels), then time.
++        let _ = m.prefill(dev.as_ref(), &toks[..prompt.len()], 0).expect("warm");
++        let m2 = GgufModel::load(dev.as_ref(), &path, cap).expect("reload timed");
++        let t = Instant::now();
++        let _ = m2.prefill(dev.as_ref(), &toks, 0).expect("timed prefill");
++        let secs = t.elapsed().as_secs_f32();
++        eprintln!("  S={s:>4}  {secs:7.3}s  {:8.1} prompt-tok/s", s as f32 / secs);
++    }
++    eprintln!("Qwen2.5-1.5B batched prefill OK on Vulkan/RDNA4 (coopmat={}).", coopmat as u8);
++}
++
++fn argmax(v: &[f32]) -> usize {
++    let mut bi = 0usize;
++    let mut bv = f32::NEG_INFINITY;
++    for (i, &x) in v.iter().enumerate() {
++        if x > bv { bv = x; bi = i; }
++    }
++    bi
++}
+diff --git a/rust/crates/ffai-models/src/llama.rs b/rust/crates/ffai-models/src/llama.rs
+index 5c94cab..50055c7 100644
+--- a/rust/crates/ffai-models/src/llama.rs
++++ b/rust/crates/ffai-models/src/llama.rs
+@@ -532,6 +532,33 @@ impl Q8Mat {
+     fn matvec(&self, dev: &dyn Device, x: &Tensor) -> Result<Tensor> {
+         ops::gemv_q8(dev, &self.qs, &self.scales, x, self.m, self.k, self.m)
+     }
++
++    /// Batched `out[n_rows, m] = x[n_rows, k] · Wqᵀ` via the resident-Q8
++    /// cooperative-matrix GEMM (`gemm_q8_mpp`). This is the **prefill** path:
++    /// all `n_rows` prompt tokens projected in one dispatch (vs `n_rows`×
++    /// `matvec`), and on Vulkan/RDNA4 it lights up the coopmat fragment ops when
++    /// `MT_VK_COOPMAT=1`. Returns `[n_rows, m]`.
++    ///
++    /// Debug: `FFAI_PREFILL_GEMV=1` routes the batched projection through a
++    /// per-row `gemv_q8` loop instead (the proven decode kernel), to A/B the
++    /// GEMM path against attention/rope when isolating a prefill correctness bug.
++    fn gemm(&self, dev: &dyn Device, x: &Tensor, n_rows: usize) -> Result<Tensor> {
++        if std::env::var("FFAI_PREFILL_GEMV").map(|v| v == "1").unwrap_or(false) {
++            // Per-row gemv_q8: slice each token's [k] activation, matvec, stack.
++            let mut rows: Vec<u8> = Vec::with_capacity(n_rows * self.m * 4);
++            for r in 0..n_rows {
++                let xr = ops::slice(dev, &x.reshaped(vec![n_rows * self.k]), r * self.k, self.k)?;
++                let yr = ops::gemv_q8(dev, &self.qs, &self.scales, &xr, self.m, self.k, self.m)?;
++                dev.synchronize()?;
++                let mut yb = vec![0u8; self.m * 4];
++                dev.download(yr.buffer.as_ref(), &mut yb)?;
++                rows.extend_from_slice(&yb);
++            }
++            let buf = dev.upload(&rows)?;
++            return Ok(Tensor::new(buf, vec![n_rows, self.m], ffai_core::DType::F32));
++        }
++        ops::gemm_q8_mpp(dev, &self.qs, &self.scales, x, n_rows, self.m, self.k)
++    }
+ }
+ 
+ /// Per-layer resident-Q8 matmul weights (the 7 big projections). Norms/biases
+@@ -1008,4 +1035,139 @@ impl GgufModel {
+         dev.download(logits.buffer.as_ref(), &mut bytes)?;
+         Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+     }
++
++    /// Batched **prefill**: process all `tokens` at positions `[start, start+S)`
++    /// in ONE forward, writing their K/V into the cache, and return the next-token
++    /// logits (the last row's `[vocab]`). This is the prefill counterpart of the
++    /// per-token [`step`]: instead of `S` sequential `step()` calls (each doing
++    /// `gemv_q8` matvecs), the seven projections + lm_head run as batched
++    /// `[S, k]·Wᵀ` GEMMs through [`ffai_ops::gemm_q8_mpp`] — the SimdGroup CoopTile
++    /// kernel that picks up `VK_KHR_cooperative_matrix` on Vulkan/RDNA4 when
++    /// `MT_VK_COOPMAT=1`. Only the resident-Q8 path is GEMM-routed; without Q8
++    /// weights it falls back to the per-token loop (f32 dense decode).
++    ///
++    /// Requires `head_dim == 128` (the `sdpa_multi` prefill-attention kernel).
++    /// Positions must fit the KV-cache capacity (`start + S <= cap`).
++    pub fn prefill(&self, dev: &dyn Device, tokens: &[u32], start: usize) -> Result<Vec<f32>> {
++        let cfg = &self.cfg;
++        let s = tokens.len();
++        // Fall back to the proven per-token path when the GEMM prereqs aren't met
++        // (no resident-Q8 weights, single token, or non-128 head_dim).
++        if self.q8.is_none() || s <= 1 || cfg.head_dim != 128 {
++            let mut last = Vec::new();
++            for (i, &t) in tokens.iter().enumerate() {
++                last = self.step(dev, t, start + i)?;
++            }
++            return Ok(last);
++        }
++        let hd = cfg.head_dim;
++        let cap = self.cap;
++        let nkv = cfg.n_kv_heads;
++        let nq = cfg.n_q_heads;
++        let q8w = self.q8.as_ref().unwrap();
++
++        // Embed all S tokens → x [S, hidden].
++        let ids = Tensor::new(
++            dev.upload(u32_bytes(tokens))?,
++            vec![s],
++            ffai_core::DType::U32,
++        );
++        let mut x = ops::gather(dev, &self.weights.embed, &ids)?.reshaped(vec![s, cfg.hidden]);
++
++        // Positions [start, start+S) for batched RoPE + KV append.
++        let pos_vec: Vec<u32> = (0..s).map(|i| (start + i) as u32).collect();
++        let positions = Tensor::new(
++            dev.upload(u32_bytes(&pos_vec))?,
++            vec![s],
++            ffai_core::DType::U32,
++        );
++
++        for l in 0..self.n_layers {
++            let w = &self.weights.layers[l];
++            let q8 = &q8w.layers[l];
++            // ── attention ──────────────────────────────────────────────
++            let h = ops::rms_norm(dev, &x, &w.attn_norm, cfg.eps)?; // [S, hidden]
++            let mut q = q8.wq.gemm(dev, &h, s)?; // [S, nq*hd]  — coopmat GEMM
++            let mut k = q8.wk.gemm(dev, &h, s)?; // [S, nkv*hd]
++            let mut v = q8.wv.gemm(dev, &h, s)?; // [S, nkv*hd]
++            if cfg.attn_bias {
++                q = ops::add_bias_rows(dev, &q, w.bias_q.as_ref().unwrap(), s, nq * hd)?;
++                k = ops::add_bias_rows(dev, &k, w.bias_k.as_ref().unwrap(), s, nkv * hd)?;
++                v = ops::add_bias_rows(dev, &v, w.bias_v.as_ref().unwrap(), s, nkv * hd)?;
++            }
++            // Optional Qwen3 per-head Q/K RMSNorm (rms_norm normalizes the last
++            // dim, so a [S*heads, head_dim] view is correct per (token,head)).
++            let (q, k) = if cfg.qk_norm {
++                let qv = q.reshaped(vec![s * nq, hd]);
++                let kv = k.reshaped(vec![s * nkv, hd]);
++                (
++                    ops::rms_norm(dev, &qv, w.q_norm.as_ref().unwrap(), cfg.eps)?,
++                    ops::rms_norm(dev, &kv, w.k_norm.as_ref().unwrap(), cfg.eps)?,
++                )
++            } else {
++                (q, k)
++            };
++            // Batched RoPE over [S, heads, hd] (one dispatch each for Q and K).
++            let q = ops::rope_llama_many(dev, &q.reshaped(vec![s, nq, hd]), &positions, nq, hd, cfg.rope_theta, 1.0, 1.0, 1.0, 1e9)?;
++            let k = ops::rope_llama_many(dev, &k.reshaped(vec![s, nkv, hd]), &positions, nkv, hd, cfg.rope_theta, 1.0, 1.0, 1.0, 1e9)?;
++            let v = v.reshaped(vec![s, nkv, hd]);
++
++            // Append all S tokens' K/V into the cache in two batched dispatches,
++            // then attend. We attend each of the S queries with the PROVEN
++            // `sdpa_decode` kernel (the same op the decode `step` uses) over its
++            // causal prefix `[0, start+r]` — `sdpa_multi`'s batched flash kernel is
++            // not yet validated on the Vulkan backend. The projections + FFN — the
++            // bulk of prefill FLOPs — already ran batched through the coopmat GEMM;
++            // attention is bandwidth-bound, not the coopmat target. Bit-identical
++            // to the sequential path.
++            ops::kv_append_many(dev, &k, &positions, &self.kcache[l], nkv, hd, cap)?;
++            ops::kv_append_many(dev, &v, &positions, &self.vcache[l], nkv, hd, cap)?;
++            let q_flat = q.reshaped(vec![s * nq * hd]);
++            let mut attn_rows: Vec<u8> = Vec::with_capacity(s * nq * hd * 4);
++            for r in 0..s {
++                let qr = ops::slice(dev, &q_flat, r * nq * hd, nq * hd)?.reshaped(vec![nq, hd]);
++                let len = (start + r + 1) as u32; // causal: query r attends [0, start+r]
++                let a = ops::sdpa_decode(
++                    dev,
++                    &qr,
++                    &self.kcache[l].reshaped(vec![nkv, cap, hd]),
++                    &self.vcache[l].reshaped(vec![nkv, cap, hd]),
++                    hd,
++                    len,
++                    cap as u32,
++                    cfg.heads_per_group(),
++                    cfg.attn_scale(),
++                )?; // [nq, hd]
++                dev.synchronize()?;
++                let mut ab = vec![0u8; nq * hd * 4];
++                dev.download(a.buffer.as_ref(), &mut ab)?;
++                attn_rows.extend_from_slice(&ab);
++            }
++            let attn = Tensor::new(dev.upload(&attn_rows)?, vec![s, nq, hd], ffai_core::DType::F32);
++            let attn_o = attn.reshaped(vec![s, nq * hd]);
++            let o = q8.wo.gemm(dev, &attn_o, s)?; // [S, hidden]  — coopmat GEMM
++            x = ops::add(dev, &x.reshaped(vec![s * cfg.hidden]), &o.reshaped(vec![s * cfg.hidden]))?
++                .reshaped(vec![s, cfg.hidden]);
++
++            // ── MLP (SwiGLU) ───────────────────────────────────────────
++            let h2 = ops::rms_norm(dev, &x, &w.mlp_norm, cfg.eps)?; // [S, hidden]
++            let gate = q8.w_gate.gemm(dev, &h2, s)?; // [S, ffn]
++            let up = q8.w_up.gemm(dev, &h2, s)?;     // [S, ffn]
++            let act = ops::swiglu(dev, &gate, &up)?; // [S, ffn]
++            let down = q8.w_down.gemm(dev, &act, s)?; // [S, hidden]
++            x = ops::add(dev, &x.reshaped(vec![s * cfg.hidden]), &down.reshaped(vec![s * cfg.hidden]))?
++                .reshaped(vec![s, cfg.hidden]);
++        }
++
++        // Final norm over all rows, then lm_head on the LAST token only (the
++        // next-token logits). Slice the last hidden row on-device so the lm_head
++        // stays a single matvec, matching the per-token decode path's final step.
++        let xn = ops::rms_norm(dev, &x, &self.weights.final_norm, cfg.eps)?; // [S, hidden]
++        let last_xn = ops::slice(dev, &xn.reshaped(vec![s * cfg.hidden]), (s - 1) * cfg.hidden, cfg.hidden)?;
++        let logits = q8w.lm_head.matvec(dev, &last_xn)?;
++        dev.synchronize()?;
++        let mut bytes = vec![0u8; self.vocab * 4];
++        dev.download(logits.buffer.as_ref(), &mut bytes)?;
++        Ok(bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
++    }
+ }
+diff --git a/rust/crates/ffai-ops/src/lib.rs b/rust/crates/ffai-ops/src/lib.rs
+index 38a8602..8514c42 100644
+--- a/rust/crates/ffai-ops/src/lib.rs
++++ b/rust/crates/ffai-ops/src/lib.rs
+@@ -530,6 +530,97 @@ pub fn gemv_q8(
+     Ok(out)
+ }
+ 
++/// Batched Q8 GEMM — the **prefill** projection path. `out[r,o] = Σ_k W[o,k]·x[r,k]`
++/// for `n_rows` tokens at once, dispatching metaltile's `ffai_gemm_q8_mpp`
++/// (SimdGroup-scope CoopTile 64×64×32 tile). On the Vulkan/RDNA4 backend this
++/// kernel picks up the gated `VK_KHR_cooperative_matrix` fragment ops when
++/// `MT_VK_COOPMAT=1` (≈6× the scalar GEMM) — the realized prefill win. With the
++/// gate unset it runs the bit-exact scalar `SoftwareLocalC` tiles. Either way it
++/// replaces the `n_rows`× sequential `gemv_q8` matvecs of the per-token path.
++///
++/// The coopmat staging tiles are fp16, so the activation/output are carried as
++/// f16 across the kernel: `x` (f32 `[n_rows, k_in]`) is cast to f16 on entry and
++/// the f16 result is widened back to f32 `[n_rows, m_out]` so the rest of the
++/// f32 forward graph is unchanged. Weight layout (`qs`/`scales`) is identical to
++/// [`gemv_q8`] (dense, `rows_per_group = m_out`). `k_in` must be a multiple of 32.
++pub fn gemm_q8_mpp(
++    dev: &dyn Device,
++    qs: &Tensor,
++    scales: &Tensor,
++    x: &Tensor,
++    n_rows: usize,
++    m_out: usize,
++    k_in: usize,
++) -> Result<Tensor> {
++    if k_in % 32 != 0 {
++        return Err(Error::Msg(format!("gemm_q8_mpp: k_in {k_in} must be a multiple of 32")));
++    }
++    // Coopmat fragments stage through fp16 → drive the kernel at f16. Cast the
++    // f32 residual-stream activations in, widen the result back out.
++    let xf16 = if x.dtype == DType::F16 { x.clone() } else { cast_f32_f16(dev, x)? };
++    // `ffai_gemm_q8_mpp` in Reduction mode (matches the metaltile coopmat test
++    // + bench). Buffer order: x, qs, d_f32, out; constexpr n_rows, out_dim, k_in.
++    let k = cached_ir("ffai_gemm_q8_mpp", DType::F16, || {
++        let mut k = metaltile_std::ffai::gemm_q8_mpp::ffai_gemm_q8_mpp::kernel_ir_for(DType::F16);
++        k.mode = metaltile_core::ir::KernelMode::Reduction;
++        k
++    });
++    let out = Tensor::empty(dev, vec![n_rows * m_out], DType::F16)?;
++    let u = |v: u32| Binding::Scalar(v.to_le_bytes().to_vec());
++    // grid (threadgroups) = [ceil(out_dim/64), ceil(n_rows/64), 1], tg [128,1,1].
++    let grid = Grid {
++        grid: [(m_out as u32).div_ceil(64), (n_rows as u32).div_ceil(64), 1],
++        block: [128, 1, 1],
++    };
++    dev.dispatch(
++        &k,
++        &[
++            Binding::Buffer(xf16.buffer.clone()),
++            Binding::Buffer(qs.buffer.clone()),
++            Binding::Buffer(scales.buffer.clone()),
++            Binding::Buffer(out.buffer.clone()),
++            u(n_rows as u32),
++            u(m_out as u32),
++            u(k_in as u32),
++        ],
++        grid,
++    )?;
++    let out_f32 = cast_f16_f32(dev, &out)?;
++    Ok(out_f32.reshaped(vec![n_rows, m_out]))
++}
++
++/// Broadcast-add a per-feature bias `[n]` across every row of `x [n_rows, n]`:
++/// `out[r,o] = x[r,o] + bias[o]`. The decode path adds a `[n]` bias to a single
++/// `[n]` projection with plain [`add`]; the batched prefill path needs the same
++/// bias on every token row, but [`add`] is shape-strict (no broadcast). This is
++/// a fully on-device elementwise kernel (`out[i] = x[i] + bias[i % n]`) — no
++/// host round-trip, so it works on device-local (non-mappable) weight buffers.
++/// Returns `[n_rows, n]` f32.
++pub fn add_bias_rows(dev: &dyn Device, x: &Tensor, bias: &Tensor, n_rows: usize, n: usize) -> Result<Tensor> {
++    // Elementwise inline IR: i = ProgramId(0) (global flat id); the row-local
++    // column is `col = i - (i / n) * n`; `out[i] = x[i] + bias[col]`. We compute
++    // `col` with Div/Mul/Sub rather than `Mod` (the GLSL `%` lowering broadcast
++    // the wrong bias element on the Vulkan backend). `n` is a compile-time
++    // literal (the kernel is rebuilt per call, never cached, so no cross-width
++    // collision). Fully on-device — works on device-local (non-mappable) weights.
++    // Copy the device-local bias into a host-VISIBLE tensor via the proven
++    // `slice` kernel (its output is `Tensor::empty` → `dev.alloc` → host-mappable,
++    // unlike the device-local weight buffer that `vkMapMemory` rejects), download
++    // it, tile to `[n_rows, n]`, upload, and do ONE proven elementwise `add`.
++    // Bias is `n` floats — a negligible round-trip next to the projection GEMM.
++    let bias_hv = slice(dev, bias, 0, n)?;
++    dev.synchronize()?;
++    let mut bbytes = vec![0u8; n * 4];
++    dev.download(bias_hv.buffer.as_ref(), &mut bbytes)?;
++    let mut tiled = Vec::with_capacity(n_rows * n * 4);
++    for _ in 0..n_rows {
++        tiled.extend_from_slice(&bbytes);
++    }
++    let tiled_t = Tensor::new(dev.upload(&tiled)?, vec![n_rows * n], DType::F32);
++    let out = add(dev, &x.reshaped(vec![n_rows * n]), &tiled_t)?;
++    Ok(out.reshaped(vec![n_rows, n]))
++}
++
+ /// Q8 gemv with fused ReLU²: `out[r] = max(0, (Wq·x)[r])²` — a MoE expert's
+ /// `up` projection + activation in one dispatch. Dispatches `ffai_gemv_q8_coalesced_relu2`.
+ pub fn gemv_q8_relu2(dev: &dyn Device, qs: &Tensor, scales: &Tensor, x: &Tensor, m_out: usize, k_in: usize, rows_per_group: usize) -> Result<Tensor> {

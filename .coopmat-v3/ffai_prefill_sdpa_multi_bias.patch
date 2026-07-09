@@ -1,0 +1,172 @@
+diff --git a/rust/crates/ffai-models/src/llama.rs b/rust/crates/ffai-models/src/llama.rs
+index 50055c7..7613eba 100644
+--- a/rust/crates/ffai-models/src/llama.rs
++++ b/rust/crates/ffai-models/src/llama.rs
+@@ -1113,37 +1113,30 @@ impl GgufModel {
+             let v = v.reshaped(vec![s, nkv, hd]);
+ 
+             // Append all S tokens' K/V into the cache in two batched dispatches,
+-            // then attend. We attend each of the S queries with the PROVEN
+-            // `sdpa_decode` kernel (the same op the decode `step` uses) over its
+-            // causal prefix `[0, start+r]` — `sdpa_multi`'s batched flash kernel is
+-            // not yet validated on the Vulkan backend. The projections + FFN — the
+-            // bulk of prefill FLOPs — already ran batched through the coopmat GEMM;
+-            // attention is bandwidth-bound, not the coopmat target. Bit-identical
+-            // to the sequential path.
++            // then attend the whole block in ONE `sdpa_multi` flash dispatch.
++            // `sdpa_multi` (causal) makes query `r` attend `[0, base_kv+r+1)`;
++            // with `base_kv = start` that is the causal prefix `[0, start+r]` —
++            // exactly the per-query `sdpa_decode` loop this replaced, but in a
++            // single grid (`[n_q_heads*n_query]` workgroups) with no per-row
++            // host download/upload round-trip. Validated bit-accurate on the
++            // Vulkan backend by `metaltile-std/tests/vulkan_sdpa_multi.rs`
++            // (prefill + GQA shapes) and the auto corpus.
+             ops::kv_append_many(dev, &k, &positions, &self.kcache[l], nkv, hd, cap)?;
+             ops::kv_append_many(dev, &v, &positions, &self.vcache[l], nkv, hd, cap)?;
+-            let q_flat = q.reshaped(vec![s * nq * hd]);
+-            let mut attn_rows: Vec<u8> = Vec::with_capacity(s * nq * hd * 4);
+-            for r in 0..s {
+-                let qr = ops::slice(dev, &q_flat, r * nq * hd, nq * hd)?.reshaped(vec![nq, hd]);
+-                let len = (start + r + 1) as u32; // causal: query r attends [0, start+r]
+-                let a = ops::sdpa_decode(
+-                    dev,
+-                    &qr,
+-                    &self.kcache[l].reshaped(vec![nkv, cap, hd]),
+-                    &self.vcache[l].reshaped(vec![nkv, cap, hd]),
+-                    hd,
+-                    len,
+-                    cap as u32,
+-                    cfg.heads_per_group(),
+-                    cfg.attn_scale(),
+-                )?; // [nq, hd]
+-                dev.synchronize()?;
+-                let mut ab = vec![0u8; nq * hd * 4];
+-                dev.download(a.buffer.as_ref(), &mut ab)?;
+-                attn_rows.extend_from_slice(&ab);
+-            }
+-            let attn = Tensor::new(dev.upload(&attn_rows)?, vec![s, nq, hd], ffai_core::DType::F32);
++            let attn = ops::sdpa_multi(
++                dev,
++                &q.reshaped(vec![s * nq * hd]),
++                &self.kcache[l].reshaped(vec![nkv * cap * hd]),
++                &self.vcache[l].reshaped(vec![nkv * cap * hd]),
++                hd,
++                nq as u32,
++                start as u32, // base_kv
++                s as u32,     // n_query
++                cap as u32,   // kv_stride
++                cfg.heads_per_group(),
++                true, // causal
++                cfg.attn_scale(),
++            )?; // [s, nq, hd]
+             let attn_o = attn.reshaped(vec![s, nq * hd]);
+             let o = q8.wo.gemm(dev, &attn_o, s)?; // [S, hidden]  — coopmat GEMM
+             x = ops::add(dev, &x.reshaped(vec![s * cfg.hidden]), &o.reshaped(vec![s * cfg.hidden]))?
+diff --git a/rust/crates/ffai-ops/src/lib.rs b/rust/crates/ffai-ops/src/lib.rs
+index 8514c42..1fadd71 100644
+--- a/rust/crates/ffai-ops/src/lib.rs
++++ b/rust/crates/ffai-ops/src/lib.rs
+@@ -597,27 +597,83 @@ pub fn gemm_q8_mpp(
+ /// host round-trip, so it works on device-local (non-mappable) weight buffers.
+ /// Returns `[n_rows, n]` f32.
+ pub fn add_bias_rows(dev: &dyn Device, x: &Tensor, bias: &Tensor, n_rows: usize, n: usize) -> Result<Tensor> {
+-    // Elementwise inline IR: i = ProgramId(0) (global flat id); the row-local
+-    // column is `col = i - (i / n) * n`; `out[i] = x[i] + bias[col]`. We compute
+-    // `col` with Div/Mul/Sub rather than `Mod` (the GLSL `%` lowering broadcast
+-    // the wrong bias element on the Vulkan backend). `n` is a compile-time
+-    // literal (the kernel is rebuilt per call, never cached, so no cross-width
+-    // collision). Fully on-device — works on device-local (non-mappable) weights.
+-    // Copy the device-local bias into a host-VISIBLE tensor via the proven
+-    // `slice` kernel (its output is `Tensor::empty` → `dev.alloc` → host-mappable,
+-    // unlike the device-local weight buffer that `vkMapMemory` rejects), download
+-    // it, tile to `[n_rows, n]`, upload, and do ONE proven elementwise `add`.
+-    // Bias is `n` floats — a negligible round-trip next to the projection GEMM.
+-    let bias_hv = slice(dev, bias, 0, n)?;
+-    dev.synchronize()?;
+-    let mut bbytes = vec![0u8; n * 4];
+-    dev.download(bias_hv.buffer.as_ref(), &mut bbytes)?;
+-    let mut tiled = Vec::with_capacity(n_rows * n * 4);
+-    for _ in 0..n_rows {
+-        tiled.extend_from_slice(&bbytes);
++    // Fully on-device per-feature bias broadcast: `i = ProgramId(0)` (global
++    // flat id), row-local column `col = i % n`, `out[i] = x[i] + bias[col]`.
++    // `n` is a CONSTEXPR push-constant (bound as a `Binding::Scalar`) — NOT a
++    // baked `Op::Const` literal — so the one cached `ffai_add_bias_rows`
++    // pipeline serves every projection width (q: nq*hd, k/v: nkv*hd) instead
++    // of silently reusing the first call's `n`. The DSL `%` lowers to
++    // `BinOpKind::Mod` → GLSL `uint(i) % uint(n)` (integer modulo), validated
++    // bit-exact on Vulkan by `metaltile-std/tests/vulkan_add_bias_rows.rs`.
++    // No host round-trip — runs straight on the device-local weight buffer.
++    use metaltile_core::ir::ConstExprDecl;
++    use metaltile_core::ConstExpr;
++    let total = n_rows * n;
++    let out = Tensor::empty(dev, vec![total], DType::F32)?;
++    let mut k = Kernel::new("ffai_add_bias_rows");
++    for (pname, is_out) in [("x", false), ("bias", false), ("out", true)] {
++        k.params.push(Param {
++            name: pname.into(),
++            dtype: DType::F32,
++            shape: Shape::scalar(),
++            is_output: is_out,
++            kind: ParamKind::Tensor,
++        });
+     }
+-    let tiled_t = Tensor::new(dev.upload(&tiled)?, vec![n_rows * n], DType::F32);
+-    let out = add(dev, &x.reshaped(vec![n_rows * n]), &tiled_t)?;
++    k.constexprs.push(ConstExprDecl {
++        name: ConstExpr::new("n"),
++        dtype: DType::U32,
++        value: None,
++    });
++    // SSA: 0=i, 1=n, 2=col, 3=x[i], 4=bias[col], 5=sum.
++    k.body.push_op(Op::ProgramId { axis: 0 }, ValueId::new(0));
++    k.body.push_op(
++        Op::Load { src: "n".into(), indices: vec![], mask: None, other: None },
++        ValueId::new(1),
++    );
++    k.body.push_op(
++        Op::BinOp { op: BinOpKind::Mod, lhs: ValueId::new(0), rhs: ValueId::new(1) },
++        ValueId::new(2),
++    );
++    k.body.push_op(
++        Op::Load {
++            src: "x".into(),
++            indices: vec![IndexExpr::Value(ValueId::new(0))],
++            mask: None,
++            other: None,
++        },
++        ValueId::new(3),
++    );
++    k.body.push_op(
++        Op::Load {
++            src: "bias".into(),
++            indices: vec![IndexExpr::Value(ValueId::new(2))],
++            mask: None,
++            other: None,
++        },
++        ValueId::new(4),
++    );
++    k.body.push_op(
++        Op::BinOp { op: BinOpKind::Add, lhs: ValueId::new(3), rhs: ValueId::new(4) },
++        ValueId::new(5),
++    );
++    k.body.push_op_no_result(Op::Store {
++        dst: "out".into(),
++        indices: vec![IndexExpr::Value(ValueId::new(0))],
++        value: ValueId::new(5),
++        mask: None,
++    });
++    let grid = Grid::d1((total as u32).div_ceil(256), 256);
++    dev.dispatch(
++        &k,
++        &[
++            Binding::Buffer(x.buffer.clone()),
++            Binding::Buffer(bias.buffer.clone()),
++            Binding::Buffer(out.buffer.clone()),
++            Binding::Scalar((n as u32).to_le_bytes().to_vec()),
++        ],
++        grid,
++    )?;
+     Ok(out.reshaped(vec![n_rows, n]))
+ }
+ 
