@@ -37,8 +37,9 @@ let package = Package(
     ],
     dependencies: [
         // F-80 cliff fix: local path dep so allocator + sdpa_vector edits
-        // land. Revert to URL when committed to mlx-swift fork.
-        .package(name: "mlx-swift", path: "/Users/tom/dev/mlx-swift"),
+        // land. Relative so alpha CI (../mlx-swift checkout) resolves too.
+        // Revert to URL when committed to mlx-swift fork.
+        .package(name: "mlx-swift", path: "../mlx-swift"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],
